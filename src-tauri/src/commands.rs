@@ -79,6 +79,7 @@ pub fn set_config(
         config.recording.target_stable_id = previous.recording.target_stable_id.clone();
         crate::notify(&app, "error", "Stop the recording before changing the source.");
     }
+    crate::config::keep_once_flags(&mut config, &previous);
     config.accent_color = crate::model::clean_accent(config.accent_color.as_deref());
     config.accent_color_2 = crate::model::clean_accent(config.accent_color_2.as_deref());
     let next = state.replace_config(config);
@@ -1014,7 +1015,11 @@ pub fn apply_clip_edit(
     let trim = edit::Trim { start_ms, end_ms };
 
     let applied = edit::apply(&clip, trim, &tracks, encoder, quality, progress(&app, &id));
-    store(&state, &app, &clip, applied, tracks)
+    let stored = store(&state, &app, &clip, applied, tracks);
+    if stored.is_ok() {
+        crate::telemetry::used(crate::telemetry::Feature::Editor);
+    }
+    stored
 }
 
 /// Undo the trim: pull the whole recording back, keep the mix.
@@ -1065,7 +1070,6 @@ pub fn discard_clip_original(
             .ok_or_else(|| "clip not found".to_string())
     })?;
     announce_change(&app);
-    crate::telemetry::used(crate::telemetry::Feature::Editor);
     Ok(clip)
 }
 

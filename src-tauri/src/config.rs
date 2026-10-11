@@ -183,10 +183,37 @@ pub fn save(config: &AppConfig) -> std::io::Result<()> {
     std::fs::rename(tmp, config_path())
 }
 
+/// Flags the app sets on its own ("shown once") only ever go from false to
+/// true. A settings page still holding the config it loaded at start sends the
+/// old false with its next change, and would bring the notice back.
+pub fn keep_once_flags(next: &mut AppConfig, previous: &AppConfig) {
+    next.usage_stats_noticed |= previous.usage_stats_noticed;
+    next.tray_hint_shown |= previous.tray_hint_shown;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::AudioSource;
+
+    #[test]
+    fn a_stale_settings_page_cannot_take_back_a_shown_notice() {
+        // The app set both flags itself; the page still holds the config it
+        // loaded at start and sends all of it with the next change.
+        let mut previous = default_config();
+        previous.usage_stats_noticed = true;
+        previous.tray_hint_shown = true;
+        let mut next = default_config();
+        keep_once_flags(&mut next, &previous);
+        assert!(next.usage_stats_noticed);
+        assert!(next.tray_hint_shown);
+
+        // And a page that knows better still gets its way going forward.
+        let mut next = default_config();
+        next.usage_stats_noticed = true;
+        keep_once_flags(&mut next, &default_config());
+        assert!(next.usage_stats_noticed);
+    }
 
     fn source(id: &str, kind: SourceKind, enabled: bool) -> AudioSource {
         AudioSource {
