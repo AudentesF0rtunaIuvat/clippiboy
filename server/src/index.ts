@@ -24,6 +24,7 @@ import {
   shareQuota,
   sweep,
 } from "./links";
+import { handlePing, sweepUsage } from "./telemetry";
 
 export { Hub } from "./hub";
 
@@ -41,7 +42,7 @@ export default {
     }
   },
   async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(sweep(env));
+    ctx.waitUntil(Promise.all([sweep(env), sweepUsage(env)]));
   },
 } satisfies ExportedHandler<Env>;
 
@@ -63,6 +64,9 @@ async function route(request: Request, env: Env): Promise<Response> {
   }
   const reported = path.match(/^\/c\/([a-z0-9]+)\/report$/);
   if (reported && method === "POST") return reportShare(request, env, reported[1]);
+
+  // Anonymous on purpose: a ping never carries the account.
+  if (path === "/t/ping" && method === "POST") return handlePing(request, env);
 
   const me = await authenticate(request, env.DB);
 
