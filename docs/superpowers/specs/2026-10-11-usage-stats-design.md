@@ -62,7 +62,7 @@ after a week as "tiktok1: 120 downloads, 45 installs, 20 still active on day 7".
 
 ### State file (`%LOCALAPPDATA%\gg.clippiboy.app\usage.json`)
 ```json
-{ "id": "uuid-v4", "heard": "discord", "pending": { "clips": 3, "shots": 1, "recordings": 0, "features": 5 }, "last_sent": "2026-10-11" }
+{ "id": "uuid-v4", "heard": "discord", "pending": { "clips": 3, "shots": 1, "recordings": 0, "features": 5 }, "last_sent": 1791700000 }
 ```
 - `id`: random UUID v4, made on first need. It is unrelated to the friends
   account and the machine.
@@ -88,7 +88,7 @@ after a week as "tiktok1: 120 downloads, 45 installs, 20 still active on day 7".
 - Counters are written to `usage.json` at most once a minute and on exit, so a
   crash loses at most a minute.
 - A thread like `updater::watch`: at start and then hourly, if `usage_stats` is
-  on and `last_sent` is not today (local date), send one ping. On `200`, zero the
+  on and `last_sent` (unix seconds) is at least 20 hours ago, send one ping. The server files it under its own UTC day. On `200`, zero the
   sent counters (keeping anything counted meanwhile) and set `last_sent`. On any
   error, keep everything for the next round, log at info level, show nothing.
 - The ping uses a plain client **without** the friends auth header.
