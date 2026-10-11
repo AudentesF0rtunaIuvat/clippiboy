@@ -72,7 +72,7 @@ export function refFromPath(pathname: string): string {
 }
 
 export function isBot(userAgent: string | null): boolean {
-  return userAgent !== null && /bot|crawler|spider/i.test(userAgent);
+  return userAgent !== null && /bot|crawler|spider|facebookexternalhit|whatsapp|embedly|preview/i.test(userAgent);
 }
 
 /** The installer reads its source back out of this name. */

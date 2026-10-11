@@ -49,7 +49,7 @@ export function screenChoice(
 
 /** Under the usage stats switch, in the setup and in Behaviour. */
 export const USAGE_HINT =
-  "Counts, never content: version, how many clips, which features. No account, no IP. Details on clippiboy.com/privacy.html";
+  "Counts, never content: version, how many clips, which features. No account, your IP is not stored. Details on clippiboy.com/privacy.html";
 
 export function Row({
   label,

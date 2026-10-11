@@ -115,7 +115,13 @@ export function Setup() {
     if (!config.setupDone && inTauri) {
       void api
         .usageSource()
-        .then((source) => setAskHeard(source === null))
+        .then((source) => {
+          if (source !== null) return;
+          setAskHeard(true);
+          // Already past the welcome by now: the question slots in behind, and
+          // the step on screen keeps its place instead of jumping back.
+          setStep((current) => (current >= 1 ? current + 1 : current));
+        })
         .catch(() => {});
     }
     // Only on opening — not every time the config changes underneath.

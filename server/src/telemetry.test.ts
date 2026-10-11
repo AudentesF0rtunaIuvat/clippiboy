@@ -60,6 +60,13 @@ test("crawlers are not downloads", () => {
   assert.equal(isBot(null), false);
 });
 
+test("link previews are not downloads either", () => {
+  assert.equal(isBot("facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"), true);
+  assert.equal(isBot("WhatsApp/2.23.20.0"), true);
+  assert.equal(isBot("TelegramBot (like TwitterBot)"), true);
+  assert.equal(isBot("Mozilla/5.0 (compatible; Embedly/0.2)"), true);
+});
+
 test("the setup carries its source in the file name", () => {
   assert.equal(downloadName("0.8.3", "site"), "ClippiBoy_0.8.3_x64-setup.site.exe");
 });
