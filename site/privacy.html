@@ -23,14 +23,14 @@
   <main id="main">
     <article class="legal">
       <h1>Privacy policy</h1>
-      <p class="small">Last updated: October 5, 2026</p>
+      <p class="small">Last updated: October 11, 2026</p>
 
       <section>
         <h2>In short</h2>
         <ul>
           <li>ClippiBoy runs on your PC. Recordings, clips, screenshots and settings stay there.</li>
-          <li>No tracking, no ads, no analytics, no cookies.</li>
-          <li>Only the friends feature talks to our server, and only once you sign in with Discord for it.</li>
+          <li>No ads, no cookies, no tracking across sites. The app sends one anonymous usage count a day, which you can switch off.</li>
+          <li>Apart from that count, only the friends feature talks to our server, and only once you sign in with Discord for it.</li>
           <li>Clips sent to friends go straight from PC to PC and never touch our server.</li>
           <li>Only a clip you share as a link is uploaded. It is deleted after five days.</li>
         </ul>
@@ -47,6 +47,7 @@
         <h2>This website</h2>
         <p>clippiboy.com is hosted on GitHub Pages (GitHub, Inc., USA). In front of it sits Cloudflare (Cloudflare, Inc., USA), which provides the address and delivers the page. Both process the data technically required for a visit, such as IP address, time, requested page and browser identifier, and keep their own logs of it.</p>
         <p>The site sets no cookies and loads no fonts or scripts from third-party servers. Only if the current version is not already baked into the page does your browser ask the GitHub API (api.github.com) for it.</p>
+        <p>The download buttons fetch the installer from GitHub through <strong>clippiboy.com/get/…</strong>. For each download we add one to a count per link and day, for example “tiktok1, October 11: 12 downloads”. Nothing else about the download is stored. The link's name is also put into the installer's file name, so the app can tell which link it came from (see below).</p>
         <p>The legal basis is our legitimate interest in delivering the site securely and reliably (Art. 6(1)(f) GDPR).</p>
       </section>
 
@@ -57,7 +58,21 @@
           <li><strong>Update check</strong>: the app downloads the file with the latest version number and, for an update, the installer from GitHub Releases.</li>
           <li><strong>ffmpeg</strong>: on first start, the app downloads the ffmpeg program once from GitHub Releases.</li>
         </ul>
-        <p>GitHub sees your IP address when this happens. Apart from that, the app sends nothing. The diagnostic report tool only writes a text file to your desktop. Whether you pass it on is up to you.</p>
+        <p>GitHub sees your IP address when this happens. Apart from that and the usage statistics below, the app sends nothing. The diagnostic report tool only writes a text file to your desktop. Whether you pass it on is up to you.</p>
+      </section>
+
+      <section>
+        <h2>Usage statistics</h2>
+        <p>Once a day, the app sends a short message to our server (api.clippiboy.com) so we can see how many people use ClippiBoy, how they found it and which features matter. It contains:</p>
+        <ul>
+          <li>a random installation number the app made up, which is not linked to you, your PC or a friends account,</li>
+          <li>the app version,</li>
+          <li>the name of the download link, if the installer's file name carried one, and your answer to “Where did you hear about ClippiBoy?” in the setup, if you gave one,</li>
+          <li>how many clips, screenshots and recordings were saved since the last message,</li>
+          <li>whether the console, friends, sending to a friend, share links, the clip editor or the Stream Deck were used (yes or no for each).</li>
+        </ul>
+        <p>It contains no clips, file names, titles, games, names, friends or sign-in, and it is sent without your friends account even when you are signed in. Our server does not store your IP address with it. We only use these numbers as aggregated statistics. Each day's numbers and the downloads per link are kept for 400 days; an installation that has not sent anything for 400 days is deleted entirely.</p>
+        <p>You can switch this off at any time in the setup or under <em>Settings → Behaviour → Send anonymous usage stats</em>. The app then sends nothing more and deletes its installation number and counts; switching it on again starts with a new number. The legal basis is our legitimate interest in understanding how ClippiBoy is found and used, so we can improve it (Art. 6(1)(f) GDPR).</p>
       </section>
 
       <section>
