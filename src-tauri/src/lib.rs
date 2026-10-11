@@ -1362,7 +1362,6 @@ pub fn run() {
             share::share_clear,
             telemetry::usage_source,
             telemetry::usage_set_heard,
-            telemetry::usage_notice,
         ])
         .build(tauri::generate_context!())
         .expect("could not start ClippiBoy");

@@ -50,8 +50,6 @@ export const api = {
   /** The download link the installer came from, if its name carried one. */
   usageSource: () => invoke<string | null>("usage_source"),
   usageSetHeard: (heard: string | null) => invoke<void>("usage_set_heard", { heard }),
-  /** Tells someone who updated, once, that usage stats are on. */
-  usageNotice: () => invoke<void>("usage_notice"),
   /** Throws when a combination is invalid or already taken. */
   /** All four at once — the core only accepts them together. */
   setHotkeys: (

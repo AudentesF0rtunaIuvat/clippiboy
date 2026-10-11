@@ -11,6 +11,7 @@ import { Toasts } from "./components/Toasts";
 import { ClipPicker, SharePicker, Transfers } from "./components/Share";
 import { UpdateNotice } from "./components/UpdateNotice";
 import { FfmpegNotice } from "./components/FfmpegNotice";
+import { UsageNotice } from "./components/UsageNotice";
 import { TextMenu } from "./components/TextMenu";
 import { Setup } from "./components/Setup";
 import { MenuProvider } from "./components/ui/Menu";
@@ -68,6 +69,7 @@ export default function App() {
           <div className="mx-auto w-full max-w-[1180px] px-8">
             <FfmpegNotice />
             <UpdateNotice />
+            <UsageNotice onNavigate={setRoute} />
           </div>
           {/* Keyed on the route so the rise plays again on every change — the
               same trick the overlay uses to replay its card animation. The

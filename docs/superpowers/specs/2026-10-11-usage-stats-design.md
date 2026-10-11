@@ -110,11 +110,13 @@ bytes); the server keeps the first non-null value.
   line under it.
 
 ### Existing users
-They never see the wizard. On the first start of the version that brings this,
-if `usage_stats_noticed` is false, the main window shows one toast: "ClippiBoy
-now sends anonymous usage stats. Turn it off in Settings → Behaviour." Then
-`usage_stats_noticed = true`. Their first ping waits until the toast has been
-shown.
+They never see the wizard. While `setup_done && usage_stats && !usage_stats_noticed`,
+the dashboard shows a notice card at the top (like the update notice): "ClippiBoy
+now sends anonymous usage stats" with **Got it** and **Settings** (opens
+Behaviour). Either button, or 10 seconds in front of the user (the clock only
+runs while the window has the focus), sets `usage_stats_noticed`. No ping goes
+out before. A toast was tried first and was missed: a window behind another one
+still counts as visible.
 
 ## 4. Friends server (`server/src/telemetry.ts`, migration `0006_usage.sql`)
 

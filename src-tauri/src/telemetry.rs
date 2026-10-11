@@ -320,32 +320,6 @@ pub fn usage_set_heard(heard: Option<String>) {
     usage.flush();
 }
 
-/// Someone who updated never saw the setup and its switch: tell them once.
-/// The first ping waits for this.
-#[tauri::command]
-pub fn usage_notice(app: tauri::AppHandle) {
-    let state = app.state::<crate::state::AppState>();
-    {
-        // Only the flag — `replace_config` would reapply the audio sources.
-        let mut config = state.config.lock();
-        if !config.setup_done || config.usage_stats_noticed {
-            return;
-        }
-        config.usage_stats_noticed = true;
-        if let Err(err) = crate::config::save(&config) {
-            log::warn!("could not remember the usage notice: {err}");
-        }
-        if !config.usage_stats {
-            return;
-        }
-    }
-    crate::notify(
-        &app,
-        "ok",
-        "ClippiBoy now sends anonymous usage stats. Turn it off in Settings → Behaviour.",
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
