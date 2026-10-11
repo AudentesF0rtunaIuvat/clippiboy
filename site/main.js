@@ -349,7 +349,6 @@ async function fromApi() {
 
 /** Wording has to match bake-release.mjs, which writes the same into the HTML. */
 function show(data) {
-  document.querySelectorAll("[data-download]").forEach((a) => { a.href = data.setup.url; });
   if (data.plugin) {
     document.querySelectorAll("[data-plugin]").forEach((a) => { a.href = data.plugin.url; });
   }
@@ -379,6 +378,16 @@ function show(data) {
     );
   }
 }
+
+// A campaign can link to the page instead of the file: clippiboy.com/?ref=tiktok1
+// makes the download buttons count for tiktok1.
+(function downloadSource() {
+  const ref = (new URLSearchParams(location.search).get("ref") || "").toLowerCase();
+  if (!/^[a-z0-9-]{1,32}$/.test(ref)) return;
+  document.querySelectorAll("[data-download]").forEach((a) => {
+    a.href = `https://clippiboy.com/get/${ref}`;
+  });
+})();
 
 (async function release() {
   const data = (await fromSite()) ?? (await fromApi());

@@ -92,7 +92,8 @@ const swap = (pattern, replacement) => {
   if (next === html) console.warn(`::warning::Nothing in index.html matched ${pattern}`);
   html = next;
 };
-swap(/(data-download href=")[^"]*"/g, `$1${escape(release.setup.url)}"`);
+// The download buttons stay on clippiboy.com/get/…, which counts per link and
+// serves this release; main.js carries a ?ref= of the page over to them.
 if (release.plugin) swap(/(data-plugin href=")[^"]*"/g, `$1${escape(release.plugin.url)}"`);
 swap(/(<span data-version>)[^<]*(<\/span>)/, `$1Version ${escape(release.version)}, ${mb} MB$2`);
 if (downloads > 0) {

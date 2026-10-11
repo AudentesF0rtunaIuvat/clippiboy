@@ -1,12 +1,16 @@
+import { downloadName, isBot, refFromPath, utcDay } from "../src/telemetry";
+
 const ORIGIN = "https://einfabo.github.io/clippiboy";
+const RELEASES = "https://github.com/EinFabo/clippiboy/releases/latest";
 const HOME = "https://clippiboy.com";
 
 interface Env {
   API: Fetcher;
+  DB: D1Database;
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     // One address: www goes to the bare domain.
     if (url.hostname !== "clippiboy.com") {
@@ -18,6 +22,9 @@ export default {
     // A share link's page; the video on it loads from api.clippiboy.com directly.
     if (/^\/c\/[a-z0-9]+$/.test(url.pathname)) {
       return env.API.fetch(request);
+    }
+    if (/^\/get(\/|$)/.test(url.pathname)) {
+      return download(request, env, ctx, refFromPath(url.pathname));
     }
     const upstream = await fetch(`${ORIGIN}${url.pathname}${url.search}`, {
       method: request.method,
@@ -36,3 +43,42 @@ export default {
     return response;
   },
 };
+
+/**
+ * The latest setup under a name that carries where the link came from — the
+ * installer writes its own name down and the app reads the source out of it. A
+ * redirect would not do: then GitHub's name would win. Each real download adds
+ * one to its link's count for the day; nothing else about the request is kept.
+ */
+async function download(request: Request, env: Env, ctx: ExecutionContext, ref: string): Promise<Response> {
+  let release: { version: string; setup: { url: string } };
+  let file: Response;
+  try {
+    // The release the page itself shows, baked in after every release.
+    const baked = await fetch(`${ORIGIN}/release.json`, { cf: { cacheEverything: true, cacheTtl: 300 } });
+    if (!baked.ok) throw new Error(`release.json: ${baked.status}`);
+    release = await baked.json();
+    file = await fetch(release.setup.url, { method: request.method });
+    if (!file.ok) throw new Error(`setup: ${file.status}`);
+  } catch (err) {
+    console.error(err);
+    return Response.redirect(RELEASES, 302);
+  }
+  if (request.method === "GET" && !isBot(request.headers.get("User-Agent"))) {
+    ctx.waitUntil(
+      env.DB.prepare(
+        "INSERT INTO downloads (day, ref, count) VALUES (?, ?, 1) ON CONFLICT(day, ref) DO UPDATE SET count = count + 1",
+      )
+        .bind(utcDay(Date.now()), ref)
+        .run(),
+    );
+  }
+  const headers = new Headers({
+    "Content-Type": "application/octet-stream",
+    "Content-Disposition": `attachment; filename="${downloadName(release.version, ref)}"`,
+    "Cache-Control": "no-store",
+  });
+  const length = file.headers.get("Content-Length");
+  if (length) headers.set("Content-Length", length);
+  return new Response(request.method === "HEAD" ? null : file.body, { headers });
+}
