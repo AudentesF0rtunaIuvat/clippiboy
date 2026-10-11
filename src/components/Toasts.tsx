@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { inTauri } from "@/lib/ipc";
+import { api, inTauri } from "@/lib/ipc";
 import { cn } from "@/lib/cn";
 import { useFlip } from "@/lib/useFlip";
 
@@ -59,12 +59,24 @@ export function Toasts() {
               ),
             );
           },
-          entry.kind === "error" ? 6000 : 3000,
+          entry.kind === "error" || entry.message.length > 60 ? 6000 : 3000,
         ),
       );
     }).then((fn) => {
       if (cancelled) fn();
-      else unlisten = fn;
+      else {
+        unlisten = fn;
+        // Now that a toast can show: tell someone who updated, once, that
+        // usage stats are on (the app decides whether that is still due). Not
+        // while the window waits hidden in the tray — then on first showing.
+        const notice = () => {
+          if (document.visibilityState !== "visible") return;
+          document.removeEventListener("visibilitychange", notice);
+          void api.usageNotice().catch(() => {});
+        };
+        document.addEventListener("visibilitychange", notice);
+        notice();
+      }
     });
 
     return () => {

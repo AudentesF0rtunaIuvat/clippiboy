@@ -47,6 +47,11 @@ export const api = {
   setConfig: (config: AppConfig) => invoke<void>("set_config", { config }),
   /** Play a notification sound at `volume` (0–1), switched on or not. */
   previewSound: (kind: SoundKind, volume: number) => invoke<void>("preview_sound", { kind, volume }),
+  /** The download link the installer came from, if its name carried one. */
+  usageSource: () => invoke<string | null>("usage_source"),
+  usageSetHeard: (heard: string | null) => invoke<void>("usage_set_heard", { heard }),
+  /** Tells someone who updated, once, that usage stats are on. */
+  usageNotice: () => invoke<void>("usage_notice"),
   /** Throws when a combination is invalid or already taken. */
   /** All four at once — the core only accepts them together. */
   setHotkeys: (

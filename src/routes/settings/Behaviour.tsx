@@ -2,7 +2,7 @@ import { useShallow } from "zustand/react/shallow";
 import { useEngine } from "@/store";
 import { Card, SectionTitle } from "@/components/ui/Card";
 import { Toggle } from "@/components/ui/Controls";
-import { Row } from "./shared";
+import { Row, USAGE_HINT } from "./shared";
 
 export function BehaviourTab() {
   // `useShallow`, siehe `SourceTrouble`.
@@ -42,6 +42,12 @@ export function BehaviourTab() {
             onChange={(autoStartWithWindows) =>
               patchConfig({ autoStartWithWindows })
             }
+          />
+        </Row>
+        <Row label="Send anonymous usage stats" hint={USAGE_HINT}>
+          <Toggle
+            checked={config.usageStats}
+            onChange={(usageStats) => patchConfig({ usageStats, usageStatsNoticed: true })}
           />
         </Row>
       </Card>

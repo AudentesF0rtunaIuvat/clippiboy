@@ -7,12 +7,26 @@ import { Button } from "@/components/ui/Button";
 import { Segmented, Toggle } from "@/components/ui/Controls";
 import { Mark } from "@/components/ui/Logo";
 import { cn } from "@/lib/cn";
+import { api, inTauri } from "@/lib/ipc";
 import { TargetCard } from "@/routes/Recording";
 import { QuickSetup } from "@/routes/AudioMixer";
 import { Hotkeys, keyLabel } from "@/routes/settings/Hotkeys";
-import { Row, screenChoice } from "@/routes/settings/shared";
+import { Row, screenChoice, USAGE_HINT } from "@/routes/settings/shared";
 
-const STEPS = ["welcome", "screen", "audio", "hotkeys", "ready"] as const;
+const STEPS = ["welcome", "heard", "screen", "audio", "hotkeys", "ready"] as const;
+type StepName = (typeof STEPS)[number];
+
+/** Answers to "Where did you hear about ClippiBoy?" — the server knows the same keys. */
+const HEARD = [
+  { key: "tiktok", label: "TikTok" },
+  { key: "youtube", label: "YouTube" },
+  { key: "discord", label: "Discord" },
+  { key: "friend", label: "A friend" },
+  { key: "reddit", label: "Reddit" },
+  { key: "other", label: "Other" },
+] as const;
+
+const COUNT_WORDS: Record<number, string> = { 4: "Four", 5: "Five" };
 
 /** Buffer lengths offered in the last step, in seconds. */
 const LENGTHS = ["60", "90", "120", "180"] as const;
@@ -71,6 +85,13 @@ export function Setup() {
   const [busy, setBusy] = useState(false);
   /** The clip length as it was on opening, to tell "left alone" from "changed". */
   const [keptLength, setKeptLength] = useState("");
+  const [usageStats, setUsageStats] = useState(true);
+  /**
+   * Only on the very first setup, and only when the download link did not
+   * already say where someone came from.
+   */
+  const [askHeard, setAskHeard] = useState(false);
+  const steps: readonly StepName[] = askHeard ? STEPS : STEPS.filter((s) => s !== "heard");
 
   // Fresh lists each time it opens: a screen or headset plugged in since start.
   // The choices of the last step start from what is configured now.
@@ -89,17 +110,31 @@ export function Setup() {
     setKeptLength(current);
     setAutoStart(config.setupDone ? config.buffer.autoStart : true);
     setWithWindows(config.autoStartWithWindows);
+    setUsageStats(config.usageStats);
+    setAskHeard(false);
+    if (!config.setupDone && inTauri) {
+      void api
+        .usageSource()
+        .then((source) => setAskHeard(source === null))
+        .catch(() => {});
+    }
     // Only on opening — not every time the config changes underneath.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   if (!open) return null;
 
-  const name = STEPS[step];
-  const last = step === STEPS.length - 1;
+  const name = steps[step];
+  const last = step === steps.length - 1;
+
+  const heard = (key: string) => {
+    if (inTauri) void api.usageSetHeard(key).catch(() => {});
+    setStep(step + 1);
+  };
 
   const skip = async () => {
     setSetupOpen(false);
+    // The switch was on the last step, unseen — so the notice still comes.
     if (!config.setupDone) await patchConfig({ setupDone: true });
   };
 
@@ -123,6 +158,8 @@ export function Setup() {
         setupDone: true,
         buffer,
         autoStartWithWindows: withWindows,
+        usageStats,
+        usageStatsNoticed: true,
       });
       if (!useEngine.getState().bufferActive) await toggleBuffer();
       setSetupOpen(false);
@@ -153,8 +190,8 @@ export function Setup() {
       />
       <div className="relative mx-auto flex min-h-full w-full max-w-[720px] flex-col px-8 py-8">
         <header data-tauri-drag-region className="flex items-center justify-between gap-4">
-          <div className="flex items-center gap-1.5" aria-label={`Step ${step + 1} of ${STEPS.length}`}>
-            {STEPS.map((s, i) => (
+          <div className="flex items-center gap-1.5" aria-label={`Step ${step + 1} of ${steps.length}`}>
+            {steps.map((s, i) => (
               <span
                 key={s}
                 className={cn(
@@ -178,9 +215,33 @@ export function Setup() {
               <h1 className="mt-6 text-[28px] font-semibold tracking-tight">Welcome to ClippiBoy</h1>
               <p className="mt-3 max-w-[460px] text-sm text-ink-muted">
                 ClippiBoy keeps the last minutes of your game, so you can save the best moment
-                after it happened. Four quick steps and you are set.
+                after it happened. {COUNT_WORDS[steps.length - 1]} quick steps and you are set.
               </p>
             </div>
+          )}
+
+          {name === "heard" && (
+            <Step title="Where did you hear about ClippiBoy?" hint="Helps us see what works. Optional.">
+              <div className="grid grid-cols-3 gap-3">
+                {HEARD.map(({ key, label }) => (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => heard(key)}
+                    className="rounded-card border border-line bg-surface px-4 py-4 text-sm font-medium transition-colors hover:border-accent/60 hover:bg-elevated"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={() => setStep(step + 1)}
+                className="mt-4 text-xs text-ink-faint underline-offset-2 hover:text-ink hover:underline"
+              >
+                Skip
+              </button>
+            </Step>
           )}
 
           {name === "screen" && (
@@ -275,6 +336,9 @@ export function Setup() {
                 </Row>
                 <Row label="Start with Windows" hint="Starts hidden in the tray">
                   <Toggle checked={withWindows} onChange={setWithWindows} />
+                </Row>
+                <Row label="Send anonymous usage stats" hint={USAGE_HINT}>
+                  <Toggle checked={usageStats} onChange={setUsageStats} />
                 </Row>
               </Card>
               <p className="mt-5 rounded-inner border border-line bg-elevated px-4 py-3 text-sm">
