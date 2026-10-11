@@ -63,6 +63,8 @@ pub fn default_config() -> AppConfig {
         tray_hint_shown: false,
         watermark: true,
         setup_done: false,
+        usage_stats: true,
+        usage_stats_noticed: false,
         control: ControlConfig::default(),
         accent_color: None,
         colors_unlocked: false,

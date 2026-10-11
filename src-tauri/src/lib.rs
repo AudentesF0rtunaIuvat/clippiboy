@@ -32,6 +32,7 @@ pub mod state;
 pub mod stems;
 pub mod thumbs;
 pub mod tint;
+pub mod telemetry;
 pub mod tools;
 pub mod tray;
 pub mod updater;
@@ -1263,6 +1264,7 @@ pub fn run() {
             }
             start_buffer_if_configured(handle);
             updater::watch(handle);
+            telemetry::start(handle);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1355,11 +1357,17 @@ pub fn run() {
             share::share_cancel,
             share::share_dismiss,
             share::share_clear,
+            telemetry::usage_source,
+            telemetry::usage_set_heard,
+            telemetry::usage_notice,
         ])
         .build(tauri::generate_context!())
         .expect("could not start ClippiBoy");
 
     app.run(|handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            telemetry::flush();
+        }
         // A hidden window must not take the process with it — quitting only
         // happens via "Quit" in the tray.
         if let tauri::RunEvent::ExitRequested { api, .. } = event {

@@ -371,6 +371,7 @@ impl AppState {
         };
         // Takes effect with the next frame, no restart.
         crate::watermark::set_enabled(next.watermark);
+        crate::telemetry::on_config(&next);
         self.apply_audio();
         // A running buffer takes a new length right away — longer fills up from
         // here, shorter is cut down. Without this it kept the length it was

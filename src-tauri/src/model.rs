@@ -515,6 +515,14 @@ pub struct AppConfig {
     /// config from before it existed belongs to someone already set up.
     #[serde(default = "yes")]
     pub setup_done: bool,
+    /// The anonymous daily usage ping (`telemetry.rs`). On by default, also for
+    /// configs from before it existed — those get told once, see below.
+    #[serde(default = "yes")]
+    pub usage_stats: bool,
+    /// Whether the switch above has been shown: in the setup, or once as a
+    /// notice after the update that brought it. No ping goes out before.
+    #[serde(default)]
+    pub usage_stats_noticed: bool,
     /// The local port for the Stream Deck plugin — see [`ControlConfig`].
     #[serde(default)]
     pub control: ControlConfig,
