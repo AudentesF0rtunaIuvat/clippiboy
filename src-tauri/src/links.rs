@@ -496,6 +496,7 @@ async fn upload(
             log::warn!("share link {}: no poster: {err}", link.id);
         }
     }
+    crate::telemetry::used(crate::telemetry::Feature::ShareLink);
     Ok(link)
 }
 

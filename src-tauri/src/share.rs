@@ -351,6 +351,7 @@ pub async fn share_send(app: AppHandle, clip_id: String, friend_id: String) -> R
             crate::friends::send_relay(&app, &friend_id, &Signal::ShareCancel { id });
         }
     });
+    crate::telemetry::used(crate::telemetry::Feature::SendFriend);
     Ok(())
 }
 

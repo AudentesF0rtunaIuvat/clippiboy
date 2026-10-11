@@ -157,6 +157,9 @@ fn handle(app: &tauri::AppHandle, mut request: Request, token: &str) {
     if !allowed {
         return respond(request, 403, json!({ "ok": false, "error": "forbidden" }));
     }
+    if *request.method() == Method::Post {
+        crate::telemetry::used(crate::telemetry::Feature::StreamDeck);
+    }
 
     // The query part is nothing this port uses; cutting it off keeps a stray
     // `?x=1` from turning into a 404.

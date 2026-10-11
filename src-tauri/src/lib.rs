@@ -129,6 +129,7 @@ pub fn save_clip_and_notify(app: &tauri::AppHandle, seconds: Option<u32>) -> Res
             let _ = app.emit("clip-saved", clip.clone());
             notify(app, "ok", format!("Clip saved · {seconds} s"));
             sounds::play(app, SoundKind::ClipSaved);
+            telemetry::clip();
             overlay::show_with_thumb(
                 app,
                 BannerKind::Clip,
@@ -176,6 +177,7 @@ pub fn take_screenshot_and_notify(app: &tauri::AppHandle) -> Result<model::Clip,
             let _ = app.emit("clip-saved", clip.clone());
             notify(app, "ok", "Screenshot saved".to_string());
             sounds::play(app, SoundKind::Screenshot);
+            telemetry::shot();
             overlay::show_with_thumb(
                 app,
                 BannerKind::Screenshot,
@@ -249,6 +251,7 @@ pub fn stop_recording_and_notify(app: &tauri::AppHandle) -> Result<model::Clip, 
             let length = format::duration(clip.duration_ms);
             notify(app, "ok", format!("Recording saved · {length}"));
             sounds::play(app, SoundKind::RecordingSaved);
+            telemetry::recording();
             overlay::show_with_thumb(
                 app,
                 BannerKind::Recording,

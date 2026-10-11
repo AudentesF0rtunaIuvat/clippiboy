@@ -195,6 +195,7 @@ pub fn open(app: &tauri::AppHandle) {
     // is still on screen. This is where it starts over — and where the page
     // learns how much room the task bar wants.
     let _ = window.emit("console-opened", layout);
+    crate::telemetry::used(crate::telemetry::Feature::Console);
     // Shown last, the console now lies over a banner or REC badge standing at
     // the same moment. Those belong on top.
     overlay::raise(app);

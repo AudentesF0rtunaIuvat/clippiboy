@@ -1065,6 +1065,7 @@ pub fn discard_clip_original(
             .ok_or_else(|| "clip not found".to_string())
     })?;
     announce_change(&app);
+    crate::telemetry::used(crate::telemetry::Feature::Editor);
     Ok(clip)
 }
 

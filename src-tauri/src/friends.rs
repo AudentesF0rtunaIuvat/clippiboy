@@ -439,6 +439,7 @@ async fn serve(app: &AppHandle, token: &str) -> Result<End, String> {
     let friends = app.state::<Friends>();
     *friends.outbox.lock() = Some(sender);
     friends.view.lock().connected = true;
+    crate::telemetry::used(crate::telemetry::Feature::Friends);
     emit(app);
     // The lists may have changed while we were away.
     if let Err(err) = refresh(app, true).await {
