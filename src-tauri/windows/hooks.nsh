@@ -32,3 +32,24 @@
     Pop $R8
   ${EndIf}
 !macroend
+
+; Runs after everything is in place.
+;
+; Downloads from clippiboy.com/get/<ref> are named ...-setup.<ref>.exe, so the
+; installer's own file name says which link it came from. Write it down for the
+; app, which reads the source out of it (telemetry.rs) - no parsing here. Only
+; the first install does: an update runs the plain GitHub installer and must not
+; overwrite where someone originally came from.
+!macro NSIS_HOOK_POSTINSTALL
+  ${IfNot} ${FileExists} "$LOCALAPPDATA\gg.clippiboy.app\install-source.txt"
+    Push $R8
+    CreateDirectory "$LOCALAPPDATA\gg.clippiboy.app"
+    ClearErrors
+    FileOpen $R8 "$LOCALAPPDATA\gg.clippiboy.app\install-source.txt" w
+    ${IfNot} ${Errors}
+      FileWrite $R8 "$EXEFILE"
+      FileClose $R8
+    ${EndIf}
+    Pop $R8
+  ${EndIf}
+!macroend
