@@ -1,0 +1,1279 @@
+[
+ {
+  "id": "ED-10",
+  "title": "Drag repaints the whole run on a full-res canvas and re-renders the entire ShotViewer tree on every pointer move",
+  "severity": "medium",
+  "category": "perf",
+  "locations": [
+   "ShotAnnotate.tsx:679-683",
+   "ShotAnnotate.tsx:796-802"
+  ],
+  "claim": "A move or resize drag repaints the entire run containing the mark (all of its siblings) on a full-resolution canvas. Each move also calls `editShapes` -> `setShapes` in ShotViewer, re-rendering the whole ~1650-line tree (sidebar, ColorPicker, ClipMeta).",
+  "scenario": "Dragging or resizing a mark on a large screenshot causes a full-res repaint and a full React re-render per pointermove, making interaction sluggish.",
+  "fix": "During a drag, lift the dragged mark into its own layer (as is already done for drafts) and throttle with rAF; memoise the side panel.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "ShotAnnotate.tsx:796-802 onMove for a move drag calls `replace(state.id, {...}, state.gesture)` on every pointermove, and replace (701-705) is `onShapes(shapes.map(s => s.id === id ? {...s, ...patch} : s), gesture)`, so no rAF throttle and no local drag state. The layers are built by `toSteps(... shapes ...)` (679-682), which puts the new object into its existing run. The guard `sameLayer` (548-556) compares shape identities, so only the run holding the dragged mark fails it. That run's ShapeLayer effect (569-575) then runs `ctx.clearRect(0,0,element.width,element.height); paint(ctx, shapes)` on a canvas sized `width={width} height={height}` (picture resolution, 578-581), repainting every sibling in the run. The 'own layer' treatment in the comment at 670-673 only applies to `draft` (683), never to a dragged existing mark. On the ShotViewer side, onShapes={editShapes} (ShotViewer.tsx:888) calls `setShapes(after); setUnsaved(true);` (281-292) in the 1649-line ShotViewer component. ClipMeta (ClipMeta.tsx:16 `export function ClipMeta`) and ColorPicker are not memo-wrapped, and vite.config.ts uses plain `react()` with no React Compiler, so the whole panel reconciles on each move. usePictureBox's box is memoised (pictureBox.ts:96-99), so other runs really are skipped.",
+    "corrected_claim": "",
+    "reachable_by": "Any user in draw mode who uses the Select tool to drag or resize an existing mark. The cost grows with picture resolution (4K stills) and with the number of marks in the same run.",
+    "fix_assessment": "Lifting the dragged mark out has to keep its z-order relative to later blur steps: split the run into before, dragged and after rather than putting it on top, which briefly adds full-res canvases. A rAF throttle adds little because Chromium already delivers pointermove at most once per frame. A simpler, larger win is to keep the drag local to AnnotateLayer (as is done for draft) and call onShapes once on pointerup, or else to memoise the side panel."
+   },
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "ShotAnnotate.tsx:796-802 onMove 'move' branch calls replace(state.id, {...}, state.gesture) -> onShapes(shapes.map(...)) on every pointermove; ShotViewer.tsx:281-291 editShapes -> setShapes(after); setUnsaved(true) re-renders the whole ShotViewer (ClipMeta at :943, ColorPicker at :971/:984, neither memoised). ShotAnnotate.tsx:679-682 layers = useMemo(() => toSteps(...), [shapes, written]); toSteps (:491-524) groups consecutive non-blur marks into one {kind:'layer'} run; ShapeLayer (:566-575) clearRect + paint(ctx, shapes) on a canvas of the picture's full width/height. sameLayer (:548-556) compares marks by identity, and replace only rebuilds the touched mark, so ONLY the run containing the dragged mark repaints; the other runs are skipped. The 'layer of its own' treatment (:669-672, drawing at :684) applies to the draft only, not to move/resize drags. ShotViewer is mounted only in the main window (Clips.tsx:656), whose args in tauri.conf.json:27 keep the GPU (only overlay/console use --disable-gpu, overlay.rs:57).",
+    "corrected_claim": "The mechanism is real, but it is narrower than claimed. Each move or resize drag repaints one full-resolution canvas: the run holding the dragged mark and its non-blur neighbours. Other runs are skipped by sameLayer. Each move also re-renders ShotViewer and its unmemoised side panel. Chromium already aligns pointermove to animation frames, so this is at most one repaint and one React render per frame, not per raw sample. The canvas is GPU-accelerated in the main window. Expect visible lag only on weak hardware with a 4K still and a run holding many or long pen strokes. This is a low-severity performance issue, not a correctness one.",
+    "reachable_by": "Ordinary use by the local user: select tool, drag or resize an existing mark in the screenshot editor (main window, Clips route). No security impact.",
+    "fix_assessment": "Lifting the dragged mark into its own canvas during the gesture, as is done for drafts, would cut the repaint to that one mark, and memoising ClipMeta/side panel trims React work. An rAF throttle adds little because Chromium already coalesces pointermove per frame."
+   }
+  ]
+ },
+ {
+  "id": "ED-11",
+  "title": "Failed thumbnail rebuild silently keeps the pre-edit (unredacted) thumbnail",
+  "severity": "medium",
+  "category": "privacy",
+  "locations": [
+   "commands.rs:640-643",
+   "clips.rs:290-302"
+  ],
+  "claim": "After an edit, thumbnail failure is only logged: `if let Err(err) = make_still(..) { log::warn!(..) }` (commands.rs:640-643), and `set_picture` (clips.rs:290-302) doesn't touch `thumb_path`. The old `thumbs/<id>.jpg` stays; gallery and console tiles use `?v=${clip.sizeBytes}`, which changes, so they re-fetch the old JPEG. Also, if the capture-time thumbnail failed, `thumb_path` stays NULL forever even after a successful rebuild.",
+  "scenario": "ffmpeg is unavailable or fails at edit time (it was fine at capture): a 480-px thumbnail of the unblurred content remains visible in the gallery and console.",
+  "fix": "Build the thumbnail in-process from the `picture` already in memory (box downscale + the existing `png` crate; drop the ffmpeg dependency for stills). On any failure delete the old thumbnail and set `thumb_path` to NULL. Have `set_picture` also set `thumb_path`.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "commands.rs:641-643 `if let Err(err) = crate::thumbs::make_still(&target, &clip.id) { log::warn!(\"thumbnail not refreshed: {err}\"); }` then commands.rs:645-646 `lib.set_picture(&clip.id, picture.width, picture.height, size_bytes)`; clips.rs:289-301 set_picture only `UPDATE clips SET width = ?2, height = ?3, size_bytes = ?4` (thumb_path untouched; set_thumb at clips.rs:253 is only called from thumbs::migrate:115, which skips clips whose thumb_path is None at :89-91). thumbs.rs:50-62 make_still shells out to ffmpeg writing thumbs/<id>.jpg; a spawn failure (muxer.rs:66-68) leaves the old file in place. Reach: write_screenshot (commands.rs:497, invoked via ipc.ts:148 from ShotViewer.tsx:619) -> edit_screenshot -> write_picture (:598). Edits are not gated on ffmpeg readiness. tools.rs:135-156 sets TOOL_DIR only after the pinned VERSION is present/downloaded; until then muxer::tool falls back to bare 'ffmpeg' on PATH (muxer.rs:45-48). Tiles: Clips.tsx:474 and Console.tsx:633 `?v=${clip.sizeBytes}` re-fetch the same stale file. Dashboard.tsx:236 has no cache-buster at all. take_screenshot (state.rs:890-940) is not gated on ffmpeg, so a capture during the first-run download stores thumb_path=None (state.rs:933-939), and no later step records the thumbnail.",
+    "corrected_claim": "Exposure is local only. Screenshots cannot be shared as links (links.rs:343-345), so the stale thumbnail is never uploaded as a poster. A friend who receives a screenshot builds a thumbnail from the received file (share.rs:837-838). The unredacted original is also kept on disk by design (keep_original, commands.rs:605-619). The stale JPEG is a second local copy that the user can see in the UI, not a new exfiltration path.",
+    "reachable_by": "The local user, through ordinary use. They blur or crop a screenshot while the pinned ffmpeg is unavailable: the window after an app update that bumps tools::VERSION while the ~200 MB download runs or fails offline, a removed or quarantined ffmpeg.exe, or a failure writing the .jpg. The old 480-px thumbnail then keeps showing the unredacted content in the gallery, the console and the dashboard, visible to anyone who sees the screen (for example a stream of the main window). The NULL-forever part is reached by taking a screenshot before the first-run ffmpeg download finishes.",
+    "fix_assessment": "The fix is sound. Downscaling the in-memory picture in-process removes the ffmpeg dependency for stills. On any failure the code should delete thumbs/<id>.jpg and call set_thumb(None); on success it should call set_thumb(Some(path)), using the existing clips.rs:253, which also cures the NULL-forever case. Dashboard.tsx:236 also needs a ?v= cache-buster."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "commands.rs:641-643 `if let Err(err) = crate::thumbs::make_still(&target, &clip.id) { log::warn!(\"thumbnail not refreshed: {err}\"); }`: the old file is neither deleted nor nulled. clips.rs:297-299 set_picture only runs `UPDATE clips SET width = ?2, height = ?3, size_bytes = ?4`, so thumb_path is never touched. thumbs.rs:51-63 make_still uses an external ffmpeg (muxer.rs:39-48 falls back to PATH if the pinned tool is missing), and on failure `thumbs/<id>.jpg` from capture is left in place. Capture: state.rs:933-939 sets `thumb_path` to None when make_still fails, and nothing ever repairs a NULL. thumbs.rs:91-93 migrate `continue`s on None, and set_thumb is called only from migrate. Consumers: Clips.tsx:474 and Console.tsx:633 use `${fileUrl(clip.thumbPath)}?v=${clip.sizeBytes}`, and size_bytes changes after the rewrite (commands.rs:640), so they re-fetch the stale JPEG. Dashboard.tsx:236 has no cache-buster at all. Exposure is limited to the local machine: share links refuse screenshots (links.rs:343-345 `if clip.screenshot { return Err(...) }`), so the poster upload at links.rs:487 never sends a screenshot thumbnail, and P2P receivers build their own thumbnail from the received file (share.rs:837-841).",
+    "corrected_claim": "",
+    "reachable_by": "A local user who edits (blurs or crops) a screenshot while ffmpeg cannot be started or fails, for example the pinned binary was removed or quarantined, or the thumbnail file is locked. For the NULL thumb_path part: any screenshot taken while ffmpeg was unavailable, such as before the tool download finished. The stale image shows only in local UI (gallery, console overlay, dashboard, share dialog). It is never uploaded.",
+    "fix_assessment": "The robust core of the fix is sound: on failure, delete thumbs/<id>.jpg and set thumb_path to NULL, and on success set thumb_path. Building the thumbnail in-process needs care. The crate only has `png` (no JPEG encoder), while thumbs::path names the file `.jpg`, so either the path or extension changes or the code relies on content sniffing."
+   }
+  ]
+ },
+ {
+  "id": "ED-12",
+  "title": "Editor trusts database dimensions when there is no original; received screenshots carry sender-claimed dimensions",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "commands.rs:457-461",
+   "share.rs:129-136",
+   "share.rs:841-851"
+  ],
+  "claim": "`screenshot_edit` falls back to `} else { (clip.width, clip.height) }` when there is no original (commands.rs:457-461). Received screenshots store sender-supplied meta as dimensions (`width: meta.width, height: meta.height`, share.rs:129-136, 841-851) without reading the file header.",
+  "scenario": "A friend's screenshot with wrong meta: the canvas, `full` and the CropLayer are sized wrongly, and `object-contain` letterboxes the real image inside a box of the wrong aspect. Marks and blurs misalign, and Rust rejects layers (\"does not fit\").",
+  "fix": "In `screenshot_edit` always use `size_of_png(clip.path)` when there is no original. At receive time verify the header (PNG magic, sane dimensions) and store the real dimensions.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "commands.rs:457-461 `let (original_width, original_height) = if original.is_file() { crate::shot::size_of_png(&original).unwrap_or((clip.width, clip.height)) } else { (clip.width, clip.height) };` -- no header read when there is no image.png. share.rs:848-849 file_clip: `width: meta.width, height: meta.height,` straight from the offer; offered() (share.rs:535-560) checks only id/sha256 lengths and tracks, never the dimensions or the file content. ShotViewer.tsx:426-429 `full = { width: edit?.originalWidth ?? clip.width, ... }` sizes CropLayer (:894-898) and the mark layers (:615 `layerBytes(step.shapes, full.width, full.height)`); the img is `object-contain` inside a box computed from ground.width/height (:840-852). On save, edit_screenshot calls keep_original then read_png(original) -> real dims, and shot.rs:104-107 `if top.0 != self.width || top.1 != self.height { return Err(\"The layer does not fit the picture.\") }`; blur coordinates are applied in the real picture's frame, so they land in the wrong place.",
+    "corrected_claim": "Accurate as stated, with two scope notes. (1) It is transient: keep_original (commands.rs:606-620) runs before the failing read, so after the first save attempt image.png exists and the next screenshot_edit uses size_of_png(original); a successful blur/crop-only save also corrects the DB via set_picture (commands.rs:646). So the first edit session is the broken one: layers are rejected, or blurs/crops land in the wrong place. (2) An honest ClippiBoy sender sends its own DB dimensions (share.rs:267-268), which match the file unless the file was changed outside ClippiBoy. The same stale-DB fallback therefore also hits LOCAL screenshots cropped in another app (the case under_rect's comment at shot.rs:398-401 anticipates). View mode also sizes the stage from clip.width/height (ShotViewer.tsx:449).",
+    "reachable_by": "A friend whose client sends wrong width/height in the offer meta (a modified or buggy client), after the user accepts the offer; or any screenshot whose file was cropped or resized outside ClippiBoy (local, or sent on by an honest sender), opened in the editor before any ClippiBoy edit.",
+    "fix_assessment": "Reading the header with size_of_png(clip.path) when there is no original is cheap and fixes every source of stale dimensions, including external edits. Checking the header at receive time and storing the real dimensions is a useful addition, and the DB width/height should also be corrected, because view mode uses them too."
+   },
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "commands.rs:457-461 `if original.is_file() { size_of_png(&original).unwrap_or((clip.width, clip.height)) } else { (clip.width, clip.height) }`; share.rs:848-849 `width: meta.width, height: meta.height` (file_clip, no header read); ShotViewer.tsx:427 `width: edit?.originalWidth ?? clip.width`, :448 view mode `{ src: clip.path, width: clip.width, height: clip.height }`, :615 `layerBytes(step.shapes, full.width, full.height)`; shot.rs:106-107 blend `if top.0 != self.width || top.1 != self.height { Err(\"The layer does not fit the picture.\") }`. Honest senders: share.rs:267-268 send `clip.width/clip.height`, which are the real PNG size (state.rs:950-951 from the grabbed shot; commands.rs:646 `set_picture(picture.width, picture.height)` after every edit). Self-heal: commands.rs:523 `keep_original(&clip)?` runs before the failing blend at :578, so the next screenshot_edit finds image.png and uses size_of_png. Entry: server/src/hub.ts:256 relays only between friends; share.rs:526-534 accept_clips gate; user must press Accept (share_accept, share.rs:360).",
+    "corrected_claim": "The mechanism is real: an untouched received screenshot is sized in the editor and viewer from the sender-supplied meta.width/height, and Rust rejects mark layers when they don't match. But a stock ClippiBoy sender always sends the true PNG size, so this needs a modified or third-party client run by an accepted friend, and the user has to accept the offer. It also corrects itself. The first save attempt (even one that fails at blend) runs keep_original first, so on the next open screenshot_edit reads the real size from image.png. Any successful save then fixes the database dimensions through set_picture. Until then, view mode and crop letterbox wrongly, and a crop made in the bad coordinates is clamped and can cut the wrong region.",
+    "reachable_by": "Only a friend (mutual friendship enforced by the server at hub.ts:256) running a modified or non-stock client who sends lying meta, and only after the user accepts the offer under their accept_clips setting. Ordinary use with stock senders never triggers it. In practice it is unlikely, and the only harm is to that one received picture.",
+    "fix_assessment": "The fix is sound and cheap. Using size_of_png(clip.path) when there is no original removes the editor dependency on the database. Reading the PNG header in file_clip (and storing the real size, or rejecting the file) also fixes view mode and the library dimensions."
+   }
+  ]
+ },
+ {
+  "id": "ED-13",
+  "title": "Received screenshots may be JPEG, which permanently breaks editing and Copy picture",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "share.rs:1187-1190"
+  ],
+  "claim": "The receive path accepts `jpg/jpeg` for screenshots (share.rs:1187-1190), but the editor and clipboard assume PNG.",
+  "scenario": "For a received `.jpg` screenshot, `keep_original` copies the JPEG to `image.png`, after which `read_png` fails forever; Copy picture also fails.",
+  "fix": "At receive time verify the header (PNG magic, sane dimensions) and reject non-PNG screenshots.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "share.rs:1187-1190 `\"mp4\" | \"mkv\" | \"mov\" | \"webm\" | \"png\" | \"jpg\" | \"jpeg\" => ext` with no check against meta.screenshot; receive (share.rs:643) saves under that name and file_clip (share.rs:864) sets `screenshot: meta.screenshot` with no content check. The thumbnail uses ffmpeg (thumbs.rs:51-63), so the item looks normal. Edit: commands.rs:523 keep_original copies the file to image.png (shot.rs:288), then :539 `read_png(original_path)` fails on JPEG data (png::Decoder, shot.rs:455-466), and has_original stays true, so every later edit fails the same way (forget is only reached on success, :535). Copy picture: commands.rs:666 `read_png(clip.path)` fails directly. Honest senders never produce this: state.rs:1232 `let extension = if kind == ClipKind::Screenshot { \"png\" } ...`, and write_picture (commands.rs:632-634) keeps the path and writes PNG.",
+    "corrected_claim": "Accurate as stated. The scope is a bit wider: no content check runs for screenshot=true at all, so a file named .mp4 or holding arbitrary bytes, flagged as a screenshot, breaks editing and Copy picture the same way. The copy into image.png is not what causes the failure (read_png on the JPEG fails either way); it just makes the failure persist. Stock ClippiBoy never sends a JPEG screenshot, so only a modified or third-party sender can reach this.",
+    "reachable_by": "Only an accepted friend (hub.ts:256 areFriends) running a non-stock client who flags a JPEG (or any non-PNG) file as a screenshot, and only after the user accepts the offer. A stock app never does this. The impact is limited to that one received item: viewing and the thumbnail work, editing and Copy picture fail with an error. There is no crash and no effect on other clips.",
+    "fix_assessment": "Checking the PNG magic and size at receive time, keyed on meta.screenshot rather than the extension, closes it and also covers the .mp4 or garbage case. Dropping jpg/jpeg from safe_file_name alone would not be enough."
+   },
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "share.rs:1187-1190 `\"mp4\" | \"mkv\" | \"mov\" | \"webm\" | \"png\" | \"jpg\" | \"jpeg\" => ext,` -- the screenshot flag and the extension are never cross-checked, and receive() (share.rs:618-680) only checks the sender-supplied sha256, never the content. edit_screenshot: keep_original copies clip.path to image.png (commands.rs:617), then `crate::shot::read_png(&crate::shot::original_path(&clip.id))?` (:533/:539). read_png uses png::Decoder::read_info (shot.rs:455-467), which fails with InvalidSignature on non-PNG data (png-0.17.16 decoder/stream.rs:810-820). copy_clip_image: `crate::shot::read_png(std::path::Path::new(&clip.path))?` (commands.rs:666). A locally captured screenshot is always .png (state.rs:1232 `let extension = if kind == ClipKind::Screenshot { \"png\" } else { \"mp4\" };`).",
+    "corrected_claim": "A received screenshot whose bytes are not PNG can never be edited (crop, marks or reset) and Copy picture always fails for it, because read_png only decodes PNG. Two details are wrong. (1) Nothing breaks 'permanently' because of keep_original: read_png fails on the very first attempt whether or not image.png exists, and the copy only leaves a misnamed JPEG in the edit store that is cleared when the clip is deleted. (2) The jpg/jpeg allowlist entry is not the root cause. Content is never checked, so a screenshot named .png that holds JPEG (or any other) bytes, or one sent with a .mp4 name, fails the same way. An honest ClippiBoy sender never produces this, because its screenshots are always PNG.",
+    "reachable_by": "A friend whose client is modified or not ClippiBoy (or who passes on such a file) sends an offer with screenshot:true and non-PNG content, and the receiving user accepts it.",
+    "fix_assessment": "Checking the content at receive time (PNG signature plus a successful read_info with sane dimensions) and rejecting non-PNG screenshots is the right fix. It must not rely on the extension, and for screenshots the stored extension should be forced to .png."
+   }
+  ]
+ },
+ {
+  "id": "ED-14",
+  "title": "AnnotateLayer and CropLayer never clear an interrupted drag",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "ShotAnnotate.tsx:917-925",
+   "ShotAnnotate.tsx:764-767",
+   "ShotViewer.tsx:1408-1414",
+   "ShotViewer.tsx:786-790"
+  ],
+  "claim": "AnnotateLayer only handles pointer down/move/up (ShotAnnotate.tsx:917-925), and `onMove` never checks `event.buttons` (764-767); CropLayer (ShotViewer.tsx:1408-1414) has the same gap. The stage's own pan handler already handles the case (\"Let go somewhere the stage never heard of it (Alt+Tab mid-drag)\", ShotViewer.tsx:786-790), but the two layers don't.",
+  "scenario": "After Alt+Tab or a lost pointer capture mid-drag, `drag.current` or `draft` stays set; the selected mark (or the crop) follows the hovering mouse with no button held and keeps adding to the same undo step until the next click.",
+  "fix": "Add `onPointerCancel` and `onLostPointerCapture` handlers that reset `drag.current` and the draft, and ignore moves with `event.buttons === 0`.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ShotAnnotate.tsx:923-925 the layer div wires only `onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp}`; handles (967-983) likewise only down/move/up. onMove (764-765) `const state = drag.current; const point = at(event);` then acts on state/draft with no `event.buttons` check; drag.current is cleared only in onUp (857) and the handle's onPointerUp (982); draft only via setDraft(null) in onUp (868). No pointercancel/lostpointercapture/blur/visibility handler anywhere in either file (grep). CropLayer src/components/ShotViewer.tsx:1411-1413, 1429-1431, 1447-1449: only down/move/up; onMove 1367-1369 `if (!state) return;` then onRect(...) with no buttons check; drag.current=null only in onUp 1391. Contrast the stage pan handler ShotViewer.tsx:786-790 `// Let go somewhere the stage never heard of it (Alt+Tab mid-drag). if (event.buttons === 0) { pan.current = null; return; }` plus 802-803 onPointerCancel/onLostPointerCapture. Undo coalescing: ShotViewer.tsx:285 `if (gesture === undefined || gesture !== lastGesture.current) history.current.push(before)` so stale move/handle drags with the same `drag-N` gesture merge into one undo step.",
+    "corrected_claim": "Accurate in substance, with two refinements: (1) only stale move/handle drags of a mark (drag.current) write marks and merge into the drag's undo step; a stale draft (new mark) just follows the mouse uncommitted and is silently replaced by the next pointerdown's setDraft (ShotAnnotate.tsx:747), and the crop selection (setSel) has no undo history at all. (2) The next click clears it (pointerup resets drag.current). Whether WebView2 really withholds pointerup/pointercancel after Alt+Tab mid-drag is platform behaviour not checkable here, but the codebase's own pan handler comment at ShotViewer.tsx:786 states it was observed.",
+    "reachable_by": "The local user dragging a mark, a mark handle, a new mark or the crop rectangle and then Alt+Tabbing (or otherwise losing the Win32 mouse capture) before releasing the button; no remote trigger.",
+    "fix_assessment": "Sound and consistent with the existing pan handler: add onPointerCancel/onLostPointerCapture that clear drag.current (and setDraft(null) or commit it) on the layer, the handles and the crop elements, and bail out of onMove when event.buttons === 0. Note the handles call setPointerCapture on their own element, so lostpointercapture must be handled there too."
+   }
+  ]
+ },
+ {
+  "id": "ED-15",
+  "title": "Unredacted original kept forever in originals/<id>/image.png with no way to purge it",
+  "severity": "medium",
+  "category": "privacy",
+  "locations": [
+   "shot.rs:287-289",
+   "edit.rs:139-151"
+  ],
+  "claim": "The pre-edit original is stored at `%APPDATA%\\ClippiBoy\\originals\\<id>\\image.png` (shot.rs:287-289) indefinitely. `discard_original` (edit.rs:139-151) only knows `video.mp4` and returns \"There is no original to throw away.\" for screenshots, so the only way to purge the unredacted pixels is to delete the screenshot.",
+  "scenario": "A user blurs or crops sensitive content believing it is gone; the unredacted full image remains on disk in the app data folder with no UI to remove it.",
+  "fix": "Add a \"Flatten - discard history\" action that removes `image.png`, `base.png` and `shot.json` (keeping `under.*`). Mention in the UI that blur and crop stay reversible locally.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/src/shot.rs:287-289 `pub fn original_path(clip_id) -> PathBuf { crate::edit::dir(clip_id).join(\"image.png\") }`; edit.rs:56-62 dir = config::data_dir().join(\"originals\").join(id), config.rs:10-12 data_dir = dirs::data_dir()/ClippiBoy (%APPDATA%\\ClippiBoy). commands.rs edit_screenshot calls `keep_original(&clip)?` unconditionally for every edit (blur/marks too, not only crop) and keep_original `std::fs::copy(&clip.path, &original)` once. The only removal paths: shot::forget (shot.rs:433-437), reached only when `crop.is_none() && steps.is_empty() && marks.is_empty()` i.e. reverting the file to the unredacted original (commands.rs ~531-536), and edit::remove on delete_clip. edit.rs:139-143 `let video = video_path(clip_id); if !video.is_file() { return Err(\"There is no original to throw away.\".into()); }` and trim_originals_on_disk (160-180) only counts video.mp4. UI: 'Free up space…' needs clip.originalAvailable (clipMenu.tsx:223), which is edit::has_original = trim note + video.mp4 (edit.rs:97-99, clips.rs:145), always false for a screenshot.",
+    "corrected_claim": "Accurate. Two nuances: the original is kept for any edit (blur-only included), not only a crop as the shot.rs:281 doc says; and the UI already discloses the kept copy ('Edited — the untouched picture sits beside it' pill tooltip, ShotViewer.tsx:743, and 'The untouched picture is kept beside it…' in the crop panel, ShotViewer.tsx:1181), so the 'believes it is gone' scenario is only partly true. The shared/exported file (clip.path) is redacted; the exposure is local (app-data folder, roaming profile/backups). under.png also holds unblurred pixels of the watermark corner.",
+    "reachable_by": "Anyone with read access to the user's %APPDATA%\\ClippiBoy\\originals folder (other local users with access, backups, roaming-profile sync, malware); the user cannot purge it short of deleting the screenshot or reverting the redaction.",
+    "fix_assessment": "A 'flatten / discard history' action deleting image.png, base.png and shot.json is workable (the next edit would re-snapshot the redacted file via keep_original), but it should also consider under.png/under.json, which can contain unblurred pixels under the watermark and whose size check (under_rect) will reject them after a crop anyway."
+   }
+  ]
+ },
+ {
+  "id": "ED-20",
+  "title": "Undo merges drags across an AnnotateLayer remount because gesture ids restart at 0",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "ShotAnnotate.tsx:638",
+   "ShotAnnotate.tsx:735",
+   "ShotAnnotate.tsx:976",
+   "ShotViewer.tsx:285-288"
+  ],
+  "claim": "Gesture ids come from `gestures.current`, which restarts at 0 whenever AnnotateLayer remounts (draw -> crop -> Cancel -> draw), while `lastGesture` in ShotViewer survives the remount. The first drag afterwards (`drag-1`) therefore merges with the last drag before the remount (`drag-1`).",
+  "scenario": "User drags a mark, switches to crop, cancels, returns to draw and drags again; one Undo reverts both drags.",
+  "fix": "Use a module-level or `useId`-based gesture counter and reset `lastGesture` on mode change.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ShotAnnotate.tsx:638 `const gestures = useRef(0);` (per-instance, resets on mount); :735 and :976 `gesture: \\`drag-${++gestures.current}\\``. src/components/ShotViewer.tsx:880-891 `{mode === \"draw\" && (<AnnotateLayer ... onShapes={editShapes} />)}` so the layer unmounts in crop mode; pickPreset (ShotViewer.tsx:540-549) sets mode \"crop\" and leaveCrop (567-571) `setMode(unsaved ? \"draw\" : \"view\")` — neither touches lastGesture. editShapes (ShotViewer.tsx:281-293): `if (gesture === undefined || gesture !== lastGesture.current) history.current.push(before);` — equal key => no new history entry. lastGesture is only cleared by resetShapes (267-272) and undo (297-300).",
+    "corrected_claim": "",
+    "reachable_by": "User in the editor: the last edit before entering crop must be the first drag (drag-1) of that draw session (counter counts pointer-downs on marks/handles); then crop preset -> Cancel (or pick a tool) -> drag a mark: the new drag-1 joins the old step, and one Ctrl+Z reverts both drags.",
+    "fix_assessment": "A module-level counter (or clearing lastGesture whenever mode changes / AnnotateLayer mounts) fixes it; either is sufficient on its own. useId would also yield a fresh value on client remount but is an odd tool for this."
+   }
+  ]
+ },
+ {
+  "id": "ED-21",
+  "title": "Restyle undo key merges separate style changes into one undo step",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "ShotViewer.tsx:682",
+   "ShotViewer.tsx:285-288",
+   "src/components/ShotViewer.tsx:281-294",
+   "src/components/ShotViewer.tsx:682"
+  ],
+  "claim": "`restyle` uses the history key `style-${id}-${keys}`, which is identical for separate clicks on the same mark and property.",
+  "scenario": "Changing one mark red -> blue -> green with three separate clicks produces a single undo step.",
+  "fix": "Give restyle a per-interaction token (pointerdown or slider-start).",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "EF-37",
+    "slice": "02-editor-features",
+    "title": "Separate restyles of the same mark merge into one undo step",
+    "claim": "Undo coalesces steps by a `gesture` key (ShotViewer.tsx:281-294). Restyle gestures are keyed `style-${id}-${keys}` (682), so two separate colour clicks on the same mark and property produce the same key and merge into one undo step.",
+    "locations": [
+     "src/components/ShotViewer.tsx:281-294",
+     "src/components/ShotViewer.tsx:682"
+    ],
+    "fix": "Add a counter that advances on pointerup/blur of the control so each discrete restyle gets its own key."
+   }
+  ],
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ShotViewer.tsx:678-686 `editShapes((drawn) => drawn.map(...), \\`style-${chosen.id}-${Object.keys(patch).join()}\\`)` — key depends only on mark id and patched property names. editShapes (281-293) skips history.push when `gesture === lastGesture.current`. Swatch clicks call it discretely: src/components/ui/ColorPicker.tsx:123 `onClick={() => onChange(swatch)}` -> ShotViewer.tsx:974 `onChange={(color) => restyle({ color })}`; Segmented look/shape (1017-1037) the same. Nothing between clicks (onSelect, opening the picker) resets lastGesture; only resetShapes/undo do.",
+    "corrected_claim": "",
+    "reachable_by": "User restyling the same selected mark with separate clicks (colour swatches, alt colour, Look/Shape segmented control, or separate slider pulls) with no other mark edit in between — even if another mark was selected and re-selected meanwhile.",
+    "fix_assessment": "A per-interaction token (bumped on pointerdown/pointerup or on discrete clicks) is right; alternatively clear lastGesture on slider release and pass no gesture for discrete swatch/segment clicks."
+   }
+  ]
+ },
+ {
+  "id": "ED-24",
+  "title": "Hit-test margin uses blur size (a radius) as stroke width, creating a huge invisible halo",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "ShotAnnotate.tsx:372"
+  ],
+  "claim": "`const margin = shape.tool === \"text\" ? slack : Math.max(slack, shape.size);` treats a blur's `size` as stroke width, but for blur it is a radius running up to `base*12` (96 px at 4K, 192 px at 8K).",
+  "scenario": "A recent blur's invisible halo steals Select clicks meant for nearby marks.",
+  "fix": "Use `slack` for blur (and text).",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ShotAnnotate.tsx:372 `const margin = shape.tool === \"text\" ? slack : Math.max(slack, shape.size);` applies to blur too. Blur's size is a radius (line 49 'radius for blur'), slider range(): line 125 `case \"blur\": return [base, base * 12, base * 2];` with base = max(2, round(width/480)) (line 115), fed by ShotViewer.tsx:689 `range(active, full.width)`, so the max is 96 px at 3840 wide and 192 px at 7680. Blur is not hollow (hollow() line 357 covers box/ellipse only), so it is caught in the first (precise) pass by the bounding-box test at 387-393 with that margin, and hitPass walks from the topmost shape down (line 368). The preview patch itself is only the rectangle (BlurPatch 1052-1065), so the whole margin is invisible. slack = 6/box.scale (line 689).",
+    "corrected_claim": "",
+    "reachable_by": "Any user who raises the Blur slider and then uses Select near that blur. At the default size (base*2) the margin is about equal to slack, so nothing changes. At the maximum the halo is about 12*base*scale, around 27 screen px at fit-to-window on any resolution, and it grows with editor zoom because the margin is fixed in picture pixels.",
+    "fix_assessment": "Using `slack` for blur (as already done for text) is correct and safe: the blur's visible extent is exactly its rectangle."
+   }
+  ]
+ },
+ {
+  "id": "ED-26",
+  "title": "Blur edge handling differs between preview and file",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/shot.rs:139-210",
+   "src/components/ShotAnnotate.tsx:1063",
+   "src-tauri/src/shot.rs:129-134"
+  ],
+  "claim": "The preview's backdrop-filter clips and mirrors at the patch edge, while the Rust blur reads `radius` pixels beyond the patch. A saved blur cut by a crop reads black stage in the preview but real pixels in Rust.",
+  "scenario": "Near patch or crop edges the saved blur looks different from the preview the user approved.",
+  "fix": "No specific fix given beyond aligning preview and file behaviour (see ED-1).",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "EF-28",
+    "slice": "02-editor-features",
+    "title": "Rust blur edge semantics assume backdrop-filter behaviour that may not hold",
+    "claim": "The Rust comment at shot.rs:129-134 assumes `backdrop-filter` blurs the whole picture and clips afterwards (so Rust reads a margin of `radius` around the rectangle). Chromium may instead clip the backdrop to the element and mirror at its edges, so blur edges near the rectangle border could differ between preview and file. The report says to verify in WebView2.",
+    "locations": [
+     "src-tauri/src/shot.rs:129-134"
+    ],
+    "fix": "Verify in WebView2; add parity tests / single renderer."
+   }
+  ],
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Rust reads beyond the rectangle: src-tauri/src/shot.rs:156-161 `let from_x = left.saturating_sub(radius); ... let to_x = (left + w + radius).min(self.width as usize);`. It also blurs the UNCROPPED original and crops only afterwards: src-tauri/src/commands.rs:569-584 `let mut picture = pristine; for step in &steps { ... picture.blur(...) ... } if let Some(area) = crop { picture = picture.crop(...)?; }`. The preview in draw mode shows only the cropped base.png (ShotViewer.tsx:439-447 `src: edit?.basePath ..., width: edit?.crop?.width`) on a `bg-black` stage (ShotViewer.tsx:822). BlurPatch elements are placed in stage coordinates and are not clipped to the picture box (ShotAnnotate.tsx:1052-1065; only the watermark-under img gets an overflow-hidden wrapper at ShotViewer.tsx:862-866). Marks kept from before a crop may reach past the new edges (ShotAnnotate.tsx:781-784). So at a crop edge the preview's backdrop holds either black stage or nothing beyond the ground, while the file blurs in the real pixels that the crop later removes. The shot.rs:129-134 comment's premise that the preview 'blurs the whole picture and clips afterwards' is a claim about Chromium that cannot be checked here.",
+    "corrected_claim": "The crop-edge mismatch follows from the source alone: the core blurs the pre-crop original, while the preview only has the cropped ground on a black stage. The broader claim that blur edges differ at every patch edge, because Chromium/WebView2 clips the backdrop to the element and mirrors at its edge, rests on Chromium's backdrop-filter edge mode and cannot be verified from this repo. If it holds, the file is the more blurred one at patch edges, which is the safe direction for redaction.",
+    "reachable_by": "A user who places a blur touching or crossing a crop edge (drawn after cropping, or kept from before a re-crop). The general patch-edge case applies to every blur if Chromium mirrors at the element edge.",
+    "fix_assessment": "There is no concrete fix. Aligning the two means either the core blurs after cropping and clamps or mirrors at the rectangle like Chromium, or the preview shows the core-rendered blur. Either needs a WebView2 check first."
+   }
+  ]
+ },
+ {
+  "id": "ED-27",
+  "title": "Caption text jumps vertically on commit (CSS line-height vs canvas textBaseline top)",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "ShotAnnotate.tsx:248-258",
+   "ShotAnnotate.tsx:1019-1020",
+   "src/components/ShotAnnotate.tsx:248",
+   "src/components/ShotAnnotate.tsx:1019-1020"
+  ],
+  "claim": "The caption edit field uses `lineHeight: 1.25` (CSS half-leading) while the canvas draws with `textBaseline = \"top\"` (em-box top), so the two place text at different vertical offsets.",
+  "scenario": "Text moves a few pixels vertically when the caption is committed from the field to the canvas.",
+  "fix": "No specific fix given (align the field's line box with the canvas baseline).",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "EF-47",
+    "slice": "02-editor-features",
+    "title": "Possible vertical jump when a caption is put down",
+    "claim": "The in-place caption textarea's CSS line box uses line-height 1.25 (ShotAnnotate.tsx:1019-1020) while the canvas draws text with `textBaseline=\"top\"` (248), so the text may jump vertically when the caption is committed. The report says to verify in WebView2.",
+    "locations": [
+     "src/components/ShotAnnotate.tsx:248",
+     "src/components/ShotAnnotate.tsx:1019-1020"
+    ],
+    "fix": "Position both the textarea and canvas text from `fontBoundingBoxAscent`."
+   }
+  ],
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Canvas: src/components/ShotAnnotate.tsx:247-258 `ctx.font = textFont(shape.size); ctx.textBaseline = \"top\"; ... const y = y1 + at * shape.size * LINE_HEIGHT; ctx.fillText(line, x1, y);` Field: ShotAnnotate.tsx:1013-1020 `...css(typing.x, typing.y), font: `600 ${style.size * box.scale}px Inter, ...`, lineHeight: LINE_HEIGHT` with p-0 (1011) and no vertical correction anywhere (no fontBoundingBox*/half-leading code in src/). In CSS the first baseline sits at half-leading + ascent = LH/2 + (A-D)/2 em below the field's top. Canvas 'top' places the em-square top at y (Blink: NormalizedTypoAscent, about tA/(tA+tD) em). These agree only by coincidence: a font with A+D = 1 em is off by exactly the half-leading, 0.125 em. With Inter-like metrics (A~0.969, D~0.241) it is about 0.19 em. While a caption is being edited it is left off the canvas (678-681), so on commit the field disappears and the canvas text appears at the other offset.",
+    "corrected_claim": "",
+    "reachable_by": "Every caption typed or re-edited in the editor. The size of the jump depends on the font that actually resolves (Inter / Segoe UI Variable Display via the local() @font-face in src/index.css:5-11): roughly 0.1-0.3 em, a few screen pixels at the default size.",
+    "fix_assessment": "Offsetting the textarea by (canvas em-top baseline - CSS first baseline), measured once with measureText().fontBoundingBoxAscent / emHeightAscent, or drawing with textBaseline='alphabetic' at y + half-leading + ascent, would align them. The suggested fontBoundingBoxAscent approach works if both sides use it."
+   }
+  ]
+ },
+ {
+  "id": "ED-30",
+  "title": "Thumbnail ffmpeg filter fails or upscales for extreme crops",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "thumbs.rs:59"
+  ],
+  "claim": "The thumbnail filter is `-vf scale=480:-1`, fixing width at 480 regardless of aspect or source size.",
+  "scenario": "A 16x4000 crop asks for 480x120000, which exceeds the JPEG limit, so ffmpeg fails and the stale-thumbnail problem (ED-11) applies; tiny crops get upscaled.",
+  "fix": "Use `scale='min(480,iw)':'min(480,ih)':force_original_aspect_ratio=decrease`.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/src/thumbs.rs:59 (make_still) `.args([\"-frames:v\", \"1\", \"-vf\", \"scale=480:-1\", \"-q:v\", \"4\"])` (same filter in make() at :36). The UI lets a crop go down to 16 px wide: ShotViewer.tsx:63 `const MIN_EDGE = 16;`, enforced only at :1387 `rect.width < MIN_EDGE || rect.height < MIN_EDGE`. After an edit, commands.rs:641 `if let Err(err) = crate::thumbs::make_still(&target, &clip.id) { log::warn!(\"thumbnail not refreshed: {err}\"); }`, so a failure is only logged. I ran the same command with local ffmpeg 6.1.1 on scratch images. 16x3000 fails with exit 234: `[mjpeg encoder] JPEG does not support resolutions above 65500x65500` / `Nothing was written into output file`. A previously existing .jpg kept the same md5, so the old thumbnail stays (stale). 16x2160 gives 480x64800, just under the limit. 16x16 gives 480x480, so it is upscaled.",
+    "corrected_claim": "",
+    "reachable_by": "A local user who crops a screenshot to a sliver whose height/width ratio is above about 136.5 (65500/480): for example a 16-px-wide full-height crop on a portrait 1440p/4K or a 5K monitor. A 4K landscape picture just stays under the limit. Received/shared tall images go through make_still too (share.rs:838, state.rs:933).",
+    "fix_assessment": "I tested the proposed filter `scale='min(480,iw)':'min(480,ih)':force_original_aspect_ratio=decrease` with ffmpeg 6.1.1. It handles all three cases: 16x3000 gives 3x480, 16x2160 gives 4x480, and 16x16 stays 16x16. Because Command passes the args without a shell, the quotes reach ffmpeg's filter parser as intended. The only side effect is that portrait thumbnails get smaller (they are capped at 480 tall)."
+   }
+  ]
+ },
+ {
+  "id": "ED-31",
+  "title": "Out-of-range rectangles are clamped to a 1-pixel strip instead of rejected",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "shot.rs:48-57",
+   "shot.rs:59-63",
+   "shot.rs:148-151"
+  ],
+  "claim": "Clamping uses `x.min(self.width.saturating_sub(1))`, so a rectangle entirely right of or below the picture becomes a 1-px strip at the edge: `clamped` and `crop` succeed and `blur` writes one column, instead of returning an error. The UI never sends such a rect, but a buggy or compromised caller could.",
+  "scenario": "A malformed write_screenshot call with a rect outside the picture silently crops to / blurs a 1-px edge strip rather than failing.",
+  "fix": "`if area.x >= self.width || area.y >= self.height { return Err(..) }`.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "shot.rs:49-53 clamped: `let x = area.x.min(self.width.saturating_sub(1)); ... let width = area.width.min(self.width - x);`. For area.x >= self.width this gives x = width-1 and width = 1, so no error. crop at shot.rs:60-63 and blur at :148-151 repeat the same logic, so blur writes a 1-column (or 1-row) strip at the edge, and a non-ellipse blur copies it back at :195-196. commands.rs:551 `Some(area) => Some(pristine.clamped(area)?)` and :563/:583 crop to that 1-px strip, base.png and shot.json record it, and write_picture overwrites the clip file with it. The test named `a_rectangle_beside_the_picture_is_no_rectangle` (shot.rs:811-815) only checks `width: 0`, so a rect that really is beside the picture is never tested. The UI does not produce one: ShotAnnotate.tsx:694-697 clamps the pointer to [0,width]/[0,height], :509 drops blurs <2 px, and the crop UI enforces MIN_EDGE.",
+    "corrected_claim": "",
+    "reachable_by": "Only a caller of the write_screenshot IPC command that bypasses the editor UI (a bug elsewhere in the frontend, or code running in the WebView). The damage is recoverable, because keep_original preserves the untouched picture.",
+    "fix_assessment": "The early `Err` for `area.x >= self.width || area.y >= self.height` in clamped fixes the crop path. blur has its own independent clamp (shot.rs:148-151) and needs a matching early return, since it does not go through clamped."
+   }
+  ]
+ },
+ {
+  "id": "ED-38",
+  "title": "No frontend tests",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [
+   "package.json"
+  ],
+  "claim": "There are no frontend test files or test runner, so editor logic such as `markRect`, `fitRatio`/`spanned`, `toSteps`, `shift`/`readMarks`, `sigmaOf` and the move-clamp in `onMove` is untested.",
+  "scenario": "Regressions in preview/file parity (e.g. markRect vs Rust rect_kept) or coordinate maths go unnoticed.",
+  "fix": "Add vitest coverage for `markRect` vs fixtures from the Rust `rect_kept` tests, `fitRatio`/`spanned`, `toSteps`, `shift`/`readMarks` round-trip, `sigmaOf`, and the move-clamp in `onMove`.",
+  "reported_confidence": "confirmed",
+  "slice": "01-editor-bugs",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "EF-27",
+    "slice": "02-editor-features",
+    "title": "No TypeScript test runner",
+    "claim": "There is no TypeScript test runner at all (package.json has no vitest or jest), so editor geometry (`toSteps`, `bounds`, `hit`, `shift`/`readMarks`, crop maths) is untested.",
+    "locations": [
+     "package.json"
+    ],
+    "fix": "Add vitest; move pure geometry out of the components (`fitRatio`, `ratioOf`, `spanned` into a new `lib/crop.ts`; `toSteps`, `bounds`, `hit`, `nearLine`, `onRim`, `handlesOf`; `shift`/`readMarks`, `boxFor`/`clampView`; the move clamp) and test it."
+   }
+  ],
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "package.json scripts are only dev/build/preview/tauri/app/ffmpeg/probe/report/app:build; devDependencies have no vitest/jest. A find for *.test.*/*.spec.*/vitest.config*/jest.config*/__tests__ outside node_modules returns only server/src/telemetry.test.ts and server/src/shares.test.ts (the Worker, run with `node --test`, server/package.json). .github/workflows/release.yml runs `npm ci` and builds; no frontend test step. The named functions exist untested: watermark.ts:27 markRect (a hand copy of Rust `rect_kept`, which has Rust tests at watermark.rs:232-301), ShotViewer.tsx:90 ratioOf, :103 fitRatio, :1323 spanned, :1366 onMove, :1464 readMarks, :1475 shift; ShotAnnotate.tsx:297 bounds, :345 hit, :400 onRim, :425 nearLine, :447 handlesOf, :491 toSteps, :1079 sigmaOf; pictureBox.ts:43 boxFor, :63 clampView.",
+    "corrected_claim": "",
+    "reachable_by": "Any future change to editor geometry or to watermark::rect_kept without the TS twin.",
+    "fix_assessment": "Sound. Most of these are module-private functions or closures inside components (fitRatio, ratioOf, shift, readMarks, spanned, onMove, hit, nearLine...), so they must be exported or moved to lib/ first; markRect, toSteps, bounds, boxFor and clampView are already exported and testable right away. node --test (already used by server/) would also work without adding vitest."
+   }
+  ]
+ },
+ {
+  "id": "ED-43",
+  "title": "Size slider steps from a fractional minimum, so values snap off the default",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "Controls.tsx:95",
+   "ShotAnnotate.tsx:127"
+  ],
+  "claim": "The slider uses `step = 1` (Controls.tsx:95) with `range()` min `Math.max(1, base*0.4)` (ShotAnnotate.tsx:127), which can be fractional (e.g. 0.8 or 3.2), so values snap to 0.8, 1.8 …",
+  "scenario": "The slider knob shows a value different from the default size until it is touched.",
+  "fix": "Pass `step = min` or round `min`.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Controls.tsx:95 `step = 1,` passed to `<input type=\"range\" ... min={min} step={step}>` (108-114). ShotAnnotate.tsx:114-115 `baseStroke = Math.max(2, Math.round(width / 480))` and :127 `return [Math.max(1, base * 0.4), base * 6, base];`. ShotViewer.tsx:997-1002 `<Slider value={style.size} min={sizeRange[0]} max={sizeRange[1]} ...>` with no step; the label at 1004 shows `Math.round(style.size)`.",
+    "corrected_claim": "The mechanism is right, but the example 0.8 cannot occur: base is at least 2, and Math.max(1, 0.8) gives 1. min is fractional when base is 3, 4, 6, 7, 8 and so on, for example 1.2 at 1280 wide, 1.6 at 1920 wide and 3.2 at 3840 wide. With step 1 and the step base at min, the grid is 1.6, 2.6, 3.6 and so on, so the default 4 is shown at 3.6 (8 at 3840 wide is shown at 8.2). The label reads 4 and the gradient fill is computed from 4. After the slider is touched, sizes become x.6, the exact default can no longer be reached, and the reachable maximum is 23.6, not 24.",
+    "reachable_by": "Any user opening the editor on a typical 1920- or 3840-wide screenshot with the arrow, box, ellipse or pen tool.",
+    "fix_assessment": "Rounding min (for example Math.max(1, Math.round(base * 0.4))) puts every default on the integer grid and fixes it. 'step = min' would not: the grid 1.6, 3.2, 4.8 still misses the default 4."
+   }
+  ]
+ },
+ {
+  "id": "ED-33",
+  "title": "crop's doc comment merged into clamped's doc; crop has none",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "shot.rs:34-47"
+  ],
+  "claim": "`crop`'s doc (\"Cut a rectangle out of the picture…\") is merged into `clamped`'s doc comment at shot.rs:34-47, and `crop` itself has no doc comment.",
+  "scenario": "Misleading API docs for clamped/crop.",
+  "fix": "Split the doc comment so each function documents itself.",
+  "reported_confidence": "confirmed",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "shot.rs:34-47 is one contiguous `///` block. It begins `/// Cut a rectangle out of the picture.` / `/// The rectangle is clamped to what is really there rather than rejected ...` (:34-38). Without a separator it continues `/// The rectangle as it will really be cut.` (:39-47) and attaches to `pub fn clamped` at :48. `pub fn crop` at :59 follows a blank line (:58) and has no doc comment. The block has been this way since the file was introduced (commit a9013a6).",
+    "corrected_claim": "",
+    "reachable_by": "Developers reading the rustdoc or hovering over clamped/crop. There is no runtime effect.",
+    "fix_assessment": "Moving lines 34-38 above `pub fn crop` is all that is needed and is trivially correct."
+   }
+  ]
+ },
+ {
+  "id": "ED-34",
+  "title": "clamped and crop duplicate the same clamping logic",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "shot.rs"
+  ],
+  "claim": "`clamped` and `crop` in shot.rs repeat the same clamping logic.",
+  "scenario": "The two copies can drift apart.",
+  "fix": "`crop(Rect)` should take the already-clamped rect.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "clamped shot.rs:49-52 `let x = area.x.min(self.width.saturating_sub(1)); let y = area.y.min(self.height.saturating_sub(1)); let width = area.width.min(self.width - x); let height = area.height.min(self.height - y);`. crop shot.rs:60-63 is the same in usize: `let left = x.min(self.width.saturating_sub(1)) as usize; ... let cut_width = (width as usize).min(self.width as usize - left); ...`, with the same empty check at :35/:64. blur at :148-151 is a third copy. clamped's doc (:44-47) states the invariant that the noted rect must equal what crop cuts, and only the single test at shot.rs:799-808 guards it.",
+    "corrected_claim": "",
+    "reachable_by": "Maintenance only. Today the copies agree, and the only effect would be a future drift between the noted crop (shot.json) and the cut base.png.",
+    "fix_assessment": "This is sound. The least invasive form is for crop to call `self.clamped(Rect{..})?` internally and cut the returned rect, which keeps the existing call sites in watermark.rs:138 and commands.rs:563/583 unchanged. Changing crop's signature to take a pre-clamped Rect would mean touching those callers."
+   }
+  ]
+ },
+ {
+  "id": "ED-35",
+  "title": "MAX_ZOOM_STEP duplicates MAX_ZOOM",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "ShotViewer.tsx:60",
+   "pictureBox.ts:78",
+   "src/components/ShotViewer.tsx:60",
+   "src/lib/pictureBox.ts:78"
+  ],
+  "claim": "`MAX_ZOOM_STEP = 8` (ShotViewer.tsx:60) duplicates `MAX_ZOOM = 8` (pictureBox.ts:78).",
+  "scenario": "Changing one constant without the other makes zoom limits inconsistent.",
+  "fix": "Use a single shared constant.",
+  "reported_confidence": "confirmed",
+  "slice": "01-editor-bugs",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "EF-51",
+    "slice": "02-editor-features",
+    "title": "Duplicate zoom constant",
+    "claim": "`MAX_ZOOM_STEP` (ShotViewer.tsx:60) repeats `MAX_ZOOM` (pictureBox.ts:78).",
+    "locations": [
+     "src/components/ShotViewer.tsx:60",
+     "src/lib/pictureBox.ts:78"
+    ],
+    "fix": "No explicit fix proposed (flagged for the line-level reviewer)."
+   }
+  ],
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/components/ShotViewer.tsx:60 `const MAX_ZOOM_STEP = 8;` is used at :481 `Math.min(Math.max(was.zoom * factor, 1), MAX_ZOOM_STEP)`. src/lib/pictureBox.ts:78 `export const MAX_ZOOM = 8;` is used at :69 in clampView `Math.min(Math.max(view.zoom, 1), MAX_ZOOM)`. ShotViewer already imports clampView/boxFor from \"@/lib/pictureBox\" (:44-51) but not MAX_ZOOM. zoomAt passes its result through clampView. So if the two values diverged: when MAX_ZOOM_STEP is the larger, zoomAt computes x/y for a scale that clampView then cuts back, and the pointer anchor slips. When it is the smaller, the wheel stops short of the limit clampView allows.",
+    "corrected_claim": "",
+    "reachable_by": "Maintenance only. There is no runtime defect today, because both values are 8.",
+    "fix_assessment": "Importing MAX_ZOOM from @/lib/pictureBox (already an import source) and deleting MAX_ZOOM_STEP is trivially correct."
+   }
+  ]
+ },
+ {
+  "id": "ED-36",
+  "title": "Watermark asset size 535x152 hard-coded in TS",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "watermark.ts:142-143"
+  ],
+  "claim": "The watermark asset size 535x152 is hard-coded in watermark.ts:142-143.",
+  "scenario": "A regenerated watermark asset with different dimensions would silently break the preview's mark placement.",
+  "fix": "Derive the size from the asset (or share the constant with Rust).",
+  "reported_confidence": "confirmed",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/lib/watermark.ts:13-14 `const PICTURE_WIDTH = 535; const PICTURE_HEIGHT = 152;` used at :31-32 (`widthFor`/`heightFor`). The asset src-tauri/assets/watermark.png really is 535x152 (IHDR checked). Rust derives the size from the decoded picture instead: watermark.rs `picture()` -> `crate::shot::read_rgba(PICTURE)`, `stamp` passes `*picture_width, *picture_height` into `rect`. The preview sets both width and height of the <img> from markRect (ShotViewer.tsx:905-917, `width: mark.width * box.scale, height: mark.height * box.scale`, class `max-w-none`, no object-fit). scripts/make-watermark.py:30 computes `width = PAD + HEIGHT + GAP + text_w + PAD`, so the width depends on font metrics and can change on regeneration. Nothing (test or build step) checks the TS constants against the PNG.",
+    "corrected_claim": "The constants are at src/lib/watermark.ts:13-14 (the file is only 57 lines), not 142-143. Otherwise accurate: a regenerated asset with a different aspect ratio would make the preview mark a different size from (and stretched relative to) what the Rust core stamps, with no error.",
+    "reachable_by": "Developer regenerating the watermark asset (scripts/make-watermark.py) without updating watermark.ts; not reachable by users.",
+    "fix_assessment": "Reasonable. The Vite import only yields a URL, so either read naturalWidth/naturalHeight at runtime, emit the size from the generator into a shared JSON/TS file, or add a cheap test that compares the constants to the PNG header."
+   }
+  ]
+ },
+ {
+  "id": "ED-37",
+  "title": "Marks stored as JSON-in-JSON with full float precision",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "shot.rs"
+  ],
+  "claim": "shot.json stores the marks as a JSON string inside JSON (`Edit.marks: String`), and point coordinates are saved at full float precision (bloat).",
+  "scenario": "shot.json is larger and harder to read/migrate than necessary.",
+  "fix": "Use `serde_json::value::RawValue` for marks; round point coordinates.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/src/shot.rs:313-320 `pub struct Edit { pub crop: Option<Rect>, /// The marks exactly as the WebView keeps them. Opaque in here ... pub marks: String }`, written via shot.rs:348 `serde_json::to_string(edit)` -> the string is escaped JSON inside JSON. The frontend fills it with ShotViewer.tsx:629 `placed.length ? JSON.stringify(placed) : \"\"` and reads it back with ShotViewer.tsx:1467 `JSON.parse(edit.marks)`. Coordinates are never rounded: ShotAnnotate.tsx:696-697 `x: clamp((event.clientX - rect.left - box.left) / box.scale, width)` and pen points pushed at :852 `[...points, [point.x, point.y]]`; shift() (ShotViewer.tsx:1475-1485) only adds offsets. Only blur steps (ShotAnnotate.tsx:514-519) and the crop (ShotViewer.tsx:621-626) are rounded.",
+    "corrected_claim": "",
+    "reachable_by": "Every saved screenshot edit with marks; most noticeable with long pen strokes (one float pair per screen pixel moved).",
+    "fix_assessment": "Rounding coordinates (e.g. to 1-2 decimals) before JSON.stringify is the cheap win. RawValue would need serde_json's `raw_value` feature (not enabled in src-tauri/Cargo.toml:31), a frontend type change from string to array, and a read path that still accepts existing string-valued shot.json notes; serde_json::Value is a simpler alternative. The opaque-string design is deliberate (shot.rs:316-317), so this is purely cosmetic."
+   }
+  ]
+ },
+ {
+  "id": "ED-1",
+  "title": "Redaction blur written to the file is much weaker than the preview shows",
+  "severity": "high",
+  "category": "security",
+  "locations": [
+   "src-tauri/src/shot.rs:139-210",
+   "src-tauri/src/shot.rs:633-661",
+   "src/components/ShotAnnotate.tsx:1063",
+   "src/components/ShotAnnotate.tsx:1079-1081",
+   "ShotViewer.tsx:1107",
+   "shot.rs:129-134",
+   "src/components/ShotAnnotate.tsx:1069-1081",
+   "src-tauri/src/shot.rs:123-127",
+   "src/components/ShotViewer.tsx:1107"
+  ],
+  "claim": "The saved PNG gets a single box-blur pass per axis (`blur_rows(&patch, &mut across, pw, ph, radius); … blur_rows(&turned, &mut done, ph, pw, radius);` in shot.rs), while the preview is a CSS Gaussian of the same variance (`backdropFilter: blur(${sigmaOf(step.radius) * box.scale}px)` with `Math.sqrt((radius*(radius+1))/3)` in ShotAnnotate.tsx). Matching variance does not match legibility: a box kernel has sinc side-lobes, a Gaussian none. For r = 4/8/16 (the 1080p minimum and default) the box lets through about 22% of contrast at periods of 6.3/11.9/23 px versus about 3.5% for the equal-variance Gaussian (roughly 6x less) - exactly text-stroke and letter scale. So the UI hint \"What you see here is what lands in the file\" (ShotViewer.tsx:1107) is false in the dangerous direction. Additionally the Rust doc comment (shot.rs:129-134) saying the preview \"blurs the whole picture and clips afterwards\" is likely inaccurate: Chromium's backdrop-filter samples only within the element (mirror edges), so near edges the two differ the other way.",
+  "scenario": "A user blurs a 14 px password or e-mail at the default radius. The preview looks fully smeared, but the saved PNG keeps ghosted strokes that are readable, or brute-forceable against the known game/UI font.",
+  "fix": "Approximate a Gaussian with 3 box passes per axis keeping the variance: `r_i = ((1.0 + 4.0*r*(r+1)/3.0).sqrt() - 1.0) / 2.0`, rounded and >= 1; run `blur_rows` 3x each way and widen the margin to `3*r_i` (still O(n)). Consider a minimum radius tied to the rectangle height (e.g. >= h/4) or pixelate-then-blur, and offer a solid \"redact\" fill. Fix the doc comment.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "severity_reported": "high",
+  "also": [
+   {
+    "id": "EF-8",
+    "slice": "02-editor-features",
+    "title": "Blur preview (CSS Gaussian) and saved blur (single box pass) differ; file leaks more detail",
+    "claim": "The blur preview is a DOM `backdrop-filter: blur(σ)` patch, a CSS Gaussian with σ matched to the box's variance via `sigmaOf` (ShotAnnotate.tsx:1069-1081). The saved file is blurred in Rust by a single sliding-window box pass per axis (`Shot::blur`, shot.rs:123-127, 139-210). Same variance, different kernel: a box kernel's frequency response has side lobes, so fine detail such as text strokes survives better in the file than in the preview, which is the wrong way round for redaction. The blur hint text (ShotViewer.tsx:1107) promises unreadability.",
+    "locations": [
+     "src/components/ShotAnnotate.tsx:1069-1081",
+     "src-tauri/src/shot.rs:123-127",
+     "src-tauri/src/shot.rs:139-210",
+     "src/components/ShotViewer.tsx:1107"
+    ],
+    "fix": "Make `Shot::blur` three box passes per axis (Kovesi-style radii) at the same O(1) cost per pixel, change `sigmaOf` to the 3-pass variance, keep existing tests and add one asserting the 3-pass result stays close to the CSS σ. Add a Redact tool (opaque filled box, black by default) and change the blur hint (1107) so it doesn't promise unreadability. Medium term: one WebView renderer (option A)."
+   }
+  ],
+  "status": "partial",
+  "final_severity": "high",
+  "votes": [
+   {
+    "lens": "impact",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "high",
+    "evidence": "shot.rs:179-185 runs exactly one box pass per axis: `blur_rows(&patch, &mut across, pw, ph, radius); ... blur_rows(&turned, &mut done, ph, pw, radius);` (blur_rows shot.rs:633 is a plain sliding-window mean). ShotAnnotate.tsx:1063 previews it as `backdropFilter: blur(${sigmaOf(step.radius) * box.scale}px)` with sigmaOf = `Math.sqrt((radius * (radius + 1)) / 3)` (1079-1080), i.e. a CSS Gaussian of the same variance. The radius goes through unchanged: toSteps `radius: Math.round(shape.size)` (ShotAnnotate.tsx:519) -> commands.rs:577 `picture.blur(..., *radius, ...)`. Slider: range() `case \"blur\": return [base, base * 12, base * 2]` with base = max(2, round(width/480)), so 1080p is min 4 / default 8 and 4K default 16. ShotViewer.tsx:1107 says \"What you see here is what lands in the file.\" Numbers check out: first side lobe |H| = 0.227/0.220/0.218 at periods 6.3/11.9/23.1 px vs 0.036/0.035/0.035 for the Gaussian, and above about 6% (N=17) at all periods of 3 to 8 px for r=8, where the Gaussian gives under 1e-3. My simulation (DejaVu Sans, blur_rows reproduced with its floor rounding): at the default r=8 on 14 px text, and at r=16 on 24 px text, a textbook Wiener deconvolution brings back \"Kx9pQ2vLm7 secret\" from the single-box output so it reads almost perfectly. The same deconvolution on the equal-variance Gaussian, or on a 3-pass box, stays a smear. The reviewer's mechanism is off, though. Looked at directly, the file is not more readable than the preview: the box's phase-inverted side lobes double the strokes, and at equal variance the Gaussian actually looks more legible (24/32 px text at r=8). Guess-and-compare brute force is not specific to the box either. The difference between candidate strings after blurring was about the same for both kernels (r=8: max 5 vs 4 levels, sum 701 vs 706). The Chromium mirror-edge point (doc comment shot.rs:129-134) is runtime behaviour that cannot be checked from source. If it is true, the file mixes in more of the surroundings than the preview, which is the safe direction.",
+    "corrected_claim": "The saved PNG uses a single box pass per axis, while the preview is an equal-variance Gaussian, so the WYSIWYG promise does not hold. The danger is not that the file shows readable ghost strokes; looked at directly, it is if anything less legible than the preview. The danger is that a single box blur keeps 6-22% of contrast at text-stroke frequencies, well above 8-bit quantisation, so the redaction can be inverted. At the default radius (8 at 1080p, 16 at 4K), anyone holding the shared PNG can recover small text with a standard Wiener or least-squares deconvolution: the box PSF is trivially known or estimated, and the unblurred pixels around the rectangle are kept in the file. The equal-variance Gaussian the user previews resists this far better. Brute-force against a known font is about equally effective against both kernels, so it is not the distinguishing risk. The doc-comment remark about Chromium edges is unverified and, if true, errs in the safe direction.",
+    "reachable_by": "Any recipient of a screenshot that a user blurred with the Blur tool and then shared (Discord, social media, support tickets) can recover the hidden text offline from the PNG alone, using a box PSF of radius 4-96 (guessable from the spectral zeros, or read from the open-source code). It needs no access to the app and no interaction with the victim. Only users who blur sensitive text and share the result are exposed.",
+    "fix_assessment": "Three box passes per axis with r_i = (sqrt(1 + 4r(r+1)/3) - 1)/2 and a margin of 3*r_i is correct, stays O(n), and in my test it defeated the same Wiener attack. Round r_i up (ceil, min 1) rather than to nearest, or set sigmaOf to sqrt(r_i(r_i+1)), so the file is never weaker than the preview: rounding r=8 gives r_i=4, variance 20 vs 24. Then update the doc comments in shot.rs and ShotAnnotate.tsx and the hint text. It is not sufficient on its own. Even the Gaussian at the 1080p minimum r=4 leaves 14 px text half-readable, and at r=8 it partly deconvolves. Also add a solid \"Redact\" fill (or pixelate plus noise), or tie the minimum radius to the rectangle height, and stop promising unreadability."
+   },
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Path is real: ShotViewer.tsx:619 `await writeScreenshot(` -> ipc.ts:148 `invoke<Clip>(\"write_screenshot\", ...)` -> commands.rs:577 `picture.blur(*x, *y, *width, *height, *radius, *ellipse)` -> shot.rs:180-185 `blur_rows(&patch, &mut across, pw, ph, radius); ... blur_rows(&turned, &mut done, ph, pw, radius);` (one box pass per axis, shot.rs:633 sliding-window mean). Preview: ShotAnnotate.tsx:1063 `backdropFilter: blur(${sigmaOf(step.radius) * box.scale}px)` with ShotAnnotate.tsx:1079-1080 `Math.sqrt((radius * (radius + 1)) / 3)`, i.e. an equal-variance Gaussian. Radii: ShotAnnotate.tsx range() `case \"blur\": return [base, base * 12, base * 2]` with base = max(2, round(width/480)) -> 1080p min 4 / default 8, 4K default 16. Hint at ShotViewer.tsx:1107 \"What you see here is what lands in the file.\" The 22% vs ~3.5% numbers are arithmetically right (box first side lobe -0.217 at period (2r+1)/1.43 = 6.3/11.9/23 px; Gaussian exp(-2*pi^2*sigma^2*f^2) ~0.036 there), but only at the side-lobe peak: at period 2r+1 (9 px for r=4) the box passes 0 while the Gaussian passes ~20%. Simulation (scratchpad sim/disc.py, sim/vis2.py, a numpy port of blur_rows vs equal-sigma Gaussian on DejaVu Sans text): L2 distance between blurred renderings of strings differing by one character, box vs Gaussian: r=4 205 vs 185, r=8 106 vs 82, r=16 64 vs 44, i.e. the box keeps ~10-45% more per-character signal, not ~6x. Visually (14/20/28 px text at r=4/8/16), the box result is not more legible than the Gaussian. It shows vertical stripe artifacts instead of a smooth smear, and at r=4 both are about equally half-readable; at r=8/16 neither is readable by eye.",
+    "corrected_claim": "The kernel mismatch is real: the file gets a single box pass per axis and the preview gets an equal-variance CSS Gaussian, so the saved blur looks different from the preview (striped, not smooth), and the hint at ShotViewer.tsx:1107 is not literally true. The box output keeps somewhat more fine detail (about 1.1-1.5x more per-character L2 signal in simulation), so it is modestly easier to brute-force against a known font. It is not ~6x weaker and does not leave readable strokes where the preview is unreadable. The 22%-vs-3.5% figure is taken only at the box side-lobe peaks, and at other frequencies near 1/(2r+1) the Gaussian passes more. Any blur at these radii can be brute-forced against a known font, and at the 1080p minimum r=4 14 px text is half-readable in both preview and file, which the user can see. The doc-comment point (Chromium backdrop-filter mirrors edges and does not mix in surroundings) is plausible but is runtime behaviour. Near the edges it would make the file blur stronger than the preview, which is the safe direction.",
+    "reachable_by": "Ordinary use by the user: Blur tool in the screenshot editor, then save (ShotViewer -> write_screenshot). Exploiting it needs whoever later receives the shared image (a friend, a Discord recipient, anyone the file is posted to) to run a known-font brute-force or deblur attack. The extra exposure over what the preview shows is small, so in practice this is unlikely to be the deciding factor.",
+    "fix_assessment": "Three box passes per axis with variance-preserving radii is a sound O(n) change that brings the file close to the CSS Gaussian and removes the striping. The variance math in sigmaOf must then be updated to match. The more valuable parts are an opaque Redact fill and rewording the hint so it no longer promises unreadability, since no blur is safe against known-font brute force."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src-tauri/src/shot.rs:180-185 runs exactly one box pass per axis: `blur_rows(&patch, &mut across, pw, ph, radius); ... transpose(...); blur_rows(&turned, &mut done, ph, pw, radius);` and blur_rows (shot.rs:633-661) is a plain sliding-window mean over 2r+1 taps. The radius reaches it unchanged: ShotAnnotate.tsx:518 `radius: Math.round(shape.size)` -> commands.rs:577 `picture.blur(*x, *y, *width, *height, *radius, *ellipse)`. The preview is ShotAnnotate.tsx:1063 `backdropFilter: `blur(${sigmaOf(step.radius) * box.scale}px)`` with ShotAnnotate.tsx:1079-1081 `Math.sqrt((radius * (radius + 1)) / 3)` = variance of a (2r+1)-tap box, i.e. an equal-variance Gaussian (CSS blur() is specified as Gaussian). Defaults: range() ShotAnnotate.tsx:124-125 `[base, base * 12, base * 2]` with baseStroke = max(2, round(w/480)) -> 1080p min 4, default 8; 4K default 16. I recomputed the responses: first box side lobe at period 6.27/11.87/23.04 px for r=4/8/16 passes 22.7/22.0/21.8 % (sign-inverted) vs 3.50/3.47/3.43 % for the Gaussian, about 6.3-6.5x. A simulation of 14 px DejaVu text with the exact blur_rows semantics shows the r=8 box output carrying visible vertical striping (ringing) where the equal-variance Gaussian is smooth blobs, so the file visibly differs from the preview. The hint ShotViewer.tsx:1107 says \"What you see here is what lands in the file.\" The doc comment shot.rs:129-134 asserts the preview \"blurs the whole picture and clips afterwards\"; nothing in the repo implements that, it rests on Chromium/WebView2 backdrop-filter behaviour.",
+    "corrected_claim": "The kernel mismatch, the figures and the false hint are all accurate. The scenario overstates it in one respect. At the default r=8, 14 px text in the saved file does not show legible ghost letters. It shows side-lobe ringing (vertical bars) that keeps far more mid-frequency information than the preview. That makes known-font matching or deconvolution attacks easier and lets the file visibly differ from the preview. It is not plainly readable by eye. At the 1080p minimum r=4, both kernels leave 14 px text partly guessable, which is a separate weakness of the minimum radius. The preview also shows a downscaled picture (sigma * box.scale), which hides fine residue even more. The edge-behaviour side claim (Chromium backdrop-filter samples only inside the element with mirrored edges, so the shot.rs:129-134 comment is wrong) cannot be checked from source here. It depends on WebView2/Chromium implementing the Filter Effects 2 mirror edge mode.",
+    "reachable_by": "Any user who uses the Blur tool in the screenshot editor to redact text (passwords, e-mails, names) and then shares the saved PNG. The attacker is anyone who receives that file.",
+    "fix_assessment": "Three box passes per axis with Kovesi/Wells radii (sum of variances = r(r+1)/3) closely match the CSS Gaussian at the same O(n) cost. sigmaOf must then use the variance actually applied, and the margin must widen to the summed radii. On its own this only makes the preview honest. A blur stays a weak redaction primitive, so the suggested solid Redact fill and a softer hint text are the changes that actually address the security goal."
+   }
+  ]
+ },
+ {
+  "id": "ED-18",
+  "title": "Save-path failures other than writeScreenshot are swallowed in ShotViewer",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "ShotViewer.tsx:639-641"
+  ],
+  "claim": "The save catch is `catch { /* \"The notice is already in the store.\" */ }`, which is true only for `writeScreenshot`. A throw in `layerBytes` (`getContext`/`toBlob` returning null) or in the follow-up `screenshotEdit` shows nothing.",
+  "scenario": "Layer encoding fails (e.g. at 8K) or the reload after save fails: no error is shown and the UI stays \"unsaved\" although the file may have been written.",
+  "fix": "Set `lastError` in that catch for non-writeScreenshot failures.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ShotViewer.tsx:607-641: `const steps = await Promise.all(... png: await layerBytes(...))` -> `await writeScreenshot(...)` -> `const loaded = await api.screenshotEdit(clip.id)` ... `} catch { // The notice is already in the store. }`. layerBytes (ShotViewer.tsx:1607-1624) throws `new Error(\"The marks could not be turned into a picture.\")` when getContext/toBlob give null. src/lib/ipc.ts:149 `screenshotEdit: (id) => invoke<ShotEdit>(\"screenshot_edit\", { id })` (no error capture). Only src/store.ts:602-607 sets `lastError` (writeScreenshot path). BUT the only consumer of lastError is src/routes/settings/index.tsx:40,80 (`{lastError && (<Card ...>{lastError}</Card>)}`), and write_screenshot (src-tauri/src/commands.rs:498-508) never calls crate::notify, so no toast either (Toasts.tsx only listens to the backend \"notice\" event).",
+    "corrected_claim": "Real, but broader than claimed: no save failure of any kind is visible in the viewer. layerBytes/screenshotEdit failures do not even reach lastError, and a writeScreenshot failure only sets lastError, which is rendered solely on the Settings page (settings/index.tsx:80) — write_screenshot emits no 'notice' toast. So the comment 'The notice is already in the store' is technically true for writeScreenshot but nothing in the viewer shows it. 'The file may have been written' applies only to the screenshotEdit-after-success case; a layerBytes throw happens before writeScreenshot, so nothing is written then.",
+    "reachable_by": "Any user saving marks/crop when canvas encoding fails (rare; depends on WebView2 canvas limits/memory, not checkable here), when screenshot_edit fails after a successful write (e.g. clip deleted meanwhile), or any write_screenshot error (disk, locked file, out-of-range coordinates).",
+    "fix_assessment": "Setting lastError in the catch alone would not help: lastError is only displayed under Settings. The viewer needs its own inline error (local state shown near the Save/Crop buttons) or the backend should notify() on failure; the catch should then surface every failure path."
+   }
+  ]
+ },
+ {
+  "id": "ED-22",
+  "title": "Temp-file names collide across concurrent saves and leftovers are never cleaned up",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "commands.rs:633",
+   "shot.rs:353"
+  ],
+  "claim": "The main PNG temp is `target.with_extension(format!(\"{}.new.png\", std::process::id()))` (commands.rs:633) and shot.json uses a fixed `shot.json.part` (shot.rs:353). Two concurrent saves of the same clip in one process write the same temp files, and nothing ever cleans up leftovers.",
+  "scenario": "A crash between write and rename leaves `Name.1234.new.png` in the user's Screenshots folder permanently; concurrent saves of one clip clobber each other's temp files.",
+  "fix": "Use uuid or atomic-counter suffixes plus a startup sweep of `*.new.png` and `*.part`. A per-clip lock (from ED-3) also fixes the collision.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/src/commands.rs:633-638 `let temp = target.with_extension(format!(\"{}.new.png\", std::process::id())); picture.write_png(&temp)?; if let Err(err) = crate::muxer::replace_file(&temp, &target) { let _ = std::fs::remove_file(&temp); return Err(err); }` — a write_png error (shot.rs:251-276, File::create then encode) returns via `?` without removing the partial temp, and a crash leaves it too; no sweep for `*.new.png` exists anywhere (grep finds only this line). src-tauri/src/shot.rs:353 `let part = path.with_extension(\"json.part\")` lives in crate::edit::dir(clip_id), which edit::remove (edit.rs:114-118 `remove_dir_all(dir(clip_id))`) deletes with the clip, and the fixed name is overwritten by the next save. Concurrency: the only caller is ShotViewer.write (ShotViewer.tsx:1066,1100,1150,1174), every button `disabled={busy...}`, and ShotViewer is mounted only in the main window (routes/Clips.tsx:656).",
+    "corrected_claim": "The PNG temp leak is real and slightly worse than stated: besides a crash, any write_png failure (e.g. disk full mid-encode) leaves a partial `Name.<pid>.new.png` in the user's clip folder, and because the name carries the PID a later run never overwrites it; nothing sweeps it. The shot.json.part claim is overstated: it is one fixed-name file per clip inside the app's store folder, overwritten on the next save and removed when the clip is deleted. Concurrent saves of the same clip in one process are not reachable from the current UI (single caller, guarded by `busy`, main window only); the collision is only latent.",
+    "reachable_by": "App crash/kill or a failed PNG encode/write during a screenshot save (leftover temp). The concurrent-save collision needs a second caller that does not exist today.",
+    "fix_assessment": "Remove the temp on write_png failure (cheap and covers the non-crash case) and optionally sweep `*.new.png` beside clips at startup; a unique suffix is only needed once concurrent saves become possible (per-clip lock from ED-3 would cover it)."
+   }
+  ]
+ },
+ {
+  "id": "ED-40",
+  "title": "Avoidable work on every save (base.png re-encode, ffmpeg spawn, Reset re-encode)",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "commands.rs"
+  ],
+  "claim": "On every save `base.png` is re-encoded even on marks-only saves where the crop is unchanged; an ffmpeg process is spawned per save for the thumbnail; and the Reset path re-encodes the original instead of copying it.",
+  "scenario": "Each marks-only save on a large screenshot pays a full PNG encode of base.png plus an ffmpeg process launch; Reset is slower than a file copy.",
+  "fix": "Skip writing base.png if `read_edit(id).crop == crop && base exists`; build thumbnails in-process (see ED-11); copy the original on Reset.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "commands.rs:589-594 `match &ground { Some(shot) => shot.write_png(&crate::shot::base_path(&clip.id))?, None => { let _ = std::fs::remove_file(crate::shot::base_path(&clip.id)); } }` where `ground` is Some only if `crop` is Some (:557-560). So base.png is re-encoded on every save that has a crop (even if unchanged) but never written on a save without a crop. Thumbnail: commands.rs:641 `crate::thumbs::make_still(&target, &clip.id)` -> thumbs.rs:54-62 `run(ffmpeg().args([...\"-i\"...\"scale=480:-1\"...]))`, an ffmpeg process per save. Reset: commands.rs:532-536 `if crop.is_none() && steps.is_empty() && marks.is_empty() { let whole = crate::shot::read_png(&original_path)?; let clip = write_picture(&state, &clip, &whole)?; ...}`, and write_picture does `picture.write_png(&temp)` (:634); the original is a byte copy of the clip file (keep_original :617 `std::fs::copy(&clip.path, &original)`). Reached from 'Remove all marks' with no crop (ShotViewer.tsx:1100) and 'Undo crop' with no marks (:1174).",
+    "corrected_claim": "base.png is re-encoded on every save only when a crop is set (crop unchanged or not); saves without a crop delete base.png instead of encoding it. The per-save ffmpeg spawn and the Reset decode+re-encode (instead of a file copy) are accurate.",
+    "reachable_by": "User saving marks on a cropped screenshot (extra cropped-PNG encode), any save (ffmpeg spawn), and removing the last edit (decode+encode of the full original).",
+    "fix_assessment": "Valid but small wins: skipping base.png needs a crop equality check (shot::Rect does not derive PartialEq, shot.rs:322) plus a base-exists check; Reset could copy original over the clip through the same temp-and-replace route and take the size from size_of_png. In-process thumbnails remove the process launch and also the re-decode of the just-written PNG."
+   }
+  ]
+ },
+ {
+  "id": "ED-42",
+  "title": "Pen strokes copy the whole points array per sample and miss coalesced events",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "ShotAnnotate.tsx"
+  ],
+  "claim": "Pen strokes copy the whole points array on every sample (O(n^2)) and don't use `getCoalescedEvents()`, so fast strokes come out angular. `bounds()` uses `Math.min(...xs)` spreads, which can hit V8's argument limit on extremely long strokes (speculative).",
+  "scenario": "Long pen strokes get progressively slower; fast strokes look jagged; an extremely long stroke could throw from `bounds()`.",
+  "fix": "Append points without copying, use `getCoalescedEvents()`, and compute bounds with a loop instead of spread.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "ShotAnnotate.tsx:849-852: `const last = points[points.length - 1]; if (last && Math.hypot(point.x - last[0], point.y - last[1]) * box.scale < 1) return; setDraft({ ...draft, points: [...points, [point.x, point.y]] });`. 683: `drawing = useMemo(() => (draft ? toSteps([draft]) : []), [draft])`, so ShapeLayer 573-574 runs clearRect plus paint() on every new draft, and paint 240 re-strokes the whole path (`points.slice(1)`). No getCoalescedEvents anywhere in src/. bounds() 316-322 and move drag 794 use `Math.min(...xs)` spreads.",
+    "corrected_claim": "Points are not appended on every sample. A sample closer than one displayed pixel to the last point is dropped (line 851). For accepted samples the array is copied (O(n) each), but every accepted sample also clears the full-resolution draft canvas and re-strokes the whole path, which is also O(n). So the progressive slowdown comes mostly from the repaint, not the copy, and appending without copying alone would not remove it. getCoalescedEvents is indeed not used, so with Chromium's frame-aligned pointermove a fast stroke is a polyline of per-frame samples (a runtime-dependent effect). The spread limit in bounds() would need a single stroke of roughly 100k or more points, each at least one display pixel apart, which is practically unreachable.",
+    "reachable_by": "A user drawing long or fast freehand pen strokes in the screenshot editor.",
+    "fix_assessment": "getCoalescedEvents() would help stroke fidelity, and loop-based bounds are a harmless hardening. Real scaling would need incremental drawing of only the new segment on the draft canvas (keeping points in a ref), not just avoiding the array copy."
+   }
+  ]
+ },
+ {
+  "id": "ED-23",
+  "title": "Hooks called after an early return in ShotViewer",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "ShotViewer.tsx:421",
+   "ShotViewer.tsx:453",
+   "ShotViewer.tsx:462",
+   "src/components/ShotViewer.tsx:421",
+   "src/components/ShotViewer.tsx:453",
+   "src/components/ShotViewer.tsx:462"
+  ],
+  "claim": "`if (!clip) return null;` at ShotViewer.tsx:421 is followed by `useEffect` (453) and `useRef` (462). If `clip` ever went from defined to undefined React would throw \"Rendered fewer hooks than expected\". It can't happen today (Clips.tsx always passes `min(open, len-1)` with `len > 0`), so the early return is effectively dead, and rules-of-hooks lint fails.",
+  "scenario": "A future change that lets `clip` become undefined after mount crashes the viewer with a hooks-order error; lint currently fails.",
+  "fix": "Move those hooks above the guard.",
+  "reported_confidence": "confirmed",
+  "slice": "01-editor-bugs",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "EF-50",
+    "slice": "02-editor-features",
+    "title": "Hooks called after an early return in ShotViewer",
+    "claim": "`ShotViewer.tsx:421` returns early before a `useEffect` (453) and a `useRef` (462), violating the rules of hooks. This would crash if `clip` ever became undefined; Clips.tsx guards against that today.",
+    "locations": [
+     "src/components/ShotViewer.tsx:421",
+     "src/components/ShotViewer.tsx:453",
+     "src/components/ShotViewer.tsx:462"
+    ],
+    "fix": "No explicit fix proposed (flagged for the line-level reviewer)."
+   }
+  ],
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/components/ShotViewer.tsx:421 `if (!clip) return null;` followed by :453 `useEffect(() => { if (!stageSize) return; setView(...) }, [stageSize, ground.width, ground.height]);` and :462 `const badgeReset = useRef(0);`. Dead today: routes/Clips.tsx:654-663 mounts ShotViewer only when `playing[Math.min(open, playing.length - 1)]?.screenshot` is truthy and passes the same index, and ShotViewer.tsx:155 reads `clips[index]` — so clip is always defined while ShotViewer renders. Lint: package.json has no eslint dependency or lint script, there is no eslint config file in the repo, and .github/workflows (ffmpeg.yml, pages.yml, release.yml) run no linter; the `eslint-disable` comments in the file are inert.",
+    "corrected_claim": "The rules-of-hooks violation is real but latent and unreachable today. 'rules-of-hooks lint fails' is false: the project has no ESLint setup at all (no config, no dependency, no script, no CI step), so nothing currently fails.",
+    "reachable_by": "Nobody today; only a future change that lets ShotViewer render with clips[index] undefined.",
+    "fix_assessment": "Moving the stage-resize useEffect and badgeReset useRef above the guard (they don't depend on clip beyond ground.*, which can be computed with fallbacks) is correct and cheap; alternatively drop the dead guard."
+   }
+  ]
+ },
+ {
+  "id": "ED-25",
+  "title": "Watermark scale() degenerates when upscaling, producing a blocky mark unlike the smooth preview",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "watermark.rs:179-205"
+  ],
+  "claim": "`scale()` in watermark.rs:179-205 assumes downscaling. For frames taller than about 2171 px (152/0.07, e.g. 5K, 8K or tall crops) it degenerates to nearest/box sampling, so the burned-in mark is blocky while the `<img>` preview is smooth.",
+  "scenario": "Saving a 5K/8K screenshot or a tall crop produces a visibly blocky watermark that differs from the preview.",
+  "fix": "Use bilinear sampling when `step < 1`.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/src/watermark.rs:184-188 `let top = (target_y as f32 * step_y) as u32; let bottom = (((target_y + 1) as f32 * step_y).ceil() as u32).clamp(top + 1, height);` (same for x), then an unweighted mean (200-201). It really is a downscale-only area filter. With step < 1 it averages 1 or 2 source rows/columns per target pixel, with equal weights. A float32 simulation of these exact windows on the real 535x152 PNG gives: 5K (frame 2880, mark 202 px) windows (0,1),(0,2),(1,3),(2,4),(3,4),(3,5)... are mostly 2-pixel averages, so the result is soft, not blocky. 8K (4320, mark 302 px) windows (0,1),(0,2),(1,2),(1,3),... are s0, avg(s0,s1), s1, avg(s1,s2), which is a 2x linear interpolation. Alpha against PIL bilinear: mean |diff| 0.42% / 0.32%, p99 10% / 7.5%. Pure pixel duplication (nearest) happens only at exact integer ratios, e.g. mark height 304 (frame 4336-4349, reachable through a crop of an 8K shot): p99 16%. The preview (ShotViewer.tsx:905-919) is the PNG in an <img> scaled by the browser. Upscaling starts at frame height >= 2179 (round(h*0.07) >= 153), not 2171; 4K (2160) still gives 151 (test at watermark.rs:245).",
+    "corrected_claim": "scale() is a box filter meant for shrinking. When it enlarges (frame height >= ~2179 px) it averages 1-2 neighbouring source pixels with equal weights, so the mark is placed slightly off (sub-pixel) and comes out a little softer or uneven compared with bilinear. It is NOT visibly blocky at 5K or 8K: at 8K the windows amount to 2x linear interpolation. Only at exact integer ratios (e.g. a 304 px mark) does it become pure pixel doubling, and even then the difference is small on an anti-aliased source. 'Tall crops' cannot trigger it on their own: a crop is never taller than its source.",
+    "reachable_by": "Screenshots (fresh via stamp() or edited via stamp_kept()) whose height is at least ~2179 px: 5K/6K/8K displays, portrait 4K monitors, or crops of those.",
+    "fix_assessment": "Switching to bilinear when step < 1 (keeping the area average for shrinking) would be marginally more exact, but the visible gain is small. This is polish, not a bug fix."
+   }
+  ]
+ },
+ {
+  "id": "ED-39",
+  "title": "ShotViewer.tsx is a 1650-line component holding too much state",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "ShotViewer.tsx"
+  ],
+  "claim": "ShotViewer.tsx (about 1650 lines) holds the viewer, the load/save state machine, undo history, crop layer, side panel, Disclosure/PanelButton and `layerBytes`. Several bugs (ED-4, ED-5, ED-6) stem from that state being spread across closures.",
+  "scenario": "Race and state bugs are hard to see and fix; the whole tree re-renders on edits.",
+  "fix": "Extract `useShotEdit(id)` (load, save, race guards, busy, error), `useUndoHistory`, `CropLayer.tsx`, `AnnotatePanel.tsx`, and a `layers.ts` (render and encode).",
+  "reported_confidence": "confirmed",
+  "slice": "01-editor-bugs",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "`wc -l src/components/ShotViewer.tsx` = 1649. But the ShotViewer component itself is lines 147-1270 (~1120 lines); the file also holds separate top-level pieces: ratioOf :90, fitRatio :103, `function CropLayer` :1280-1456 (already its own component with its own refs, e.g. :1297 `const drag = useRef`), readMarks :1464, shift :1475, defaultStyles :1488, Disclosure :1517, PanelButton :1566, layerBytes :1607, Step :1626. Inside ShotViewer: ~20 useState (:160-198) plus history/current/lastGesture refs (:256-264) and the load/save closure `write` (:604-644). The annotation layer lives in ShotAnnotate.tsx, where ShapeLayer is `memo` (:566) and layers are `useMemo` (:679-683), so a mark edit re-renders ShotViewer but does not repaint unchanged canvases.",
+    "corrected_claim": "The file is ~1650 lines, but the ShotViewer component is ~1120 lines; CropLayer, Disclosure, PanelButton and layerBytes are already separate functions/components in the same file (moving them out is mostly a file split). The component does hold the load/save state machine, undo history and ~20 pieces of state, and the save continuation in `write` (ShotViewer.tsx:604-644) is where ED-5/ED-6 live, so the maintainability point stands; 'the whole tree re-renders' is mitigated by the memoised ShapeLayer in ShotAnnotate.tsx.",
+    "reachable_by": "Maintainers; no user-visible behaviour on its own.",
+    "fix_assessment": "A `useShotEdit(id)` hook that owns load/save with a clip-id guard would directly address ED-4/ED-5; moving CropLayer/Disclosure/PanelButton/layerBytes into their own files is cheap but changes little by itself."
+   }
+  ]
+ },
+ {
+  "id": "ED-41",
+  "title": "Each editor mode decodes a different full-resolution PNG in the WebView",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "ShotViewer.tsx"
+  ],
+  "claim": "View, draw and crop modes each use a different ground image (finished file, base.png, image.png), so every mode switch decodes a different full-res PNG in the WebView.",
+  "scenario": "Switching modes on large screenshots causes repeated full-resolution decodes and delays.",
+  "fix": "No specific fix given.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "ShotViewer.tsx:439-448: `const ground = mode === \"crop\" ? { src: edit?.originalPath ?? clip.path, ...full } : mode === \"draw\" ? { src: edit?.basePath ?? clip.path, ... } : { src: clip.path, ... }`, fed to one <img src={source}> (840-841). commands.rs:466-476: `base_path: if base.is_file() { Some(base) } else if original.is_file() { Some(original) } else { None }`, `original_path: original.is_file().then(..)`; comment 'Untouched so far: the clip's own file is both grounds at once.' ShotViewer.tsx:366-367 documents the three grounds as intentional.",
+    "corrected_claim": "Only edited screenshots get different grounds. An untouched shot has basePath and originalPath set to null, so view, draw and crop all load the same clip.path URL and nothing extra is decoded. A shot with marks only has basePath equal to image.png, so draw and crop share one file (two distinct images in total). Three distinct full-resolution files (the finished file, base.png and image.png) appear only after a crop. Each is needed by design: the finished file, the cropped picture without marks, and the whole original. Whether a return to a recently shown file decodes again depends on Chromium's image memory cache.",
+    "reachable_by": "A user switching between view, draw and crop on a screenshot that has already been edited (cropped, or for two files marked).",
+    "fix_assessment": "No fix was proposed, and the cost is inherent: each mode has to show a different picture. At most the images could be preloaded or kept decoded (for example hidden <img> elements or createImageBitmap) to hide the latency."
+   }
+  ]
+ },
+ {
+  "id": "ED-29",
+  "title": "OpenClipboard called with a NULL owner window (unsupported for SetClipboardData)",
+  "severity": "low",
+  "category": "robustness",
+  "locations": [
+   "clipboard.rs"
+  ],
+  "claim": "The clipboard is opened with `OpenClipboard(HWND::default())`. MSDN says that with a NULL owner, `EmptyClipboard` sets the owner to NULL and `SetClipboardData` \"fails\". It works in practice, but it's unsupported.",
+  "scenario": "On some Windows configurations SetClipboardData could fail after EmptyClipboard with a NULL owner, breaking Copy picture/text.",
+  "fix": "Pass the main window's HWND to OpenClipboard.",
+  "reported_confidence": "speculative",
+  "slice": "01-editor-bugs",
+  "status": "unverified",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "unverifiable",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/src/clipboard.rs:43 `if unsafe { OpenClipboard(HWND::default()) }.is_ok()`, followed by `EmptyClipboard()` and `SetClipboardData(format, ...)` in copy_files/copy_image/copy_text (121-123, 132-134, 144-146; put() at 76). Callers: commands.rs:667, 799, 888, 907 and links.rs:332, 398. The code does open the clipboard with a NULL owner and then empties it. The MSDN remark the finding cites (with a NULL owner, EmptyClipboard makes the owner NULL and SetClipboardData fails) is documentation that cannot be checked from this sandbox (the windows crate is not in ~/.cargo/registry). In practice SetClipboardData with immediate (non-delayed) data succeeds with a NULL owner on current Windows, and widely used clipboard crates do the same.",
+    "corrected_claim": "The code fact is correct: a NULL owner HWND is passed. The failure scenario is speculative. Nothing in the repo shows a failure, and the finding itself says it works in practice. Whether some Windows configuration rejects SetClipboardData here depends on Win32 behaviour that cannot be checked from source.",
+    "reachable_by": "Copy picture, copy file, copy text and copy link actions. A failure would only show up if Windows actually enforced the documented restriction.",
+    "fix_assessment": "Passing the main window's HWND is harmless and follows the documentation. Note that the window then receives WM_DESTROYCLIPBOARD, and the HWND must still be valid when the call is made (e.g. not while the window is being torn down)."
+   }
+  ]
+ },
+ {
+  "id": "ED-16",
+  "title": "External edits to the screenshot are silently overwritten on the next ClippiBoy save",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "commands.rs:539"
+  ],
+  "claim": "`edit_screenshot` rebuilds from the stored original (`image.png`) every time (commands.rs:539) without checking whether the main file was changed externally; the DB dimensions also go stale.",
+  "scenario": "After the first ClippiBoy edit, the user edits the PNG in Paint or Photos. The next ClippiBoy save rebuilds from the stale image.png and drops those external changes.",
+  "fix": "Record size and mtime (or a hash) of the last written file in shot.json; on mismatch warn, or adopt the external file as the new original.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ED-17",
+  "title": "Blocking sync commands marked #[tauri::command(async)] run on tokio workers",
+  "severity": "medium",
+  "category": "perf",
+  "locations": [
+   "commands.rs"
+  ],
+  "claim": "`write_screenshot`, `copy_clip_image` and `take_screenshot` are sync fns with `#[tauri::command(async)]`, which (likely, per Tauri 2.11 macro behaviour) runs them on async runtime workers. They do blocking work there: PNG decode/encode, blur loops, `replace_file`'s sleep-retry (up to about 2.75 s), the blocking ffmpeg wait, and `Clipboard::open`'s sleeps.",
+  "scenario": "A slow save or clipboard retry stalls other async tasks sharing the runtime (share, links, updater).",
+  "fix": "Make them `async fn` and wrap the body in `tauri::async_runtime::spawn_blocking`.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ED-2",
+  "title": "Sidecars committed before the main PNG; several screenshot writes are not atomic",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "commands.rs:589-598",
+   "commands.rs:606-620",
+   "commands.rs:627-638",
+   "commands.rs:555",
+   "shot.rs:251-258",
+   "shot.rs:385-400"
+  ],
+  "claim": "In edit_screenshot the write order is `shot.write_png(&base_path)` (`File::create` truncates base.png in place), then `write_edit(...)` (shot.json), then `write_picture` (temp + `replace_file`, retried 10x then fails with \"Is it open somewhere right now?\"). The comment at commands.rs:555 (\"Everything that can fail happens before the first byte is written\") is not true for these three writes. `keep_original` copies to `image.png` with a plain `std::fs::copy`, and `write_under` writes `under.png`/`under.json` non-atomically as well.",
+  "scenario": "(a) The screenshot is open in an external viewer that locks it, or AV holds it: `replace_file` fails, but base.png and shot.json already describe the new crop and marks while the PNG is the old one; the UI catches the error and keeps its old `edit`, so the next open shows a state the file doesn't have. (b) Disk full while writing base.png leaves a truncated base.png, so draw mode shows \"File not found\". (c) A crash or disk-full during `keep_original`'s `std::fs::copy` leaves a partial image.png; `has_original` is then true forever and every later edit, including Reset, fails in `read_png(original)`.",
+  "fix": "Write all three to temp names first (`base.png.part`, `shot.json.part`, `<name>.<uuid>.new.png`). Then `replace_file` the main PNG (most likely to fail); only on success rename the sidecar parts (or remove base.png); on failure delete the parts. `keep_original`: copy to `image.png.part` and rename. `write_under`: same for under.png and under.json.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ED-3",
+  "title": "Save racing a file move or delete orphans the edited PNG and leaves the DB pointing at the unedited file",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "commands.rs:518",
+   "commands.rs:632-651",
+   "src/routes/Clips.tsx:327-336",
+   "filing.rs:114-139",
+   "src-tauri/src/edit.rs:48-53",
+   "src-tauri/src/commands.rs:511-599"
+  ],
+  "claim": "`edit_screenshot` reads `clip.path` once at the start (commands.rs:518) and writes to it about 0.5-2 s later; nothing locks the clip. Closing the viewer runs `for (const id of seen) if (left.has(id)) void fileClip(id);` (Clips.tsx), and `file_clip` moves the file (favorites or game folder) and updates the DB path. The viewer's close button, Escape after Discard, and the footer Delete button all stay enabled while `busy`.",
+  "scenario": "The user changes the game or hits the heart in the viewer, clicks Save marks, and closes right away. `filing::place` renames P1 to P2 (and may prune P1's folder); `write_picture` then creates a new file at P1 (rename onto a missing target succeeds) and runs `set_picture` with the edited dimensions. Result: the DB points at the unedited P2 with wrong dimensions, the thumbnail comes from the orphan at P1, and P1 stays in the user's folder forever. Delete during a save similarly recreates `originals/<id>/…` and the PNG as orphans.",
+  "fix": "Add a per-clip busy set in `AppState`: `write_screenshot` holds it; `file_clip` and `delete_clip` wait for it or skip. Re-read `lib.get(id).path` immediately before `replace_file`, inside the library lock. Disable Close and Delete while `busy`, or defer `fileClip` until the save resolves.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "EF-36",
+    "slice": "02-editor-features",
+    "title": "edit_screenshot has no save lock",
+    "claim": "The clip editor serialises its saves with `WORKING` (edit.rs:48-53), but `edit_screenshot` (commands.rs:511-599) has no lock. The UI's `busy` flag is the only guard against concurrent saves of the same screenshot.",
+    "locations": [
+     "src-tauri/src/edit.rs:48-53",
+     "src-tauri/src/commands.rs:511-599"
+    ],
+    "fix": "Add a save lock for `edit_screenshot` like the clip editor's `WORKING`."
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ED-4",
+  "title": "Editor usable before its edit store loads; failed load swallowed; save then drops crop/marks and misplaces blurs",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "ShotViewer.tsx:341-356",
+   "ShotViewer.tsx:426-448",
+   "ShotViewer.tsx:956",
+   "ShotViewer.tsx:1066",
+   "src/components/ShotViewer.tsx:341-356",
+   "src/components/ShotViewer.tsx:1066"
+  ],
+  "claim": "The load is `api.screenshotEdit(id).then(...).catch(() => {})` and tools are enabled with `disabled={!inTauri || broken}` with no check of `edit`. While `edit` is null: `full = clip.width` (the cropped size), `origin = {0,0}`, draw mode draws on `clip.path` (marks already baked in), and Save sends `write(edit?.crop ?? null, shapes)`, i.e. crop = null. If the load resolves late, `resetShapes(readMarks(loaded))` silently wipes whatever was drawn in the meantime.",
+  "scenario": "`screenshot_edit` errors (e.g. \"clip database is not available\") or resolves late because the main thread is busy. On a cropped shot with only blur marks, saving silently removes the crop, drops previously saved marks from shot.json, and applies the crop-relative blur rectangles to the uncropped original at the wrong spot, so the redaction misses its target. With non-blur marks Rust fails with \"The layer does not fit the picture.\"",
+  "fix": "Disable tools and Save until `edit !== null`; show the load error instead of swallowing it; have `write` refuse to run while `edit` is null.",
+  "reported_confidence": "confirmed",
+  "slice": "01-editor-bugs",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "EF-46",
+    "slice": "02-editor-features",
+    "title": "Swallowed screenshotEdit failure makes the next save drop the crop and misplace marks",
+    "claim": "If loading the existing edit via `screenshotEdit` fails, the error is swallowed (ShotViewer.tsx:341-356). A later save (1066) then sends `crop: null` with marks positioned on the cropped picture, which drops the crop and puts the marks in the wrong place.",
+    "locations": [
+     "src/components/ShotViewer.tsx:341-356",
+     "src/components/ShotViewer.tsx:1066"
+    ],
+    "fix": "No explicit fix proposed in the report."
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ED-5",
+  "title": "Save's async continuation is not tied to the clip it started for; old edit lands on the next picture",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "ShotViewer.tsx:604-644",
+   "ShotViewer.tsx:1089",
+   "ShotViewer.tsx:1249",
+   "ShotViewer.tsx:1259"
+  ],
+  "claim": "After `await writeScreenshot(...)` the code runs `const loaded = await api.screenshotEdit(clip.id); setEdit(loaded); resetShapes(readMarks(loaded));` using the closure's (old) `clip`, with no check that the viewer still shows it. Discard is always enabled (1089) and the step/navigation buttons are enabled once `mode === \"view\"` (1249, 1259).",
+  "scenario": "Save, then Discard (mode -> view), then navigate to the next shot. The new shot's load resolves fast; the old continuation resolves later and wins, so the viewer holds the previous screenshot's `edit` (its `basePath`, crop and marks) for the new picture. Entering draw mode shows the wrong base; saving writes the foreign crop and marks into the new screenshot.",
+  "fix": "Keep `const shownId = useRef(id)` and bail out after each await when `shownId.current !== clip.id`. Better: have `write_screenshot` return the new `ShotEdit` directly.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ED-6",
+  "title": "Marks drawn while a save is running are silently discarded",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "ShotViewer.tsx:880-892",
+   "ShotViewer.tsx:632-638",
+   "src/components/ShotViewer.tsx:604-644",
+   "src/components/ShotViewer.tsx:634",
+   "src/components/ShotViewer.tsx:880-892"
+  ],
+  "claim": "AnnotateLayer stays interactive while `busy` (ShotViewer.tsx:880-892). When the save finishes, `resetShapes(readMarks(loaded)); … setMode(\"view\")` (632-638) replaces everything drawn since Save was clicked.",
+  "scenario": "On a 4K picture (about a 1 s save) the user adds one more arrow right after clicking Save; the arrow vanishes without a prompt and there is no undo.",
+  "fix": "Block input while `busy` (`pointer-events: none` overlay or BusyVeil), or snapshot `current.current` at save time and re-apply any newer shapes as unsaved.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "EF-4",
+    "slice": "02-editor-features",
+    "title": "Marks drawn during a running save are overwritten",
+    "claim": "While a screenshot save runs (0.5-2 s for a 4K picture), the annotate and crop layers stay interactive: no busy flag is passed to `AnnotateLayer`/`CropLayer` (ShotViewer.tsx:880-892), and keys are not ignored. When the save finishes, `resetShapes(readMarks(loaded))` (ShotViewer.tsx:634) replaces the shapes with the saved state, so marks and undo actions made during the save are silently overwritten.",
+    "locations": [
+     "src/components/ShotViewer.tsx:604-644",
+     "src/components/ShotViewer.tsx:634",
+     "src/components/ShotViewer.tsx:880-892"
+    ],
+    "fix": "Pass `busy` to `AnnotateLayer` and `CropLayer` (`pointer-events-none`, plus a `BusyRing` overlay) and ignore keys while busy. Or compare `current.current` with the shapes that were sent and keep anything newer."
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ED-7",
+  "title": "PNG decompression bomb in read_png/read_rgba (allocation before any size check), reachable via friend-shared screenshots",
+  "severity": "medium",
+  "category": "security",
+  "locations": [
+   "shot.rs:455-472",
+   "shot.rs:676-689",
+   "shot.rs:105-108",
+   "share.rs:633-692"
+  ],
+  "claim": "`read_png` allocates the frame buffer from IHDR alone: `let mut buffer = vec![0u8; reader.output_buffer_size()];` (shot.rs:455-472); png 0.17's `Limits` only cap row and chunk buffers, not this caller-allocated buffer. `read_rgba` (shot.rs:676-689) checks the layer's dimensions against the picture only after the full allocation and decode (`blend`, shot.rs:105-108). Received shared files go straight into the library (share.rs:633-692).",
+  "scenario": "A malicious or compromised friend sends a ~100-byte \"screenshot\" whose IHDR claims 60000x60000 (about 14 GB RGBA). The user right-clicks it and chooses Copy picture (`copy_clip_image`) or edits it; `vec!` fails and `handle_alloc_error` aborts the whole app, replay buffer included. If the allocation succeeds instead, the RGB conversion and `dib()` allocate another 2-3x.",
+  "fix": "After `read_info`, reject anything with `w as u64 * h as u64 > 1<<28` (and dimensions > 16384), then allocate with `try_reserve_exact`. Give `read_rgba` the expected `(w, h)` and reject on mismatch before allocating. At receive time read the header and store the real dimensions.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ED-8",
+  "title": "Layer PNGs travel over IPC as JSON number arrays and are buffered by serde as Content",
+  "severity": "medium",
+  "category": "perf",
+  "locations": [
+   "ShotViewer.tsx:1607-1624",
+   "types.ts:527",
+   "commands.rs:400-419",
+   "src/components/ShotViewer.tsx:1623",
+   "src/lib/types.ts:525-527",
+   "src-tauri/src/commands.rs:400-419"
+  ],
+  "claim": "`layerBytes` returns `Array.from(new Uint8Array(await blob.arrayBuffer()))`, so each byte becomes about 3.6 JSON characters plus a JS Number, stringified on the UI thread. On the Rust side `Step` is internally tagged (`#[serde(tag = \"kind\")] … Layer { png: Vec<u8> }`), so serde first buffers the whole object into `Content` (one ~32-byte `Content::U64` per PNG byte) and then copies into `Vec<u8>`.",
+  "scenario": "A 2 MB layer (text-heavy, large fills, 8K) costs roughly 7 MB of JSON plus 64 MB of transient Rust memory per save.",
+  "fix": "Send layers as raw IPC bodies (`invoke(\"write_shot_layer\", bytes, { headers: { id, index } })`, Rust reads `tauri::ipc::Request` -> `InvokeBody::Raw`), or at minimum base64 strings with `#[serde(with = \"...\")]` and an adjacently/externally tagged enum. Encode in a worker with `OffscreenCanvas.convertToBlob`.",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "EF-31",
+    "slice": "02-editor-features",
+    "title": "Layer PNGs travel over IPC as JSON number arrays",
+    "claim": "Each layer's PNG bytes are sent as a JSON `number[]` via `Array.from(Uint8Array)` (ShotViewer.tsx:1623; types.ts:525-527; commands.rs:400-419), roughly 3-4x the bytes plus parse time. Tauri 2 accepts raw bodies (`tauri::ipc::Request` / `InvokeBody::Raw`) and can return raw bytes (`tauri::ipc::Response`).",
+    "locations": [
+     "src/components/ShotViewer.tsx:1623",
+     "src/lib/types.ts:525-527",
+     "src-tauri/src/commands.rs:400-419"
+    ],
+    "fix": "Send `Uint8Array` as a raw invoke body and read it in Rust through `tauri::ipc::Request`; change the `ShotStep.layer.png` type."
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ED-9",
+  "title": "Preview and save use full-resolution canvases per blur-separated run",
+  "severity": "medium",
+  "category": "perf",
+  "locations": [
+   "ShotAnnotate.tsx:566-586",
+   "ShotViewer.tsx:609-618",
+   "src/components/ShotAnnotate.tsx:566-586",
+   "src/components/ShotViewer.tsx:1607-1624"
+  ],
+  "claim": "Preview canvases are `<canvas width={width} height={height}>` at full picture pixels (ShotAnnotate.tsx:566-586). Every blur splits the layer runs, so N blurs mean N+1 canvases of 3840x2160 (33 MB each; 132 MB each at 8K) plus the draft canvas. Save allocates another N full-size canvases at once (`Promise.all(... layerBytes ...)`, ShotViewer.tsx:609-618); at 8K this can fail, and `getContext`/`toBlob` returning null throws and is swallowed (see the swallowed-failures finding).",
+  "scenario": "On 4K/8K screenshots with several blurs, the WebView holds hundreds of MB of canvas memory; saving at 8K can fail silently.",
+  "fix": "Size preview canvases to `round(box.width*devicePixelRatio)` with `ctx.setTransform(scale…)`, repainting on zoom. Serialise `layerBytes` (or use OffscreenCanvas in a worker).",
+  "reported_confidence": "likely",
+  "slice": "01-editor-bugs",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "EF-30",
+    "slice": "02-editor-features",
+    "title": "Preview memory grows with blur count (one full-res canvas per layer)",
+    "claim": "Each run of marks is its own full-resolution preview canvas (ShotAnnotate.tsx:566-586), and each blur splits the run. A 4K canvas is about 33 MB, so 10 blurs interleaved with marks is about 11 canvases, roughly 360 MB. The export path (`layerBytes`, ShotViewer.tsx:1607-1624) then encodes one full-size PNG per layer.",
+    "locations": [
+     "src/components/ShotAnnotate.tsx:566-586",
+     "src/components/ShotViewer.tsx:1607-1624"
+    ],
+    "fix": "Single WebView renderer (option A) with cached bitmaps below/above the active mark and display-resolution preview."
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ }
+]

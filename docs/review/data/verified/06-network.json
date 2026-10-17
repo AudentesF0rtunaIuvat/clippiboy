@@ -1,0 +1,753 @@
+[
+ {
+  "id": "NW-10",
+  "title": "Share links publish the friend's name on received clips",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [
+   "src-tauri/src/share.rs:866",
+   "src-tauri/src/clips.rs:347-351",
+   "src-tauri/src/links.rs:546"
+  ],
+  "claim": "Received clips are tagged `tags: vec![format!(\"from {from}\")]` (share.rs:866). `is_friend_tag` only matches a \"with \" prefix, so when the user shares a received clip as a public link, the tag \"from <friend's Discord display name>\" goes to the public page; the server-side `cleanTags` keeps it. This contradicts the stated intent (\"who played along stays among friends, a link is public\"; commit f041a3d).",
+  "scenario": "User receives a clip from a friend, then creates a public share link for it; the public page shows \"from <friend's display name>\".",
+  "fix": "Treat \"from …\" as a friend tag, or better, store friend and sender tags in a structured field.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "share.rs:627-629 receive() takes `entry.transfer.friend_name.clone()` as `from` (friend_name = Discord display_name, friends.rs:627-631); share.rs:691 passes it to file_clip; share.rs:866 `tags: vec![format!(\"from {from}\")]`, stored via set_tags (share.rs:872). clips.rs:347-350 `is_friend_tag` matches only a case-insensitive \"with \" prefix. links.rs:546 `for tag in clip.tags.iter().filter(|tag| !crate::clips::is_friend_tag(tag))` pushes every other tag as a query param; link_create (links.rs:330-345) only rejects screenshots, not received clips. server/src/links.ts:206 `cleanTags(url.searchParams.getAll(\"tag\"))` (shares.ts:121-133 only trims/dedupes/caps), page.ts:111 renders each tag as a pill. The intent comment at links.rs:544-545 (\"who played along stays among friends, a link is public\") is broken for the sender tag. No frontend filter of \"from \" tags exists (grep of src/ found none).",
+    "corrected_claim": "",
+    "reachable_by": "The local user, by making a public share link of any clip received from a friend while its default \"from <name>\" tag is still there; the friend's display name then shows on the public page for 5 days.",
+    "fix_assessment": "Adding a \"from \" prefix check to is_friend_tag fixes it in one line, but it would also catch hand-typed tags like \"from above\". A structured field for friend/sender tags (or a dedicated marker) is the cleaner fix, and the privacy page (privacy.html:100) should say tags go along."
+   }
+  ]
+ },
+ {
+  "id": "NW-11",
+  "title": "Session token stored in plaintext in Roaming AppData",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "src-tauri/src/friends.rs:831-860"
+  ],
+  "claim": "`std::fs::write(&path, json!({ \"token\": token }))` writes the bearer session token to `%APPDATA%\\ClippiBoy\\friends.json` in plaintext. The token stays valid for 180 days without use (renewed with use), so it follows roaming profiles and backups and any same-user malware can take it. (No token appears in the logs.)",
+  "scenario": "Same-user malware or anyone with access to a roaming profile/backup reads friends.json and impersonates the user to the friends server for up to 180 days.",
+  "fix": "Protect it with DPAPI (`CryptProtectData`) or the Windows Credential Manager (keyring), and keep it in LocalAppData.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "friends.rs:831-833 `fn token_path() -> PathBuf { crate::config::data_dir().join(\"friends.json\") }`; friends.rs:846-848 `std::fs::write(&path, serde_json::json!({ \"token\": token }).to_string())`, written as plaintext. config.rs:10-12 data_dir = `dirs::data_dir()`.join(\"ClippiBoy\"); the app depends on dirs 5 (Cargo.toml:39), and dirs-5.0.1/src/win.rs:10 maps `data_dir()` to `known_folder_roaming_app_data()` (FOLDERID_RoamingAppData). server/src/db.ts:125-146 `SESSION_IDLE_MS = 180 days`, last_used refreshed at most once a day on use, so the token lasts 180 days of non-use and indefinitely with use. The token is a bearer credential: authenticate() only hashes the presented token (db.ts:131-135), with no device binding.",
+    "corrected_claim": "As claimed. One caveat on the threat: same-user malware can steal the token whatever storage is used (DPAPI/Credential Manager decrypt for any process running as the user), so the realistic gain from hardening is against copies of the file: roaming profile servers, backups, other accounts or offline disks.",
+    "reachable_by": "Anyone who can read the user's Roaming AppData: same-user processes, roaming-profile or backup copies, an admin or an offline disk.",
+    "fix_assessment": "DPAPI (CurrentUser) plus LocalAppData stops the token roaming and makes stray copies useless without the user's master key. It does not stop same-user malware, and DPAPI master keys roam too, so moving to LocalAppData is the part that stops roaming. Credential Manager is comparable."
+   }
+  ]
+ },
+ {
+  "id": "NW-12",
+  "title": "Any clippiboy://auth deep link consumes the pending sign-in verifier",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "src-tauri/src/friends.rs:147-155",
+   "src-tauri/src/friends.rs:289"
+  ],
+  "claim": "`friends.verifier.lock().take()` runs before the `/auth/exchange` call, for any `clippiboy://auth?code=<junk>`. A web page (or local process) can therefore make a pending sign-in fail, and can pop error toasts when no sign-in is open. Login CSRF (victim signed into attacker's account) is blocked by PKCE unless the attacker also learns the victim's challenge (it travels in the URL query, so browser history or server logs) within 10 minutes — that part is speculative.",
+  "scenario": "While the user is signing in, a web page opens `clippiboy://auth?code=junk`; the verifier is taken, the real code's exchange fails. Without a sign-in in progress, the same link produces error toasts. DoS confirmed.",
+  "fix": "Keep the verifier until an exchange succeeds or a timeout passes; ignore links silently when no sign-in is in progress.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "LS-39",
+    "slice": "05-local-surface",
+    "title": "Any deep link consumes the pending PKCE verifier before the exchange, letting a web page cancel sign-in",
+    "claim": "Any auth deep link `take()`s the pending verifier *before* the code exchange (friends.rs:289), and each link raises an error toast.",
+    "locations": [
+     "src-tauri/src/friends.rs:289"
+    ],
+    "fix": "Consume the verifier only after a successful exchange, and rate-limit the toasts."
+   }
+  ],
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "friends.rs:147-164 handle_url accepts any `clippiboy://auth...code=<anything>` and spawns finish_sign_in; on Err it sets signing_in=false and calls `crate::notify(&app, \"error\", err)` (line 162). friends.rs:287-291 `let Some(verifier) = friends.verifier.lock().take() else { return Err(\"That sign-in was not started here — start it again from Friends.\".into()); };` The verifier is consumed before the POST /auth/exchange (297-305). A junk code then gets a 400 from the server (server/src/index.ts:214-221, no login row), and when the real code arrives the verifier is None, so it fails with the 'not started here' toast. The server-side real login row is not spent by the junk code (it deletes only the row matching the presented code), so a retry from the app works. No format check or rate limit on code. lib.rs:1252-1255 routes every on_open_url URL to handle_url; single-instance has the deep-link feature (Cargo.toml:25), so links reach the running instance.",
+    "corrected_claim": "Mechanism as claimed. On the web-page vector: Chromium and Firefox show an external-protocol confirmation (\"Open ClippiBoy?\") for a clippiboy:// navigation from an origin the user has not always-allowed, so a hostile page needs one user click per prompt. A local process can trigger it silently, but such a process already runs as the user. Login CSRF still needs the victim's PKCE challenge (index.ts:222 checks sha256(verifier) against the stored challenge), so it stays speculative.",
+    "reachable_by": "Any local process, or a web page whose clippiboy:// launch the user approves in the browser's protocol prompt. It only disrupts a sign-in in progress or shows error toasts.",
+    "fix_assessment": "Taking the verifier only after a successful exchange (or keeping it until cancel/timeout) and silently ignoring links when signing_in is false fixes both effects. Optionally, check the code's format (randomToken(24) charset and length) before any network call."
+   }
+  ]
+ },
+ {
+  "id": "NW-13",
+  "title": "P2P exposes IP addresses before accept, and friend-chosen endpoints/relays get dialled",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [
+   "src-tauri/src/share.rs:313",
+   "src-tauri/src/share.rs:783"
+  ],
+  "claim": "The offer contains `router.endpoint().addr()`: the sender's public and LAN IPs, sent to the friend before they accept. On accept, the receiver contacts IP:ports and a relay URL chosen by the friend (iroh's `start_active_relay` ignores whether the URL is in the relay map). That reveals the receiver's IP to an attacker-run relay and sends QUIC packets to arbitrary hosts, LAN included. The privacy page doesn't say that a friend learns your public and LAN IPs (the sender's as soon as it offers), or that a friend-chosen relay host may be contacted.",
+  "scenario": "A malicious friend puts an attacker-run relay URL or internal LAN IP:ports in `EndpointAddr`; on accept the victim's app contacts those hosts, revealing the victim's IP and sending QUIC packets to arbitrary/LAN targets.",
+  "fix": "Say this in the privacy page; offer only global addresses plus the n0 relay; ignore relay URLs outside the default map; consider a relay-only option.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "share.rs:313 `Ok::<_, String>((router.endpoint().addr(), sha256, tracks))` and share.rs:338 `Signal::ShareOffer { ..., addr, meta }` relayed to the friend before any answer. iroh-1.2.0 socket.rs:1945/1954 add bound interface addresses as `DirectAddrType::Local`, so LAN IPs are in addr(). Receiver: share.rs:584 stores the friend-supplied `addr` unfiltered; after accept, share.rs:783 `endpoint.connect(addr.clone(), ALPN)`. In iroh: remote_map.rs:311-318 passes all `addrs` on, and remote_state.rs:855-856 `self.paths.insert_multiple(addrs, Source::App)` has no global/private filter; relay/actor.rs:1341-1348 `start_active_relay` only looks up an auth_token in relay_map (`.get(&url).and_then(...)`) and connects to any RelayUrl. Endpoint::bind(presets::N0) (share.rs:886) installs no before_connect hook. privacy.html:96 says only that the server passes on \"the connection details of both devices\", and privacy.html:97 names only n0 relays; neither says a friend sees your public and LAN IPs or that a friend-chosen relay may be contacted.",
+    "corrected_claim": "As claimed. Additional detail for the fix: presets::N0 also enables pkarr/DNS address lookup (iroh presets.rs:125-133, triggered in remote_state.rs:859-870), so a malicious friend can publish arbitrary relay URLs and direct addrs for their own EndpointId. Filtering the offer's addr alone would not stop the receiver dialling attacker-chosen hosts.",
+    "reachable_by": "A friend (server-verified friendship). Learning the sender's IPs needs no action from the victim beyond sending an offer. Making the receiver dial chosen hosts needs the victim to accept an offer (subject to accept_clips settings).",
+    "fix_assessment": "Disclosing this on the privacy page is cheap and right. Ignoring non-default relay URLs and non-global IPs in received offers helps but is incomplete while pkarr/DNS lookup can feed attacker addresses; a full fix needs a custom address lookup or a before_connect/relay policy (or a relay-only mode on n0 relays). Dropping LAN addrs on the sender side would cost same-LAN direct transfers."
+   }
+  ]
+ },
+ {
+  "id": "NW-14",
+  "title": "Share temp tracks and crash .part files leak",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/share.rs:1013-1015",
+   "src-tauri/src/share.rs:1113"
+  ],
+  "claim": "The cut tracks in `%TEMP%\\clippiboy-share\\<id>\\` are deleted only after a successful send (`o.tracks.drain(..)`). After Declined, Expired, Cancelled or Failed they stay forever, and nothing cleans them at startup. `.part` files from a crash stay in the user's clip folder or under `tracks\\`.",
+  "scenario": "A share offer is declined or expires; its temp track files remain in %TEMP% indefinitely; a crash mid-receive leaves .part files in the clip folder.",
+  "fix": "`impl Drop` for `Outgoing` (or clean up on every end state), plus a startup sweep of those folders.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "share.rs:1113 cut_tracks writes to `std::env::temp_dir().join(\"clippiboy-share\").join(sanitize(id))`; the only deletion of those files is share.rs:1012-1015 (`for cut in o.tracks.drain(..) { let _ = std::fs::remove_file(&cut.path); }`), inside `if arrived` (Done), plus remove_dir_all only when cutting itself fails (1144). Declined/Expired/Cancelled/Failed paths (handle_relay 471-512, relay_failed, fail()) touch only stage; share_clear (460-465) drops map entries without deleting files. There is no `impl Drop` for Outgoing (grep shows Drop only in clipboard/links/overlay/pipeline/mft). Worse: if the offer is called off during Preparing, share.rs:322-323 returns before `entry.tracks = tracks` (332), so the cuts are never even recorded. Startup discard_leftovers (lib.rs:677-688) sweeps only data_dir/buffer and data_dir/temp, not %TEMP%\\clippiboy-share. Receive: the clip .part is next to the target in the clip folder (share.rs:640-647), track .part files go under stems::dir(clip_id) = data_dir/tracks/<new uuid> (share.rs:727-728, stems.rs:39-45); both are removed only on handled error paths (668-670, 676-677, 683-684, 696-698), and nothing sweeps orphan tracks/<uuid> dirs, so a crash leaves them.",
+    "corrected_claim": "As claimed, plus the per-transfer temp directory itself stays even after a successful send (only files are removed), and cuts made for an offer cancelled while Preparing are never tracked at all. \"Forever\" is modulo Windows Storage Sense/Disk Cleanup, which may purge %TEMP% if enabled.",
+    "reachable_by": "Any outgoing share of a clip with stored stems that does not end in Done (friend declines, offer expires, cancel, failure, app exit); any crash or kill mid-receive.",
+    "fix_assessment": "Cleaning up on every terminal stage (or a Drop on Outgoing removing the whole per-id dir) plus a startup sweep of %TEMP%\\clippiboy-share fixes the sender side. The receiver needs a sweep of *.part in clip folders and of tracks/<id> dirs with no matching clip row."
+   }
+  ]
+ },
+ {
+  "id": "NW-16",
+  "title": "safe_file_name misses Windows device names and bidi control characters",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src-tauri/src/share.rs:1176-1194"
+  ],
+  "claim": "`safe_file_name` doesn't apply the reserved-name rules `filing::folder_name` has, so `CON.mp4` / `NUL.mp4.part` are possible: on Windows <= 10 the transfer fails or writes into a device. `COM¹`-style names aren't handled by either function. It doesn't strip Unicode format characters (`c.is_control()` misses U+202E), so a name can be shown as \"…4pm.png\" in Explorer, though it stays a `.mp4`.",
+  "scenario": "A friend offers a file named `CON.mp4` (transfer fails or writes to a device on Windows <= 10), or a name with U+202E that displays with a spoofed extension in Explorer.",
+  "fix": "Reuse the reserved-name logic and strip the Cf bidi characters.",
+  "reported_confidence": "likely",
+  "slice": "06-network",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "share.rs:1176-1194 safe_file_name only does `.map(|c| if c.is_control() || r#\"<>:\"/\\|?*\"#.contains(c) { '_' } else { c })`, trims dots, forces an allowlisted extension and caps the stem at 120 chars. It has no reserved-name check, unlike filing.rs:63-71 (`// CON.mp4 cannot be created on Windows, _CON can.` ... `stem.ends_with(|c: char| c.is_ascii_digit())`). Rust's char::is_control only matches category Cc, so U+202E (Cf) passes through. The app even has a Cf stripper it does not use here: game.rs:257 `0x202A..=0x202E // bidi embedding and overrides` in is_invisible/strip_invisibles. The result is used directly: share.rs:643 `let target = crate::filing::free_name(&dir, &safe_file_name(&meta.file_name));` and share.rs:644-647 builds `<name>.mp4.part`, opened at share.rs:799 via open_part. The filing.rs check uses `stem.len() == word.len() + 1` (bytes) plus is_ascii_digit, so `COM¹` (5 bytes, non-ASCII digit) is missed by both functions.",
+    "corrected_claim": "",
+    "reachable_by": "A friend whose offer the user accepts (with AcceptClips::All or as a favorite), through meta.file_name in the ShareOffer relay.",
+    "fix_assessment": "Reusing the filing.rs reserved-name rule (extended to superscript digits) and running crate::game::strip_invisibles first is cheap and correct. What actually happens with a device name rests on Win32 path normalisation (pre-Windows 11 RtlIsDosDeviceName treats `CON.x.y` as a device), which cannot be checked from source. From the code, the likely outcome is a failed transfer (open_part/set_len error, or an empty-file hash mismatch for NUL), not damage. The bidi spoof can only swap between allowlisted media extensions."
+   }
+  ]
+ },
+ {
+  "id": "NW-18",
+  "title": "ffmpeg archive isn't hashed as a whole and nothing caps its size",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "src-tauri/src/tools.rs:221-257",
+   "src-tauri/src/tools.rs:262-291"
+  ],
+  "claim": "The ffmpeg zip download has no size cap, and `ZipArchive` parses the unverified file; entries are copied to disk before their hash is known (only per-file SHA-256 hashes are pinned). A compromised release could fill `%LOCALAPPDATA%` (a zip bomb or an endless stream). Nothing gets executed, though.",
+  "scenario": "A compromised GitHub release serves an endless stream or a zip bomb; the app writes until %LOCALAPPDATA% is full.",
+  "fix": "Pin the zip's own SHA-256 and check it before opening; cap each entry at its expected size.",
+  "reported_confidence": "likely",
+  "slice": "06-network",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "tools.rs:228 `let total = response.content_length();` then 236-247 a loop `while let Some(chunk) = response.chunk().await... { file.write_all(&chunk)... downloaded += ... }` with no upper bound. The only size check, tools.rs:249 `if total.is_some_and(|total| downloaded != total)`, does nothing for a chunked response with no Content-Length. tools.rs:265 `zip::ZipArchive::new(file)` parses the unverified archive, and 275-279 `File::create(&path)` + `copy_hashing(&mut entry, &mut out)` stream each entry to disk before comparing the hash (281). In zip-4.6.1 read.rs:339 only the compressed input is limited (`reader.take(data.compressed_size)`), and make_reader (read.rs:427-438) wraps a Decompressor with a Crc32Reader, with no cap at uncompressed_size. So a deflate bomb expands without limit. When a write fails at disk-full inside the download loop, the `?` returns without removing `<VERSION>.zip.part` (removal happens only at 250/260), and the BACKOFF retries (30 s .. 30 min, forever) truncate and refill it. Nothing unverified is executed: the files are renamed into the target only after both hashes match (tools.rs:286), and provide() trusts only that target folder (tools.rs:166).",
+    "corrected_claim": "",
+    "reachable_by": "Whoever can replace the ffmpeg-9.0.1.zip asset on the repo's GitHub release (or GitHub/CDN itself). TLS stops a network attacker. It triggers on first run or whenever the 9.0.1 folder is missing.",
+    "fix_assessment": "Pinning the zip's SHA-256 is right but not enough on its own against an endless stream, because the hash is only known at the end. Also cap the download at the known archive size (abort when downloaded exceeds it, and require Content-Length), cap each entry at its expected size with take(), and delete the .zip.part on every error path."
+   }
+  ]
+ },
+ {
+  "id": "NW-22",
+  "title": "Reconnect backoff has no jitter",
+  "severity": "low",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/friends.rs:404-409"
+  ],
+  "claim": "The friends reconnect backoff has no jitter, so all clients come back together after a server deploy (thundering herd).",
+  "scenario": "After a server deploy, every client reconnects at the same backoff instants.",
+  "fix": "Add random jitter to the reconnect backoff.",
+  "reported_confidence": "likely",
+  "slice": "06-network",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "friends.rs:382 `let mut backoff = Duration::from_secs(1);` ... friends.rs:404-409 `if started.elapsed() > Duration::from_secs(60) { backoff = Duration::from_secs(1); } tokio::time::sleep(backoff).await; backoff = (backoff * 2).min(BACKOFF_MAX);` with BACKOFF_MAX = 60 s (friends.rs:38). No randomness anywhere in the loop. Every reconnect runs refresh() (GET /me + GET /friends, friends.rs:445-447) plus a hub snapshot.",
+    "corrected_claim": "",
+    "reachable_by": "Any event that drops all sockets at once (a Worker/Durable Object redeploy or restart, a Cloudflare incident); every long-lived client resets to 1 s and retries in lock-step at 1, 2, 4 ... 60 s. Clients that only notice the drop via the pong deadline (up to 75 s) spread naturally; those that get a Close/RST are synchronised. Whether deploys actually close the sockets is Cloudflare runtime behaviour not checkable here.",
+    "fix_assessment": "Adding full or equal jitter (e.g. sleep a random 50-100 % of backoff) is a few lines and the standard remedy; impact today is small given Cloudflare absorbs the burst."
+   }
+  ]
+ },
+ {
+  "id": "NW-27",
+  "title": "Privacy page says connection details of both devices pass the server; only the sender's do",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [
+   "site/privacy.html"
+  ],
+  "claim": "The privacy page says \"connection details of both devices\" pass the server; in fact only the sender's do (in the offer). The receiver's go directly to the friend. (The page's \"never reaches our server\" claim is also only true while the server behaves — see NW-1.)",
+  "scenario": "A reader of the privacy page gets an inaccurate picture of what the server relays.",
+  "fix": "Correct the privacy page wording.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "site/privacy.html:96 `our server only passes on the request and the connection details of both devices and stores none of it`. share.rs:166-180 the only relayed signals are `ShareOffer { id, size, sha256, secret, addr: EndpointAddr, meta }`, `ShareAnswer { id, accept }`, `ShareCancel { id }`; share.rs:313/338 the offer's addr is the sender's `router.endpoint().addr()`; share.rs:372 the receiver answers with `Signal::ShareAnswer { id: id.clone(), accept: true }` (no address) and then dials the sender directly (share.rs:783 `endpoint.connect(addr.clone(), ALPN)`). No other send_relay carries an EndpointAddr (grep of send_relay/EndpointAddr in src-tauri/src).",
+    "corrected_claim": "",
+    "reachable_by": "Any reader of the public privacy page; documentation inaccuracy only (the server does still see both clients' IPs via their WebSocket connections, but only the sender's iroh connection details are relayed).",
+    "fix_assessment": "Reword to 'the request and the sending device's connection details (its iroh device ID and addresses)'. Whether the 'never reaches our server' sentence should be qualified belongs to NW-1, not verified here."
+   }
+  ]
+ },
+ {
+  "id": "NW-6",
+  "title": "Two concurrent receives with the same file name share one .part file; duplicate offer ids can be accepted twice",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/share.rs:643-647",
+   "src-tauri/src/share.rs:687",
+   "src-tauri/src/share.rs:782",
+   "src-tauri/src/share.rs:1163-1167",
+   "src-tauri/src/filing.rs:247-265",
+   "src-tauri/src/filing.rs:272",
+   "src-tauri/src/share.rs:643"
+  ],
+  "claim": "`free_name` only checks the final name, so two concurrent transfers both get `X.mp4.part`. The second takes its resume offset from the first one's partly written file and truncates it (`set_len`). Rust opens files with `FILE_SHARE_DELETE`, so after the first renames the file into place, the second keeps writing into the clip that was already verified and filed. `rename` also replaces anything that appeared at the target since, and `free_name` hands back the existing target after 999 name collisions. An offer re-sent with the same id overwrites an entry that is already Moving and puts it back to Asking, so it can be accepted twice.",
+  "scenario": "The same clip is offered twice and both are accepted, or a malicious friend re-sends offers; the second transfer corrupts the already-filed clip.",
+  "fix": "Use a unique part name (`.<uuid>.part`); claim the final name atomically (`create_new`, or a move without replace, retrying on collision); reject duplicate offer ids.",
+  "reported_confidence": "likely",
+  "slice": "06-network",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "LS-19",
+    "slice": "05-local-surface",
+    "title": "`free_name` can overwrite an existing file (check-then-rename, 999-collision fallback, parallel receives)",
+    "claim": "`free_name` (filing.rs:247-265) checks `exists()` and then the caller renames. After 999 collisions it returns the existing `target`. `std::fs::rename` on Windows *replaces* the destination (filing.rs:272). share.rs:643 picks a free name *before* a long download.",
+    "locations": [
+     "src-tauri/src/filing.rs:247-265",
+     "src-tauri/src/filing.rs:272",
+     "src-tauri/src/share.rs:643"
+    ],
+    "fix": "Create the target with `create_new(true)`, or use a rename that does not replace."
+   }
+  ],
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "share.rs:643-647 `let target = crate::filing::free_name(&dir, &safe_file_name(&meta.file_name)); let part = target.with_extension(format!(\"{}.part\", ...))` - target picked before the download; filing.rs:247-265 free_name only tests `target.exists()` / `candidate.exists()` and after the 2..1000 loop returns `target` (the existing file); share.rs:782 `let offset = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0).min(size);` then share.rs:1163-1167 `OpenOptions::new().create(true).truncate(false).write(true).open(part)?; file.set_len(offset)?;` - a second receive with the same name+game folder shares X.mp4.part, resumes from the first's length and truncates to its (stale) offset; share.rs:687 `std::fs::rename(&part, &target)` (replaces an existing target on Windows); share.rs:582-585 `incoming.lock().insert(id.clone(), Incoming { transfer, ... stage: Stage::Asking ... })` unconditionally (only `id.len() > 64 || sha256.len() != 64` checked at 553), and share_accept 366-369 only requires `stage == Stage::Asking`, so a re-sent id resets a Moving entry and can be accepted again. Stock sender: share_send (share.rs:241-261) has no duplicate guard and makes a fresh uuid per send, and the UI dialog (src/components/Share.tsx:51-60) can be reopened, so the same clip can be offered twice. FILE_SHARE_DELETE: Rust std's documented Windows default share_mode is READ|WRITE|DELETE (std source not present locally), so A's rename succeeds while B's handle stays open on the now-filed file.",
+    "corrected_claim": "All mechanisms hold, but the outcome depends on timing and content. With the SAME clip offered twice the two writers write identical bytes at identical offsets, so the filed clip is only damaged when B's stale set_len(offset) truncates A's already-verified file (B opened after A finished writing but before A's rename, which waits up to 5 s for the close) and B then fails or is cancelled; or B, whose offset was computed after A's rename (during fetch_tracks or on a retry) downloads into a fresh part and renames over A's X.mp4. Outright content corruption of a filed clip needs two DIFFERENT files with the same sanitized name and game folder, e.g. a modified/malicious friend client (different content under the same file_name, or a reused offer id). The 999-collision fallback needs 999 same-stem files and is an edge case.",
+    "reachable_by": "A sender who offers the same clip twice (stock client) and a receiver who accepts both while the first is still in flight; any friend running a modified client (same file_name with different content, or a re-sent offer id).",
+    "fix_assessment": "Sound: per-transfer part names (e.g. `.<id>.part`), a non-replacing final move with retry on collision (or create_new on the target), and ignoring a ShareOffer whose id is already known (and from a different friend) fix all three paths."
+   }
+  ]
+ },
+ {
+  "id": "NW-7",
+  "title": "P2P fetch/serve stalls never time out; router JoinSet unbounded; outgoing secret stays valid forever",
+  "severity": "low",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/share.rs:787",
+   "src-tauri/src/share.rs:794",
+   "src-tauri/src/share.rs:808",
+   "src-tauri/src/share.rs:918-926",
+   "src-tauri/src/share.rs:971"
+  ],
+  "claim": "iroh sends a keep-alive every 5 s, so the QUIC idle timeout never fires while the peer process lives. In `fetch`, `open_bi`, `read_exact(header)` and `recv.read`, and in `serve`, `accept_bi`, `read_exact(length)` and `send.write_all` can therefore hang forever if the other side goes quiet. Cancel is only checked between chunks, so it cannot break a blocked call. The router's `JoinSet` is unbounded, so anyone who knows the NodeId can pile up idle connections. An outgoing transfer stays \"Moving\" with a working secret for good if the receiver disappears.",
+  "scenario": "The peer stops reading/writing without closing; the transfer hangs indefinitely and cannot be cancelled; or someone with the NodeId opens many idle connections that accumulate in the JoinSet.",
+  "fix": "Per-operation `tokio::time::timeout` (e.g. 30 s without progress); an expiry on outgoing secrets.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "iroh-1.2.0 src/socket.rs:109 `HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5)`, src/endpoint/quic.rs:156-158 `cfg.keep_alive_interval(Some(HEARTBEAT_INTERVAL)); ... default_path_max_idle_timeout(Some(PATH_MAX_IDLE_TIMEOUT))` - QUIC PINGs keep an app-silent connection alive. share.rs fetch: 783 connect is under `tokio::time::timeout(Duration::from_secs(30), ...)` but 787 `connection.open_bi().await`, 794 `recv.read_exact(&mut header).await`, 808 `recv.read(&mut buf).await` have none; cancel is only read at 804 `if cancelled.load(...)` between chunks. serve: 918 `connection.accept_bi().await`, 920/926 `recv.read_exact(...)`, 971 `send.write_all(&buf[..n]).await` have no timeout (only the later track close wait 30 s at 984 and the k wait 120 s at 989 do). iroh protocol.rs:513 `let mut join_set = JoinSet::new();` and 590 `join_set.spawn(...)` for every incoming with no cap; share.rs:889 `Router::builder(endpoint).accept(ALPN, handler).spawn()` sets no incoming_filter. Outgoing: serve error paths return Err without fail() (comment at 1029-1030 'A line that merely dropped stays open'), 935 `let open = matches!(entry.transfer.stage, Stage::Asking | Stage::Moving)`, and no timer expires Moving (only Asking at 348-351); relay_failed (521-531) only touches Preparing|Asking.",
+    "corrected_claim": "Accurate, with scope notes: share_cancel (share.rs:430-443) does flip the UI stage to Cancelled at once, so the user is not stuck - what leaks is the blocked task and its QUIC connection. A hang needs a peer whose QUIC stack is alive but whose application stops (a wedged or modified client); stock peers close on error/cancel. open_bi only blocks if the peer advertises no free bidi streams. The EndpointId is regenerated each run (Endpoint::bind without a secret key, iroh endpoint.rs:228) and is only handed out in offers, so the JoinSet flood is limited to friends who received an offer this run, the friends server, or whoever else sees that id.",
+    "reachable_by": "A friend who received an offer (or the friends server) running a misbehaving client; a wedged peer process; anyone else who learns this run's EndpointId.",
+    "fix_assessment": "Per-await idle timeouts (e.g. tokio::time::timeout around accept_bi/read_exact/each read/write_all, reset on progress) plus a select on a cancel Notify fix the hangs; an expiry for Moving outgoing transfers and a cap or incoming_filter on the router address the rest."
+   }
+  ]
+ },
+ {
+  "id": "NW-8",
+  "title": "Friends WebSocket connect has no timeout, freezing the reconnect loop",
+  "severity": "low",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/friends.rs:428"
+  ],
+  "claim": "`tokio_tungstenite::connect_async` is called with no timeout; a middlebox that stalls the TLS handshake freezes the friends reconnect loop until restart.",
+  "scenario": "A network middlebox accepts TCP but stalls the TLS handshake; the friends connection never recovers until the app is restarted.",
+  "fix": "A 15 s timeout on the WebSocket connect.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "friends.rs:428 `let (socket, _) = match tokio_tungstenite::connect_async(request).await {` with no timeout; tokio-tungstenite-0.30.0/src has no `timeout` anywhere (grep), connect.rs:31-52 just TcpStream::connect + TLS + HTTP upgrade. The loop awaits it serially: friends.rs:389 `match serve(&app, &token).await {` inside the single reconnect loop spawned by spawn_connection (378-411), which is only started from start() (143) and after sign-in (316). By contrast the reqwest client has `.connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(20))` (friends.rs:734-735), and the ping/pong deadline (friends.rs:487-491) only runs after the handshake.",
+    "corrected_claim": "Correct; note the hang needs a peer/middlebox that ACKs at TCP level and then stays silent (or never answers the HTTP upgrade). TCP connect itself has the OS timeout, and an unacknowledged ClientHello eventually fails by TCP retransmission timeout. Signing out and in again also spawns a fresh loop.",
+    "reachable_by": "Network conditions: captive portals, DPI firewalls or a black-holed path that accepts TCP but stalls TLS/upgrade; a misbehaving front end at api.clippiboy.com.",
+    "fix_assessment": "Wrapping connect_async in tokio::time::timeout(15 s) and treating expiry as an ordinary error (backoff + retry) is sufficient."
+   }
+  ]
+ },
+ {
+  "id": "NW-9",
+  "title": "Updater builder has no timeout, so one hung check stops all hourly checks",
+  "severity": "low",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/updater.rs:73-91"
+  ],
+  "claim": "The updater builder is constructed without `.timeout()`, so a single hung update check blocks and stops all subsequent hourly checks.",
+  "scenario": "One update request hangs on the network; the app never checks for updates again in that run.",
+  "fix": "Set a timeout on the updater builder.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/src/updater.rs:73-86 builds `app.updater_builder().on_before_exit(..).build()` with no `.timeout()`. updater.rs:152-172: `std::thread::spawn(move || loop { match tauri::async_runtime::block_on(check(&app)) {..} std::thread::sleep(INTERVAL); })`, so a check that never returns stops the loop for good. tauri-plugin-updater-2.10.1/src/updater.rs:176 `timeout: None` default; :451-460 `ClientBuilder::new()...; if let Some(timeout) = self.timeout { request = request.timeout(timeout); }`. reqwest-0.13.4/src/async_impl/client.rs:299 `connect_timeout: None`, :313-314 `read_timeout: None, timeout: None`. It does set `tcp_keepalive: Some(15s)`, interval 15s, 3 retries (:303-305).",
+    "corrected_claim": "This is accurate for the automatic background loop. Two limits apply. (1) Only the hourly watcher in `watch()` stops. The manual \"Check for updates\" in About.tsx:56 calls `check_update` (commands.rs:1405) as its own invocation and still works. (2) reqwest's default TCP keepalive (15 s plus 3x15 s) turns a dead link or dropped NAT entry into an error after about a minute. A permanent hang therefore needs a peer that keeps the TCP connection alive but never finishes the TLS handshake or response, such as a stalled server, a blackholing proxy or middlebox, or a captive portal. `Update.timeout` is also `None` (plugin updater.rs:553), so `download_and_install` can hang the same way.",
+    "reachable_by": "Network conditions only: a server, proxy or middlebox that accepts the connection and then goes silent during the startup or an hourly check.",
+    "fix_assessment": "Adding `.timeout(Duration::from_secs(30..60))` on the builder is correct and enough: the plugin passes it to reqwest's total request timeout. Wrapping the `block_on` in `tokio::time::timeout` would also work."
+   }
+  ]
+ },
+ {
+  "id": "NW-20",
+  "title": "Server-supplied link.id goes into URL paths unchecked",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "src-tauri/src/links.rs:489",
+   "src-tauri/src/links.rs:660"
+  ],
+  "claim": "`link.id` from the server goes into URL paths unchecked. A malicious server returning `../me` turns the take-down into `DELETE /me`. That only matters for the server operator, who controls the account anyway.",
+  "scenario": "Server returns link id `../me`; the take-down request becomes `DELETE /me`.",
+  "fix": "Validate/escape `link.id` before building URL paths.",
+  "reported_confidence": "likely",
+  "slice": "06-network",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/src/links.rs:32-41 `pub struct Link { pub id: String, ...}` deserialised straight from the POST /shares response (links.rs:585 `serde_json::from_value(read(&app, response).await?)`) and stored in links.json; no validation. links.rs:661-663 `.delete(format!(\"{}/shares/{}\", crate::friends::SERVER, link_id))` and links.rs:489 `.put(format!(\"{}/shares/{}/poster\", ..., link.id))`. reqwest parses the String with url 2.5.8, whose parser collapses dot segments (url-2.5.8/src/parser.rs:1319 `\"..\" | \"%2e%2e\" | ...` -> truncate path). So id `../me` yields `DELETE https://api.clippiboy.com/me`, which server/src/index.ts:100 routes to `deleteAccount(env, me)`. The honest server only issues `[a-z0-9]` ids (index.ts:75 regex, links.ts:270 `json({ id, url, expiresAt })`).",
+    "corrected_claim": "Accurate; the concrete consequence is slightly worse than stated: `DELETE /me` is the account-deletion route (index.ts:100), so a `../me` id would delete the user's account on take-down. The poster PUT would become `PUT /me/poster`, which has no route (404). Only the server itself (or a party able to rewrite links.json locally, who already holds the session token) can plant such an id.",
+    "reachable_by": "Only the ClippiBoy server operator (or whoever controls api.clippiboy.com's TLS-authenticated responses), or a local process able to edit links.json; no third party can inject the id.",
+    "fix_assessment": "Rejecting ids that do not match `^[a-z0-9]+$` when the Link is deserialised (or percent-encoding via Url::path_segments_mut) closes it cheaply; it is defence in depth since the operator is already trusted."
+   }
+  ]
+ },
+ {
+  "id": "NW-29",
+  "title": "\"Appear offline\" still sends game and status to the server, not stated on the privacy page",
+  "severity": "info",
+  "category": "privacy",
+  "locations": [
+   "site/privacy.html"
+  ],
+  "claim": "With \"Appear offline\", the app still sends game and status to the server (kept in memory and on the socket, not passed to friends). Consistent with \"friends see you as offline\", but not stated on the privacy page.",
+  "scenario": "A user enabling \"Appear offline\" may assume the server no longer receives their game/status.",
+  "fix": "State this on the privacy page.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/src/friends.rs:576-590 `presence_message` always sends `\"invisible\": config.invisible, \"game\": ..., \"since\": ..., \"status\": config.status, \"busy\": config.busy`. There is no early return when invisible, and game is gated only by `config.share_game`. server/src/hub.ts:92-95 `attachment.invisible = data.invisible === true; attachment.presence = sanitize(data); ... ws.serializeAttachment(attachment);`. hub.ts:211 `if (!latest || latest.invisible) return null;`, so friends and the PUBLISHED storage get null. site/privacy.html:90: \"...it reports whether you are online or busy, your status text and, if 'Show what I'm playing' is on, which game... This only goes to friends you have accepted... With 'Appear offline', friends see you as offline.\" It does not say that the server still receives these values while invisible.",
+    "corrected_claim": "Small precision: the game is sent only when \"Show what I'm playing\" is on. Status text and busy are always sent. On the server the data sits in the WebSocket's serialized attachment, which Cloudflare keeps across Durable Object hibernation, so it is held for the socket's lifetime rather than strictly in memory. It is never written to PUBLISHED storage or passed to friends.",
+    "reachable_by": "Any signed-in user who turns on \"Appear offline\".",
+    "fix_assessment": "One sentence on the privacy page is enough. A stronger option is for the app to send null game and status while invisible, since the server never uses them then (hub.ts:211)."
+   }
+  ]
+ },
+ {
+  "id": "NW-17",
+  "title": "Updater downgrade through the unsigned version field in latest.json",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "tauri-plugin-updater-2.10.1/src/updater.rs:530-532",
+   "tauri-plugin-updater-2.10.1/src/updater.rs:712"
+  ],
+  "claim": "The plugin's `release.version > self.current_version` comes from `latest.json`, which is unsigned; the minisign signature covers only the installer bytes. Someone with write access to the GitHub release (but without the signing key) can label an old, signed, vulnerable installer as 99.0 and it installs silently in passive mode. Nothing in the app's own code skips verification; this is a known limitation of the Tauri updater.",
+  "scenario": "An attacker with GitHub release write access publishes a latest.json claiming version 99.0 pointing at an old signed vulnerable installer; clients install it silently.",
+  "fix": "After download, check that the signature's trusted comment (`file:ClippiBoy_<ver>…`) matches `update.version`, or keep a minimum-version floor in the app.",
+  "reported_confidence": "likely",
+  "slice": "06-network",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Plugin (tauri-plugin-updater-2.10.1/src/updater.rs:530-533): `let should_update = match self.version_comparator.as_ref() { Some(comparator) => ..., None => release.version > self.current_version };` where release comes from the downloaded JSON. Download (updater.rs:712): `verify_signature(&buffer, &self.signature, &self.config.pubkey)?;` and verify_signature (updater.rs:1453-1462) only does `public_key.verify(data, &signature, true)`; the trusted comment is never compared to the version, and `signature` itself comes from latest.json. The app's updater.rs:72-86 builds the updater with no version_comparator. tauri-utils-2.9.3 config.rs:1091 `allow_downgrades: true` is the default, so an old NSIS installer will install over a newer one. BUT the install is not silent or automatic: src-tauri/src/updater.rs:3-7 `does not download it by itself ... ClippiBoy only reports the find — a notice in the window — and the user decides when to install`; watch() (updater.rs:146-174) only calls check() and emits `update-available`; install() is reached only via the commands.rs:1411 install_update command from UpdateNotice.tsx:31 / About.tsx:69 button handlers. tauri.conf.json:50 `\"installMode\": \"passive\"` only means no installer wizard after the user clicks.",
+    "corrected_claim": "The downgrade mechanism is real: the version in latest.json is unsigned, the minisign check covers only the installer bytes plus a trusted comment nobody reads, and no version_comparator or floor is set. But nothing installs on its own. ClippiBoy only shows an \"update 99.0 available\" notice (with notes the attacker chose), and the old signed installer runs only after the user clicks Install. Passive mode just means no wizard pages after that click.",
+    "reachable_by": "Someone who can write assets to the EinFabo/clippiboy GitHub release `latest` (or the release that latest/download resolves to) but does not hold the minisign private key, plus a user who clicks Install.",
+    "fix_assessment": "The proposed check is sound and can be done in the app: Update.signature is public, and its minisign trusted comment (`file:ClippiBoy_<ver>_x64-setup.exe`) is covered by the global signature that verify() checks. Parse it and compare it to update.version, or set a version_comparator / minimum-version floor."
+   }
+  ]
+ },
+ {
+  "id": "NW-25",
+  "title": "Any Discord user can re-request friendship right after being declined, triggering an in-game banner each time",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "server/src/index.ts",
+   "src-tauri/src/friends.rs:360-366"
+  ],
+  "claim": "Any Discord user who knows a username can re-send a friend request immediately after being declined (index.ts `sendRequest`), and each request causes an in-game banner on the victim's side (friends.rs:360-366).",
+  "scenario": "A stranger repeatedly re-sends friend requests after each decline, popping banners during the victim's game.",
+  "fix": "Rate-limit or suppress re-requests after a decline.",
+  "reported_confidence": "likely",
+  "slice": "06-network",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Decline is removeFriend, which deletes the row (server/src/index.ts:360-365), and sendRequest has no cooldown or rate limit (index.ts:313-346 inserts a new 'pending' row and `await notify(env, me, target.id)`); the only rate limiter configured is REPORT_LIMIT (server/wrangler.jsonc:32). The client turns each new incoming id into an alert (friends.rs:568-571 Friends -> refresh(app, true); friends.rs:359-366 `alert(app, Alert::Request, ...)`). But the in-game part is wrong by default: friends.rs:682 `let hushed_in_game = !config.notify_while_playing && app.state::<Friends>().game.lock().is_some();` and friends.rs:690-692 `if hushed_in_game { return; }`, with model.rs:351 `notify_while_playing: false` as the default. Mitigations exist: blocking makes the sender get 404 (index.ts:318-320 `isBlocked(env, target.id, me)`), PATCH /me allowRequests=false gives 403 (index.ts:93-97, 337), notify_requests and busy suppress alerts (friends.rs:670,676).",
+    "corrected_claim": "Re-requests are unthrottled. The sender does not even need a decline: they can withdraw (DELETE /friends/{id}) and re-send in a loop, and each new pending request makes the victim's app show a 'sent you a friend request' notice. With default settings that notice is not shown while a detected game runs (notify_while_playing defaults to false, friends.rs:682/690); it appears as a desktop overlay banner or in-app toast when no game is detected, or in game only if the user opted into notify_while_playing (or the game is not detected). The victim can stop it by blocking the sender, turning off friend requests, or turning off request notices.",
+    "reachable_by": "Any person who signs in to ClippiBoy with a Discord account and knows the victim's Discord name or friend code, until the victim blocks them.",
+    "fix_assessment": "A per-pair cooldown after a decline or withdrawal, or a per-user request rate limit (a Workers ratelimit binding like REPORT_LIMIT), would fix it; client-side de-duplication of request alerts per user id per time window would also curb the noise."
+   }
+  ]
+ },
+ {
+  "id": "NW-19",
+  "title": "handle_relay doesn't check that `from` is a current friend",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "src-tauri/src/share.rs:471"
+  ],
+  "claim": "`handle_relay` doesn't check that `from` is in the current friend list; it relies entirely on the server for the friendship check.",
+  "scenario": "A buggy or malicious server relays a message from a non-friend; the client processes it as if from a friend.",
+  "fix": "Check `from` against the local friend list in `handle_relay`.",
+  "reported_confidence": "likely",
+  "slice": "06-network",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "share.rs:469-470 `/// A relay from a friend arrived. Only friends can send one — the server checks — but what they send is still only data.` and share.rs:471-479 handle_relay dispatches ShareOffer straight to offered() with no friend lookup. offered() (share.rs:545-559) accepts any `from` when `AcceptClips::All` and falls back to `friend_name(...).unwrap_or_else(|| \"A friend\".into())`. ShareAnswer/ShareCancel are bound to an existing transfer's `friend_id == from` (share.rs:481-486, 491-494), so only offers are affected. The server does check: server/src/hub.ts:256 `if (!(await areFriends(this.env.DB, attachment.user, to))) return fail(\"not a friend\");`, and `from` is set server-side from the authenticated attachment (hub.ts:257-258). The local friend list is itself served by the same server: friends.rs:343 `request(app, reqwest::Method::GET, \"/friends\", None)` fills view.lists, which friend_name reads (friends.rs:627-630).",
+    "corrected_claim": "The claim is accurate: handle_relay trusts the server's friendship check, and an offer from a non-friend id would surface as \"A friend wants to send you...\" when accept_clips is All. But it guards only against a buggy server or a stale race. A malicious server can set `from` to any real friend's id, and it also supplies the local friend list, so the proposed local check adds no protection against a malicious server.",
+    "reachable_by": "Only the ClippiBoy friends server (a bug in its areFriends check, or a compromise). The user still has to accept the offer before anything transfers.",
+    "fix_assessment": "Checking `from` against view.lists.friends is cheap defence in depth against server bugs and unfriend races. It does nothing against a malicious server, which controls both `from` and the list."
+   }
+  ]
+ },
+ {
+  "id": "NW-26",
+  "title": "Unverified whether Windows toasts escape friend-supplied text in XML",
+  "severity": "low",
+  "category": "security",
+  "locations": [],
+  "claim": "Whether Windows toasts escape their XML (tauri-winrt-notification 0.7.3, not available locally) is unverified. The toast text comes from friends (display name, game, offer title) but only reaches a toast when banners are off.",
+  "scenario": "With banners off, a friend's display name/game/offer title containing XML markup is inserted into the toast XML unescaped (unverified).",
+  "fix": "Verify that tauri-winrt-notification escapes text, or escape it before passing.",
+  "reported_confidence": "speculative",
+  "slice": "06-network",
+  "status": "unverified",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "unverifiable",
+    "severity_suggestion": "info",
+    "evidence": "Path is real: friends.rs:719-723 (only after `if overlay.overlay.enabled {...return}` at 697-716, and only when the window is not in front and not hushed in game) `app.notification().builder().title(\"ClippiBoy\").body(text).show()`; tauri-plugin-notification-2.4.0 desktop.rs:180-216 `notification.body(&body)` ... `let _ = notification.show();` (spawned, result dropped); notify-rust-4.18.0 windows.rs:81-84 `Toast::new(app_id).title(&notification.summary)...text2(&notification.body)` -> tauri-winrt-notification 0.7.3 (Cargo.lock:6009-6011), whose source is NOT in ~/.cargo/registry/src. Crate index cache shows tauri-winrt-notification 0.1.0-0.7.2 all depended on quick-xml (most likely its escaper) and 0.7.3 dropped it, so whether 0.7.3 escapes (hand-rolled) cannot be checked here. Friend-controlled text does reach it: friends.rs:363 `{display_name} sent you a friend request` (display_name = Discord global_name, server/src/db.ts:94), friends.rs:559-562 `{name} is playing {game}` (game from the friend's presence), share.rs:587 `{friend_name} wants to send you {name}` (name = meta.title / meta.file_name from the offer).",
+    "corrected_claim": "The friend-supplied text (display name, game, offer title/file name) does reach the Windows toast XML builder when banners are off; whether tauri-winrt-notification 0.7.3 escapes it depends on that crate's source, which is not available locally (earlier versions pulled in quick-xml, 0.7.3 no longer does). Even if unescaped, the plugin drops show()'s result (desktop.rs:216), so a parse failure would only silently suppress the toast; anything beyond that (injected toast elements) is speculative.",
+    "reachable_by": "A friend (or the friends server) choosing a display name / game string / offer title, only for a receiver who has disabled overlay banners and does not have the window focused.",
+    "fix_assessment": "Cheap belt-and-braces: XML-escape (&, <, >, \", ') the text in alert() before passing it to the plugin, independent of what the crate does; or read the 0.7.3 source to confirm."
+   }
+  ]
+ },
+ {
+  "id": "NW-1",
+  "title": "P2P handshake fully trusts the server: an active server can fetch or swap any clip",
+  "severity": "medium",
+  "category": "security",
+  "locations": [
+   "src-tauri/src/share.rs:338",
+   "src-tauri/src/share.rs:886",
+   "src-tauri/src/share.rs:935-939",
+   "site/privacy.html"
+  ],
+  "claim": "The share offer relayed through the friends server carries everything needed to download: `Signal::ShareOffer { id, size, sha256, secret, addr, meta }`. The sender lets in anyone holding the secret, before any answer: `let open = matches!(entry.transfer.stage, Stage::Asking | Stage::Moving); if !same(entry.secret…) || !open` (comment: \"Dialling in is their yes\"). It never checks `connection.remote_id()`. iroh keys are new every run (`Endpoint::bind(presets::N0)`), so nothing can be pinned. The server sees every relay body (secret, sha256, sender address), so it can download or MITM the transfer. This breaks the privacy page's \"never reaches our server\" / end-to-end claim against anything other than a passive server.",
+  "scenario": "Needs the server operator, or whoever compromises the Worker or Cloudflare account. While the offer is in its 60 s Asking window, the server dials the sender and downloads the clip without the friend ever accepting. Or it replaces `addr` and `sha256` with its own endpoint and hash; the friend then receives the server's content, filed as \"from <friend>\", and the hash check passes.",
+  "fix": "Keep a persistent iroh secret key per install, protected with DPAPI. The receiver puts its NodeId in `ShareAnswer`; the sender serves only after an accepting answer and only to that `remote_id()`. Pin each friend's NodeId on first use and warn when it changes; optionally show a short safety code. Reword the privacy page.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "NW-2",
+  "title": "Size overflow in the offer lets a friend show \"1.0 MB\" and fill the disk; no size cap or free-space check on receive",
+  "severity": "medium",
+  "category": "security",
+  "locations": [
+   "src-tauri/src/share.rs:565",
+   "src-tauri/src/share.rs:755",
+   "src-tauri/src/share.rs:816"
+  ],
+  "claim": "`let total = size + meta.tracks.iter().map(|track| track.size).sum::<u64>();` — the release profile has no `overflow-checks`, so this wraps. With `size` = 1 MiB and `tracks[0].size` = 2^64-1 the banner shows \"1.0 MB\". After accept, `fetch_tracks` asks for track 0, the sender answers `rest` = 2^64-1, which passes the `offset + rest != size` check, and the receiver writes `…\\tracks\\<id>\\0.m4a.part` until C: is full. Even without the overflow trick there is no upper limit on size and no free-space check anywhere in `receive`, unlike the 2 GB guard recordings have.",
+  "scenario": "An accepted friend sends a crafted offer (size 1 MiB, track size 2^64-1); the user clicks accept on a \"1.0 MB\" clip; the receiver writes until the disk is full. The recorder and the OS suffer before the 6 retries give up and the folder is deleted.",
+  "fix": "Use `checked_add` throughout. Reject offers above a sane cap (e.g. clip <= 64 GiB, each track <= 2 GiB, `track.size` <= `size`). Check free space on both volumes with `disk.rs` before accepting and while writing. Never write past `size`.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "NW-3",
+  "title": "An accepted friend can spam offers: banner, sound and toast each time, plus a slow UI",
+  "severity": "medium",
+  "category": "security",
+  "locations": [
+   "src-tauri/src/share.rs:582-603",
+   "src-tauri/src/model.rs:355",
+   "server/src/hub.ts:39-40",
+   "server/src/hub.ts:248-253"
+  ],
+  "claim": "Every incoming offer inserts a map entry (an existing id is silently overwritten), plays `ClipReceived`, shows an overlay banner over the game and raises `Alert::Clip`, which is always wanted. The default is `accept_clips: AcceptClips::All`. The server's rate budget (30 messages per 10 s) is per WebSocket and is lost when the Durable Object hibernates, and a user may open any number of sockets, so the rate is effectively unbounded. Each `emit()` sends the whole transfer list to three webviews, so cost grows roughly with the square of the number of live offers (entries stay about 60 s or more).",
+  "scenario": "A friend scripts N sockets and floods offers during a match; the victim gets repeated banners/sounds/toasts and a slowing UI. The only remedies are blocking the friend or changing settings. Confirmed in code; size of the slowdown is likely, not measured.",
+  "fix": "Client side: at most 1-2 pending offers per friend and about 10 in total; reject ids that are already known (incoming or outgoing); one banner and one sound per friend per 30 s. Server side: a persisted per-user budget and a cap on sockets per user.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "NW-4",
+  "title": "An incomplete ffmpeg folder blocks setup for good, re-downloads every 30 minutes, and silently falls back to PATH ffmpeg",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/tools.rs:166-168",
+   "src-tauri/src/tools.rs:290",
+   "src-tauri/src/tools.rs:47-52",
+   "src-tauri/src/muxer.rs:45-48"
+  ],
+  "claim": "Setup does `if PROGRAMS.iter().all(|(name, _)| target.join(name).is_file()) { return Ok(()) }`, otherwise it downloads, then `std::fs::rename(&staging, target)`. If `9.0.1\\` exists but `ffmpeg.exe` is gone (antivirus quarantine is a common false positive, or the user deleted it), the rename onto the existing non-empty folder fails on Windows with \"could not put ffmpeg in place\". It retries every 30 minutes forever, pulling the full archive each time. Meanwhile `tool()` quietly falls back to `PathBuf::from(\"ffmpeg\")` (app folder or PATH), an untested and possibly old ffmpeg that then also parses friends' files.",
+  "scenario": "Antivirus quarantines `%LOCALAPPDATA%\\gg.clippiboy.app\\ffmpeg\\9.0.1\\ffmpeg.exe`; every 30 minutes the app downloads the whole archive and fails the rename; all ffmpeg work runs on whatever `ffmpeg` is on PATH.",
+  "fix": "When the folder is incomplete, `remove_dir_all(target)` before the rename (or unpack under a fresh name); don't fall back to PATH silently; keep the 30-minute retry from becoming a download loop.",
+  "reported_confidence": "likely",
+  "slice": "06-network",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "NW-5",
+  "title": "Files from friends go to ffmpeg unchecked, with format auto-detection, no whitelists, no timeout, on an async worker",
+  "severity": "medium",
+  "category": "security",
+  "locations": [
+   "src-tauri/src/share.rs:837-841",
+   "src-tauri/src/thumbs.rs:31-37",
+   "src-tauri/src/muxer.rs:65-68",
+   "src-tauri/src/thumbs.rs:28-62",
+   "src-tauri/src/share.rs:838-841"
+  ],
+  "claim": "The thumbnail for a received clip is made with `ffmpeg -ss 0.5 -i <received file> …`, and `file_clip` runs it synchronously inside the tokio task. Unlike the share-link server (`Mp4Boxes`), the P2P path never checks that the file is an MP4; ffmpeg picks the demuxer from the content. The pinned build's HLS demuxer refuses an `.mp4` name and concat runs with `safe=1`, which limits the obvious tricks, but ffmpeg parser bugs, playlist-style demuxers (DASH, concat reading sibling files) and any old PATH ffmpeg (NW-4) remain. `muxer::run` has no timeout/kill.",
+  "scenario": "A malicious friend sends a crafted file with a non-MP4 container; after accept, ffmpeg auto-detects and parses it (attack surface confirmed; exploitability speculative); a hanging ffmpeg also blocks the tokio worker indefinitely.",
+  "fix": "For received files add input options `-format_whitelist mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,image2,png_pipe,jpeg_pipe -protocol_whitelist file` (and to every later ffmpeg/ffprobe input of such files), or check the box structure as the server does. Put a timeout and kill on `muxer::run`. Run `file_clip` in `spawn_blocking`.",
+  "reported_confidence": "speculative",
+  "slice": "06-network",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "LS-24",
+    "slice": "05-local-surface",
+    "title": "ffmpeg automatically parses friend-supplied media without protocol whitelist or fixed demuxer",
+    "claim": "`thumbs::make` / `make_still` (thumbs.rs:28-62) run ffmpeg with no `-protocol_whitelist` and no fixed `-f` over files received from friends, right after they arrive (share.rs:838-841).",
+    "locations": [
+     "src-tauri/src/thumbs.rs:28-62",
+     "src-tauri/src/share.rs:838-841"
+    ],
+    "fix": "Add `-protocol_whitelist file` and `-f mov`/`image2` matched to the expected kind, and keep the bundled ffmpeg current."
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "NW-15",
+  "title": "Failed shrink leaves temp link file behind",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/links.rs:461"
+  ],
+  "claim": "In share-link creation, a failed shrink returns early via `??` and leaves `temp\\link-<id>.mp4` behind.",
+  "scenario": "The shrink step for a share-link upload fails; the temp `link-<id>.mp4` file is never deleted.",
+  "fix": "Clean up on every end state (e.g. a Drop guard), plus a startup sweep of temp folders.",
+  "reported_confidence": "confirmed",
+  "slice": "06-network",
+  "status": "refuted",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "refuted",
+    "severity_suggestion": "info",
+    "evidence": "links.rs:461 `let written = shrinking.await.map_err(|err| err.to_string())??;` -- but the inner error comes from commands.rs:1079 shrink(), which removes its own output on every failure after ffmpeg starts: commands.rs:1118 `let _ = std::fs::remove_file(&output);` (hw encoder failed, before x264 retry), 1126-1128 `.inspect_err(|_| { let _ = std::fs::remove_file(&output); })?` (x264 retry failed), 1134 (x264 first attempt failed: `// A half-written file looks like a finished one... remove_file(&output); return Err(err)`), 1140 (empty output). The earlier early returns (clip not found, refuse_still, source missing, output==source) happen before any file is written. Only a JoinError (panic in the blocking task) could skip cleanup, and even then lib.rs:677-688 discard_leftovers() runs at every startup (lib.rs:1200) and does `remove_dir_all(config::data_dir().join(\"temp\"))`, which is exactly where links.rs:427-429 puts `link-<id>.mp4`. The name is also deterministic per clip and ffmpeg runs with `-y` (export.rs:123), so a retry overwrites it.",
+    "corrected_claim": "",
+    "reachable_by": "Not reachable for a normal shrink failure; only a panic inside the spawn_blocking closure would leave the file, and the next app start deletes the whole temp folder.",
+    "fix_assessment": "Not needed: shrink() already cleans up its output on every error path and discard_leftovers() already sweeps data_dir/temp at startup. A Drop guard would only cover the panic case."
+   }
+  ]
+ },
+ {
+  "id": "NW-21",
+  "title": "Friends outbox is an unbounded channel",
+  "severity": "low",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/friends.rs:438"
+  ],
+  "claim": "The friends outbox is an unbounded channel, so queued outgoing messages can grow without limit.",
+  "scenario": "While the socket is down or slow, messages keep accumulating in memory without bound.",
+  "fix": "Use a bounded channel.",
+  "reported_confidence": "likely",
+  "slice": "06-network",
+  "status": "refuted",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "refuted",
+    "severity_suggestion": "info",
+    "evidence": "friends.rs:438 `let (sender, mut outbox) = mpsc::unbounded_channel::<String>();` is unbounded, but the 'socket down' scenario cannot happen: on every disconnect friends.rs:402 `*friends.outbox.lock() = None;` (and sign-out friends.rs:330), and both producers bail when there is no sender: friends.rs:637 `let Some(outbox) = friends.outbox.lock().clone() else { return false };` (send_relay) and friends.rs:649 (send_presence). While connected, the only producers are presence updates (set_game only on a game change, friends.rs:168-177, polled every 2 s; config_changed on a settings save, commands.rs:87) and share handshake signals (share.rs:339-554), which are user-driven or a single auto-reply per incoming offer handled inside the same serve loop (share.rs:554 called from handle_message, which is awaited in the loop that also drains the outbox, friends.rs:465-481). A stalled sink.send also stalls incoming processing, so no producer can outpace the consumer.",
+    "corrected_claim": "The channel is technically unbounded, but nothing queues while the socket is down (the sender is dropped and producers return early), and while connected the producers are low-rate, human- or game-change-driven, so no unbounded growth is reachable; at most a handful of messages queue during a connect/refresh or a slow write.",
+    "reachable_by": "No realistic trigger; a peer friend can only induce one queued auto-reply per relay that the same loop processes.",
+    "fix_assessment": "A bounded channel with try_send would be harmless but buys nothing measurable; not worth prioritising."
+   }
+  ]
+ },
+ {
+  "id": "NW-24",
+  "title": ".expect(\"HTTP client\") in three client builders can abort the app",
+  "severity": "low",
+  "category": "robustness",
+  "locations": [],
+  "claim": "`.expect(\"HTTP client\")` is used in three HTTP client builders; if TLS setup ever failed it would abort the whole app, ending any recording in progress.",
+  "scenario": "TLS/platform verifier initialisation fails; the reqwest client build panics and the app aborts mid-recording.",
+  "fix": "Handle the builder error instead of panicking.",
+  "reported_confidence": "likely",
+  "slice": "06-network",
+  "status": "refuted",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "refuted",
+    "severity_suggestion": "info",
+    "evidence": "The three sites exist: links.rs:235-236, telemetry.rs:232-233, friends.rs:736-737 `.build().expect(\"HTTP client\")`, and Cargo.toml:107 `panic = \"abort\"` would make a panic fatal. But build() cannot fail with this configuration: each site first calls install_crypto (friends.rs:743-746 installs ring if no provider is set), so reqwest-0.13.4/src/async_impl/client.rs:719-721 takes the installed provider instead of the panicking default_rustls_crypto_provider (client.rs:2482-2490); no root certs/CRLs/TLS-version/identity options are set, so the only TLS step is client.rs:757 `rustls_platform_verifier::Verifier::new(provider.clone())`, which on Windows is infallible (rustls-platform-verifier-0.7.0/src/verification/windows.rs:557-564 just returns `Ok(Self { ... })`). The user_agent is a valid constant (config.error check client.rs:410 cannot trip). Certificate-store access happens at handshake time and yields an error, not a panic.",
+    "corrected_claim": "`.expect(\"HTTP client\")` appears in three client builders (links.rs, telemetry.rs, friends.rs) and release builds abort on panic, but with the crypto provider installed beforehand and the Windows platform verifier constructor being infallible, Client::builder().build() has no reachable error path here, so the abort scenario cannot occur.",
+    "reachable_by": "Nothing reachable from this source and dependency set; it would need a future change adding fallible builder options (custom roots, TLS versions, identity) or a dependency upgrade that makes verifier construction fallible.",
+    "fix_assessment": "Mapping the error to a String (as tools.rs:219-220 and updater.rs:85-86 already do) is a tidy consistency change, but it fixes no current bug."
+   }
+  ]
+ }
+]

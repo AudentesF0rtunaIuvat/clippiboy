@@ -1,0 +1,73 @@
+../../../../../..src/components/ClipMeta.tsx(140,11): error TS2345: Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+  Type 'undefined' is not assignable to type 'string'.
+../../../../../..src/components/ClipMeta.tsx(149,14): error TS2345: Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+  Type 'undefined' is not assignable to type 'string'.
+../../../../../..src/components/ClipPlayer.tsx(1077,25): error TS18048: 'other' is possibly 'undefined'.
+../../../../../..src/components/ClipPlayer.tsx(1078,26): error TS18048: 'other' is possibly 'undefined'.
+../../../../../..src/components/ClipPlayer.tsx(1079,25): error TS18048: 'other' is possibly 'undefined'.
+../../../../../..src/components/Share.tsx(91,49): error TS18048: 'p' is possibly 'undefined'.
+../../../../../..src/components/Share.tsx(99,49): error TS18048: 'p' is possibly 'undefined'.
+../../../../../..src/components/Share.tsx(99,67): error TS18048: 'p' is possibly 'undefined'.
+../../../../../..src/components/Share.tsx(106,24): error TS18048: 'p' is possibly 'undefined'.
+../../../../../..src/components/Share.tsx(108,27): error TS18048: 'p' is possibly 'undefined'.
+../../../../../..src/components/Share.tsx(111,28): error TS18048: 'p' is possibly 'undefined'.
+../../../../../..src/components/Share.tsx(114,26): error TS18048: 'p' is possibly 'undefined'.
+../../../../../..src/components/Share.tsx(357,16): error TS2532: Object is possibly 'undefined'.
+../../../../../..src/components/ShotAnnotate.tsx(239,20): error TS2532: Object is possibly 'undefined'.
+../../../../../..src/components/ShotAnnotate.tsx(239,34): error TS2532: Object is possibly 'undefined'.
+../../../../../..src/components/ShotAnnotate.tsx(372,20): error TS18048: 'shape' is possibly 'undefined'.
+../../../../../..src/components/ShotAnnotate.tsx(372,68): error TS18048: 'shape' is possibly 'undefined'.
+../../../../../..src/components/ShotAnnotate.tsx(373,9): error TS18048: 'shape' is possibly 'undefined'.
+../../../../../..src/components/ShotAnnotate.tsx(374,26): error TS18048: 'shape' is possibly 'undefined'.
+../../../../../..src/components/ShotAnnotate.tsx(374,36): error TS18048: 'shape' is possibly 'undefined'.
+../../../../../..src/components/ShotAnnotate.tsx(374,46): error TS18048: 'shape' is possibly 'undefined'.
+../../../../../..src/components/ShotAnnotate.tsx(374,56): error TS18048: 'shape' is possibly 'undefined'.
+../../../../../..src/components/ShotAnnotate.tsx(374,77): error TS2322: Type 'Shape | undefined' is not assignable to type 'Shape | null'.
+  Type 'undefined' is not assignable to type 'Shape | null'.
+../../../../../..src/components/ShotAnnotate.tsx(377,9): error TS18048: 'shape' is possibly 'undefined'.
+../../../../../..src/components/ShotAnnotate.tsx(378,22): error TS18048: 'shape' is possibly 'undefined'.
+../../../../../..src/components/ShotAnnotate.tsx(379,76): error TS2322: Type 'Shape | undefined' is not assignable to type 'Shape | null'.
+  Type 'undefined' is not assignable to type 'Shape | null'.
+../../../../../..src/components/ShotAnnotate.tsx(382,24): error TS2345: Argument of type 'Shape | undefined' is not assignable to parameter of type 'Shape'.
+  Type 'undefined' is not assignable to type 'Shape'.
+../../../../../..src/components/ShotAnnotate.tsx(383,27): error TS2345: Argument of type 'Shape | undefined' is not assignable to parameter of type 'Shape'.
+  Type 'undefined' is not assignable to type 'Shape'.
+../../../../../..src/components/ShotAnnotate.tsx(384,17): error TS2345: Argument of type 'Shape | undefined' is not assignable to parameter of type 'Shape'.
+  Type 'undefined' is not assignable to type 'Shape'.
+../../../../../..src/components/ShotAnnotate.tsx(384,44): error TS2322: Type 'Shape | undefined' is not assignable to type 'Shape | null'.
+  Type 'undefined' is not assignable to type 'Shape | null'.
+../../../../../..src/components/ShotAnnotate.tsx(393,7): error TS2322: Type 'Shape | undefined' is not assignable to type 'Shape | null'.
+  Type 'undefined' is not assignable to type 'Shape | null'.
+../../../../../..src/components/ShotViewer.tsx(94,10): error TS18048: 'w' is possibly 'undefined'.
+../../../../../..src/components/ShotViewer.tsx(94,14): error TS18048: 'h' is possibly 'undefined'.
+../../../../../..src/components/ShotViewer.tsx(663,9): error TS2322: Type 'Style | undefined' is not assignable to type 'Style'.
+  Type 'undefined' is not assignable to type 'Style'.
+../../../../../..src/components/ShotViewer.tsx(1490,5): error TS2322: Type 'string | undefined' is not assignable to type 'string'.
+  Type 'undefined' is not assignable to type 'string'.
+../../../../../..src/components/ShotViewer.tsx(1494,5): error TS2322: Type 'string | undefined' is not assignable to type 'string'.
+  Type 'undefined' is not assignable to type 'string'.
+../../../../../..src/components/ShotViewer.tsx(1494,42): error TS2345: Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+  Type 'undefined' is not assignable to type 'string'.
+../../../../../..src/components/ui/Menu.tsx(166,19): error TS2345: Argument of type '(current: number) => number | undefined' is not assignable to parameter of type 'SetStateAction<number>'.
+  Type '(current: number) => number | undefined' is not assignable to type '(prevState: number) => number'.
+    Type 'number | undefined' is not assignable to type 'number'.
+      Type 'undefined' is not assignable to type 'number'.
+../../../../../..src/components/ui/Menu.tsx(175,13): error TS2345: Argument of type 'MenuEntry | undefined' is not assignable to parameter of type 'MenuEntry'.
+  Type 'undefined' is not assignable to type 'MenuEntry'.
+../../../../../..src/console/Friends.tsx(33,65): error TS2532: Object is possibly 'undefined'.
+../../../../../..src/console/Friends.tsx(50,11): error TS2322: Type 'FriendPresence | undefined' is not assignable to type 'FriendPresence | null'.
+  Type 'undefined' is not assignable to type 'FriendPresence | null'.
+../../../../../..src/console/Trend.tsx(81,9): error TS18048: 's' is possibly 'undefined'.
+../../../../../..src/console/Trend.tsx(81,21): error TS18048: 's' is possibly 'undefined'.
+../../../../../..src/console/Trend.tsx(122,10): error TS18048: 's' is possibly 'undefined'.
+../../../../../..src/console/Trend.tsx(127,73): error TS18048: 's' is possibly 'undefined'.
+../../../../../..src/routes/AudioMixer.tsx(184,43): error TS2532: Object is possibly 'undefined'.
+../../../../../..src/routes/AudioMixer.tsx(206,6): error TS2322: Type 'AudioSource | undefined' is not assignable to type 'AudioSource'.
+  Type 'undefined' is not assignable to type 'AudioSource'.
+../../../../../..src/routes/AudioMixer.tsx(206,21): error TS2322: Type 'AudioSource | undefined' is not assignable to type 'AudioSource'.
+  Type 'undefined' is not assignable to type 'AudioSource'.
+../../../../../..src/routes/Clips.tsx(519,69): error TS2345: Argument of type 'Link | undefined' is not assignable to parameter of type 'Link'.
+  Type 'undefined' is not assignable to type 'Link'.
+../../../../../..src/routes/Friends.tsx(107,58): error TS2532: Object is possibly 'undefined'.
+../../../../../..src/routes/Recording.tsx(37,3): error TS2322: Type 'number | undefined' is not assignable to type 'number'.
+  Type 'undefined' is not assignable to type 'number'.

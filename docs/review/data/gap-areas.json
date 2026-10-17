@@ -1,0 +1,109 @@
+{
+ "gaps": [
+  {
+   "key": "hotkey-accelerator-contract",
+   "title": "Hotkey recorder (TS) vs global-hotkey parser and Windows VK mapping (Rust)",
+   "files": [
+    "src/routes/settings/Hotkeys.tsx",
+    "src-tauri/src/lib.rs",
+    "src-tauri/src/commands.rs",
+    "src-tauri/src/model.rs",
+    "src/lib/ipc.ts",
+    "src/lib/lockdown.ts",
+    "~/.cargo/registry/src/*/global-hotkey-0.8.0/src/hotkey.rs",
+    "~/.cargo/registry/src/*/global-hotkey-0.8.0/src/platform_impl/windows/mod.rs",
+    "~/.cargo/registry/src/*/tauri-plugin-global-shortcut-2.3.2/src/lib.rs"
+   ],
+   "focus": "One rule is written twice. Hotkeys.tsx:68-122 (KEYS, supported(), accelerator()) says it emits only 'keys the core's hotkey parser knows'. The core turns that string into a Windows RegisterHotKey call through tauri-plugin-global-shortcut 2.3.2 and global-hotkey 0.8.0, whose sources are on disk under ~/.cargo/registry/src/*/. Run every code the recorder can emit through two steps: (a) parsing in hotkey.rs, (b) key_to_vk in platform_impl/windows/mod.rs. The codes are KeyA-Z, Digit0-9, Numpad0-9, F1-F24, each KEYS entry, and the modifiers Ctrl/Alt/Shift/Super. Already seen while scouting, so confirm and write it up with a scenario: windows/mod.rs:308-309 maps Code::NumpadEnter => VK_RETURN and Code::NumpadEqual => VK_E. Binding 'Ctrl+NumpadEnter' therefore takes Ctrl+Enter from every app on the system (chat send in Discord or Slack), and 'NumpadEqual' binds E. Find any other codes that are accepted but map to the wrong VK or to none (F13-F24, Media*, AudioVolume*, PrintScreen, Pause). Then check where the layouts disagree. event.code is physical, but RegisterHotKey uses virtual keys and the parser maps Code to a VK as if the layout were US. On QWERTZ/AZERTY, check whether the key actually bound (Backquote, BracketLeft, Semicolon, Quote, Slash, Minus, Equal, KeyY/KeyZ) is a different physical key from the one pressed and the one keyLabel() shows. Also check: AltGr arriving as ctrlKey+altKey (so 'Ctrl+Alt+Q' is recorded for '@'); Shift+Numpad digits with NumLock on; whether risky()/HARMLESS (which only looks at keys[0]) passes bare 'NumpadEnter', 'Space' or 'Tab'. In lib.rs register_hotkeys (738-840) and commands.rs set_hotkeys/suspend_hotkeys/resume_hotkeys, check: duplicate accelerators across the five actions (rejected? or the second on_shortcut fails quietly?); whether the UI learns which key failed when another app owns it, and whether the config keeps it; whether hotkeys stay suspended if the settings page unmounts or reloads while recording a key; how the default hotkeys in model.rs parse. Skip what is already reported: FC-10 (a11y), FC-42 (lockdown QWERTZ zoom), ST-2 (toggle on the main thread), the 07-report note on the unregister_all lock.",
+   "why_uncovered": "Hotkeys came up only for a11y (FC-10), threading (ST-2) and lockdown.ts. Nobody checked the TS accelerator strings against the Rust/global-hotkey parser and its Windows virtual-key table, which sits in a dependency crate that no slice owned."
+  },
+  {
+   "key": "recording-crash-recovery",
+   "title": "Recovery of manual recordings interrupted by a crash, kill or power loss",
+   "files": [
+    "src-tauri/src/recorder.rs",
+    "src-tauri/src/state.rs",
+    "src-tauri/src/lib.rs",
+    "src-tauri/src/tools.rs",
+    "src-tauri/src/muxer.rs",
+    "src-tauri/src/filing.rs"
+   ],
+   "focus": "Recordings are written to <clip folder>/.recording/<id>/ (video.h264, track_n.pcm, mix.pcm, meta.json; see recorder.rs:1-60 and write_meta at 413). At startup they are finished by recorder::leftovers (616), state.rs recover_recordings (1148-1172) -> finish_recording, and lib.rs recover_recordings (275-300). That last one is called from tools.rs:158 once ffmpeg is ready. Kill the process at each point and work out the outcome: before meta.json exists; after meta.json but before the first packet; mid-write (torn last H.264 NAL, a PCM length that is not a whole number of frames, mix.pcm shorter or longer than the tracks); during finalize/align (recorder.rs:439-626; .part.mp4 written, work dir partly removed); after the mp4 is written but before library.insert. Note that lib.rs inserts rows only after ALL recoveries return. If finish_recording deletes the work dir first, does a quit in between leave an mp4 that is never indexed, given there is no folder scan? Also check: can recovery run twice or alongside itself (the tools::setup thread, retry_ffmpeg/wake, a second ffmpeg ready)? Is there a TOCTOU between the `live` snapshot (state.rs:1150) and leftovers(), so that a recording started by hotkey, Stream Deck or the automation in that window gets 'recovered' while it is still being written? leftovers() scans only the CURRENT config.clip_dir, so leftovers in an old folder are never recovered after a folder change. Which created_at, game, tags and target folder does a recovered clip get (meta or now; lib.rs passes empty tags)? What happens if ffmpeg never becomes available? Could filing::prune/tidy, discard_leftovers (lib.rs:677) or delete paths touch .recording? Does a failed recovery retry forever on every start, with the sound or banner each time? Skip what is already reported: VP-13 (free-space guard), VP-18 (.part.mp4 orphans), VP-10/VP-11 (queue and locks), ST-6, ST-14. Give file:line, the exact crash point and the user-visible result.",
+   "why_uncovered": "Slice 03 described the recorder's write path but filed no finding on leftover recovery. recover_recordings sits across state.rs, lib.rs and tools.rs, which belonged to three different slices, and no slice owned crash-recovery paths."
+  },
+  {
+   "key": "startup-repair-chain",
+   "title": "Startup repair and migration passes that move, delete or rewrite user data on every launch",
+   "files": [
+    "src-tauri/src/lib.rs",
+    "src-tauri/src/edit.rs",
+    "src-tauri/src/thumbs.rs",
+    "src-tauri/src/filing.rs",
+    "src-tauri/src/preview.rs",
+    "src-tauri/src/clips.rs",
+    "src-tauri/src/shot.rs",
+    "src-tauri/src/share.rs",
+    "src-tauri/src/commands.rs"
+   ],
+   "focus": "lib.rs setup (1189-1232) runs these on every start: repair_screens (472-540), discard_leftovers (677-688), preview::clear, allow_existing_clip_dirs (1101-1121), then edit::repair (edit.rs:903-990, including settle at 844-895), thumbs::migrate (thumbs.rs:71-135), filing::normalize_games (152-196) and filing::tidy/place/prune/free_name (199-290). For each pass, work through realistic states. (a) At autostart sign-in, the clip folder or an older one is on a drive, NAS or OneDrive folder that is not mounted or hydrated yet, so is_file()/metadata() fail or report placeholder sizes. (b) The user renamed, moved or deleted a clip in Explorer. (c) The previous run crashed between a file move and its DB update. (d) The clip folder was changed in Settings, so rows point into the old folder. (e) The path is spelled with a different case, separators or an 8.3 name compared with config.clip_dir. Things to look for. Arm (false, Some, true) of edit::repair moves the original back onto a path the user emptied on purpose, or into a folder that no longer exists. edit::remove() calls remove_dir_all on originals/<id>/, which also holds the screenshot editor's image.png, base.png, shot.json and under.* (shot.rs:285-375); check whether any repair arm runs it for a screenshot or shared id. settle() rewrites duration/edit/original from a file that is temporarily unreadable or a OneDrive placeholder, and spawns ffprobe per clip on each start. thumbs::migrate moves any thumb_path outside thumbs/ into the store: grep every set_thumb/thumb_path assignment (state.rs, share.rs receive, commands.rs screenshot saves, plus `git log -p` for older versions) for a path that can point at a user's own file. set_thumb(None) wipes the record when the data dir is briefly unavailable. tidy moves a file, set_path fails, and the row is left stale. free_name's fallback after 999 returns an existing target, and std::fs::rename on Windows replaces it. prune can climb into user folders or `.recording`. Also check that two starts in a row are idempotent, and whether the pass order breaks anything (tidy moving files after repair/settle looked at the old paths; allow_existing_clip_dirs granting only pre-tidy parents). Skip what is already reported: LS-8, LS-11, LS-12, LS-20/21/22, AU-4, AU-5, ED-15, VP-18.",
+   "why_uncovered": "These passes were noted only for running on the main thread (LS-11) and for folder-name rules. edit::repair arms, settle, thumbs::migrate and the end-to-end order of passes have no findings ('repair(' and 'thumbs::migrate' barely appear in any report), and old-install or unmounted-drive states were never modelled."
+  },
+  {
+   "key": "persisted-format-evolution",
+   "title": "Upgrade and downgrade compatibility of every persisted JSON (config.json, DB JSON columns, sidecars)",
+   "files": [
+    "src-tauri/src/model.rs",
+    "src-tauri/src/config.rs",
+    "src-tauri/src/clips.rs",
+    "src-tauri/src/edit.rs",
+    "src-tauri/src/stems.rs",
+    "src-tauri/src/shot.rs",
+    "src-tauri/src/recorder.rs",
+    "src-tauri/src/links.rs",
+    "src-tauri/src/friends.rs",
+    "src-tauri/src/game.rs",
+    "src/lib/types.ts"
+   ],
+   "focus": "Use the git history: about 50 commits, model.rs has 7 revisions, and commit subjects carry versions such as 'Version 0.8.3'. Run `git log --oneline -- src-tauri/src/model.rs` and `git show <rev>:src-tauri/src/model.rs`, plus the same for config.rs default_config(). For every persisted type, list how it changed. Those types are: AppConfig and nested RecordingConfig, BufferConfig, AudioSource, SourceKind, OverlayConfig, ControlConfig, FriendsConfig, SoundConfig/SoundSetting, Accent; ClipEdit, TrackMix and ClipOriginal (stored as JSON in the clips.db edit/original columns); the trim.json/schnitt.json note; tracks.json/spuren.json (stems.rs:35-75); shot.json/under.json (shot.rs:300-380); recorder meta.json; links.json (links.rs:185-215); friends.json (friends.rs:820-860); the user override games.json (game.rs:185-210). (1) Upgrade: does JSON written by each older revision still deserialize? Look for fields added later without a field- or container-level #[serde(default)], renamed or removed enum variants, rename_all changes, and type changes (u64 to u32, bool to enum). The comment at model.rs:~490 shows the author knows a single miss in config.json makes config::load (config.rs:150-175) fall back to default_config(), and the next save then overwrites the user's sources, hotkeys and clip folder. Find the concrete field or variant that does it, if any, including in nested structs. (2) DB columns: decode_edit/decode_original (clips.rs:372-405) turn unreadable JSON into None. Trace whether any later write (insert's INSERT OR REPLACE, set_edit, edit::repair/settle) then persists that None and destroys the trim offset the stems depend on. (3) Downgrade: which values the current version writes (ConsoleStyle, AccentMode, RgbSpeed, AcceptClips, EncoderId, SourceKind and others) would make the previous release reset everything after an installer or updater downgrade (NW-17 makes downgrades possible). (4) Legacy names: note_path prefers schnitt.json whenever it exists (edit.rs:70-80). Check write, remove and discard when both old and new files exist, and do the same for spuren.json. If useful, you may build a throwaway crate in the scratchpad that copies the model types (serde/serde_json only) and parses JSON rebuilt from old revisions. Never touch the repo. Skip what is already reported: LS-15, EF-18, EF-32, ST-37..39, FC-1.",
+   "why_uncovered": "Reviewers compared model.rs with types.ts for the current version only. No one walked the git history to test old files against current serde types, and no one checked downgrade parsing or the DB JSON columns' silent-discard paths."
+  },
+  {
+   "key": "client-server-contract",
+   "title": "Field-by-field contract between the Rust client (links/friends/share relay/telemetry) and the Worker",
+   "files": [
+    "src-tauri/src/links.rs",
+    "src-tauri/src/friends.rs",
+    "src-tauri/src/share.rs",
+    "src-tauri/src/telemetry.rs",
+    "server/src/index.ts",
+    "server/src/hub.ts",
+    "server/src/links.ts",
+    "server/src/shares.ts",
+    "server/src/telemetry.ts",
+    "server/src/util.ts",
+    "server/scripts/e2e.mjs",
+    "src/lib/friends.ts",
+    "src/lib/links.ts"
+   ],
+   "focus": "This is about mismatches, not security; slices 06 and 08 already covered security, each looking at one side only. HTTP: for each request the client builds (friends.rs:200-360, links.rs:285-670, telemetry.rs:~260), diff it against the server route (index.ts:49-125, friends routes 300-391, links.ts, shares.ts). Compare method, path, query, JSON field names and casing (serde rename_all camelCase on the Rust side against TS property names), optional versus required, null versus missing, number versus string, units (ms versus s for createdAt/expiresAt/resetsAt/lastSeen), and limits each side enforces (title and tag lengths, upload byte cap, poster size and type). Check whether the client can produce media the server's MP4 checker in shares.ts:173-216 rejects (moov at end, fragmented MP4 from export, a PNG screenshot shared as a link). For each response, list every status and error body the server can return (HttpError and json helpers in util.ts) and check the client: does 401 sign out, does a ban or 403 surface, does a 409 or 413 show a sensible message, is the pending-upload confirm step always sent and in the right order (links.ts:200-270), does the client's quota or reset math agree with RECENT/links_reset_at/QUICK_LINKS_FOR, and do hard-coded 'expires in 5 days' strings (links.rs:388, 399, 624) contradict QUICK_LIFETIME_MS (5 minutes) at links.ts:64. WebSocket Hub: list every `t` the server sends (snapshot, presence, friends, relay, relayFailed at hub.ts:151, 160, 172, 245, 277) and every message the client sends (hello, presence, relay and any others in friends.rs/share.rs). Compare payloads with friends.rs ServerMessage (490-516) and the client's outbound JSON: presence object fields, the relayFailed `ref`/`to` round trip into share.rs, lastSeen units against how src/lib/friends.ts and the Friends UI format them, and what happens to an unknown or extra field (from_str failing on the whole message). Skip SV-*/NW-* security and rate-limit items, SV-33, NW-20.",
+   "why_uncovered": "Slice 06 reviewed only the client network code and slice 08 only the server. A cross-boundary diff of field names, units, status-code handling and WebSocket message shapes was in neither slice."
+  },
+  {
+   "key": "probe-examples",
+   "title": "Diagnostic probes (src-tauri/examples) that are packed and run on other people's machines",
+   "files": [
+    "src-tauri/examples/record-probe.rs",
+    "src-tauri/examples/trim-probe.rs",
+    "src-tauri/examples/tracks-probe.rs",
+    "src-tauri/examples/mic-probe.rs",
+    "src-tauri/examples/discord-probe.rs",
+    "src-tauri/examples/icon-probe.rs",
+    "src-tauri/examples/sessions.rs",
+    "scripts/make-probe.mjs",
+    "README.md"
+   ],
+   "focus": "README.md:~640-660 says `npm run probe` (scripts/make-probe.mjs) packs record-probe into clippiboy-probe.zip 'for somebody else's machine', so it runs on users' PCs, possibly next to an installed and running ClippiBoy. Nobody owned these files. Check the following. (1) Writes into the user's REAL data dir (config::data_dir() = %APPDATA%\\ClippiBoy: tracks/, originals/, thumbs/, temp/). The probes call stems::tracks, edit::apply, edit::restore and muxer::build with ids like 'probe-{name}' (record-probe.rs:848-856 and 1040-1100, trim-probe.rs:30-130, tracks-probe.rs:45-130). Is everything removed on every exit path: errors, early returns, panics, Ctrl+C? Does record-probe ever call edit::remove after an edit::apply first cut has moved an original into originals/<id>/? Leftovers there show up in the real app's 'Clear all trims' and storage figures. (2) Interference with a running ClippiBoy: a shared temp dir, the ffmpeg tool dir, audio sessions, the real config being read or saved. (3) Child processes in record-probe: each encoder runs in its own child, as the doc comment says. Is there a timeout or kill for a wedged child, are stdout/stderr drained so the pipe cannot deadlock, and are exit codes and signals read correctly? (4) Report arithmetic (around 880-1000): mean and percentiles over pipeline::Health samples, divide-by-zero with 0 or 1 samples, the skip(1) steady-state slice when only one sample exists, u64 underflow when subtracting counters or timestamps, units in the printed report. (5) Staleness: compare every clippiboy_lib item used (edit::apply/plan/restore/Trim, stems::tracks/remove, muxer::ClipRequest fields, Pipeline::start, AudioEngine, the RecordingConfig fields including quality and target_stable_id, the Clip fields) with the current signatures in src-tauri/src. A probe that no longer compiles breaks make-probe.mjs. (6) make-probe.mjs: what it bundles, whether --full references files that exist, and where the output goes. Report only concrete defects you can verify, with file:line.",
+   "why_uncovered": "The task brief lists src-tauri/examples as unassigned. Slice 11 looked at scripts/ only for supply-chain risk. Yet the probes are distributed to end users, run real pipeline, edit and stem code against the live data directory, and no report contains a single finding on them."
+  }
+ ]
+}

@@ -1,0 +1,992 @@
+[
+ {
+  "id": "ST-1",
+  "title": "current_game MutexGuard held across overlay::show, which blocks on the main thread: possible permanent deadlock",
+  "severity": "critical",
+  "category": "bug",
+  "locations": [
+   "lib.rs:216-221",
+   "lib.rs:356",
+   "overlay.rs:404",
+   "overlay.rs:479",
+   "commands.rs:316",
+   "state.rs:736",
+   "state.rs:472",
+   "state.rs:515",
+   "Console.tsx:337"
+  ],
+  "claim": "At lib.rs:216-221 `overlay::show(app, BannerKind::Recording, \"Recording\", state.current_game.lock().clone());` and at lib.rs:356 `Some(match state.current_game.lock().as_ref() { … })` the MutexGuard is a temporary in a call argument (or a `match` scrutinee), so it lives until the end of the statement, which includes the whole of `overlay::show`. Inside `overlay::show`, `window.is_visible()` (overlay.rs:404) and `window.hwnd()` (overlay.rs:479) are blocking main-thread round trips when called from a worker thread (tauri-runtime-wry's `getter!` sends a message to the main thread and waits on `rx.recv()`). These main-thread paths lock `current_game`: `engine_status` (sync command, commands.rs:316) -> `status_snapshot` (state.rs:736); the toggle-buffer hotkey (runs on the main thread) -> `start_pipeline` (state.rs:472/515); `set_config` -> `start_buffer_and_notify`. The worker holds `current_game` while waiting on the main thread, and the main thread waits on `current_game`, so the app deadlocks. Report: rare but a permanent hang; the pattern is confirmed, the interleaving is plausible.",
+  "scenario": "At boot, `start_buffer_if_configured`'s thread takes `current_game` at lib.rs:356 and queues IsVisible. At the same moment the console page mounts and calls `api.status()` (Console.tsx:337); the main thread dispatches that IPC first and blocks on `current_game`. Neither side can continue: the event loop is dead, so all windows, the tray and the hotkeys (which arrive through the same message loop) hang for good. A second trigger: the record hotkey, then the toggle-buffer hotkey within a few milliseconds.",
+  "fix": "Read the value into a local first (`let game = state.current_game.lock().clone(); overlay::show(…, game)`) at both sites. Make it a rule that no AppState guard is alive while calling window APIs. Better still, send banners through a channel to one overlay worker thread.",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "high",
+  "votes": [
+   {
+    "lens": "impact",
+    "verdict": "confirmed",
+    "severity_suggestion": "high",
+    "evidence": "lib.rs:216-221 `overlay::show(app, BannerKind::Recording, \"Recording\", state.current_game.lock().clone());` and lib.rs:353-359 `overlay::show(..., Some(match state.current_game.lock().as_ref() {...}))`: edition 2021 (Cargo.toml:5), so the parking_lot guard (state.rs:5,30) is a temporary that lives to the end of the statement, i.e. through the whole overlay::show. overlay.rs:404 `let awake = window.is_visible().unwrap_or(false);` and overlay.rs:479 `let Ok(handle) = window.hwnd()` (-> tauri window/mod.rs:1668 dispatcher.window_handle() -> tauri-runtime-wry lib.rs:1975 `window_getter!(dispatcher, WindowMessage::RawWindowHandle)`). tauri-runtime-wry 2.11.4 lib.rs:197-203 `getter!` = send_user_message + `$rx.recv()`; lib.rs:239-253: inline only when `current_thread().id() == context.main_thread_id`, otherwise `proxy.send_event` and block. Worker holders: lib.rs:465 `std::thread::spawn(move || start_buffer_and_notify(&app))` (boot), lib.rs:803 record hotkey spawns toggle_recording_and_notify, lib.rs:661 auto-buffer thread, tray.rs:113/122, control.rs:225/257, async commands commands.rs:331/357. Main-thread lockers: commands.rs:316 `#[tauri::command] pub fn engine_status` (sync, so runs in the IPC handler on the main thread) -> state.rs:736 `status.game = self.current_game.lock().clone();`, called from Console.tsx:337 on mount; the console page is created hidden at startup (lib.rs:1241 console::create, before start_buffer_if_configured at lib.rs:1268) and is only hidden, never destroyed (console.rs:205-218). Toggle-buffer hotkey lib.rs:812-816 calls toggle_buffer_and_notify inline; global-hotkey 0.8.0 windows/mod.rs:33-47 creates its message window in GlobalHotKeyManager::new(), called from the plugin's setup (tauri-plugin-global-shortcut 2.3.2 lib.rs:399) on the main thread, so WM_HOTKEY handlers run on the main thread -> state.rs:459-472 start_pipeline: lifecycle lock (already released by start_recording), then `let game = self.current_game.lock().clone();` when the recording's pipeline exists. Defaults keep the path live: overlay enabled and on_buffer_toggle/on_recording are true (model.rs:264-269).",
+    "corrected_claim": "",
+    "reachable_by": "Ordinary use, by timing only. (1) Boot with buffer.auto_start=true and only_buffer_in_game=false: the spawned buffer-start thread shows its banner while the hidden console page mounts and sends engine_status. (2) A worker-thread start (record hotkey, tray, Stream Deck, UI start/record buttons, auto-buffer on game detection) whose banner overlaps a main-thread toggle-buffer hotkey, or set_config changing the capture target while buffering. The race window is the latency of two main-thread round trips (IsVisible, RawWindowHandle; more with follow_active_screen), which is longest when the main thread is busy, as at boot. Severity is high, not critical: when it hits, the whole app hangs for good (event loop, all windows, tray, and every hotkey including save-clip, so the buffered moment is lost) and only killing the process recovers it. But it is a narrow timing race, not something likely to hit many users on each run.",
+    "fix_assessment": "The proposed fix is correct and enough for these two sites: bind the value in its own `let` statement (`let game = state.current_game.lock().clone();` and `let detail = match state.current_game.lock().as_ref() {...};`) so the guard drops before overlay::show. It has no side effects. To remove the main-thread side of this class of bug, also make engine_status `#[tauri::command(async)]` and spawn the toggle-buffer hotkey's work onto a thread like the other hotkeys (it currently runs start_pipeline, a few hundred ms of capture setup, on the UI thread). A single overlay worker thread is not needed."
+   },
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "Guard lifetime (edition 2021, parking_lot::Mutex, non-reentrant): lib.rs:216-221 `overlay::show(app, BannerKind::Recording, \"Recording\", state.current_game.lock().clone());` and lib.rs:356 `Some(match state.current_game.lock().as_ref() {` - the MutexGuard temporary lives to the end of the `overlay::show(...);` statement. Inside show_banner: overlay.rs:404 `let awake = window.is_visible().unwrap_or(false);`, overlay.rs:408 `to_top(&window)` -> overlay.rs:479 `let Ok(handle) = window.hwnd() else {` (plus place() getters at :398 only if follow_active_screen, default false). Blocking off-main-thread: tauri-runtime-wry-2.11.4 lib.rs:197-203 `getter!` = `send_user_message(...)?; $rx.recv()`; lib.rs:239-253 send_user_message runs inline only when `current_thread().id() == context.main_thread_id`, else `proxy.send_event`; lib.rs:2058 `fn is_visible` -> `window_getter!(self, WindowMessage::IsVisible)`; lib.rs:1972-1975 get_raw_window_handle (behind tauri window/mod.rs:1668 hwnd) -> `window_getter!(dispatcher, WindowMessage::RawWindowHandle)`. Worker-thread callers (W): lib.rs:465 boot `std::thread::spawn(move || start_buffer_and_notify(&app))`; lib.rs:661 auto-buffer thread; lib.rs:803 record hotkey `std::thread::spawn(move || toggle_recording_and_notify(&app))`; tray.rs:113/122 spawn; control.rs:225/257 Stream Deck; commands.rs:327/353 `#[tauri::command(async)]` start_buffer/toggle_recording. Main-thread lockers (M): lib.rs:815 toggle-buffer hotkey calls `toggle_buffer_and_notify(app)` inline, and the Pressed event is raised from global-hotkey-0.8.0 windows/mod.rs:152-156 (WM_HOTKEY in the hidden window's wndproc, created by plugin setup at tauri-plugin-global-shortcut lib.rs:399 on the main thread) -> start_pipeline state.rs:472 / :515 `let game = self.current_game.lock().clone();`; commands.rs:317 `#[tauri::command] pub fn engine_status` (sync = body_blocking, run inline on the UI thread) -> state.rs:736 `status.game = self.current_game.lock().clone();`, called once from Console.tsx:337 on page load (console window is created hidden at startup, lib.rs:1241); commands.rs:55 sync set_config -> :120 start_buffer_and_notify when capture target changes while buffering. Defaults: config.rs:40 `auto_start: false`, config.rs:61 `only_buffer_in_game: true`, model.rs:264-269 overlay enabled/on_recording/on_buffer_toggle true.",
+    "corrected_claim": "The mechanism is real as described: a worker thread holds current_game through at least two blocking main-thread round trips (is_visible, hwnd), and three main-thread paths lock current_game, so a parking_lot lock on the main thread at that moment hangs the event loop for good. Two details of the claim are wrong. (1) The window is narrow and its timing differs from the scenario. W holds the guard only from the lock() in the show() argument until the hwnd() round trip returns: sub-millisecond when the main thread is idle, longer only when the main thread is busy. For the hotkey pair, that window comes after start_recording has returned, which can be hundreds of ms after the record press when the pipeline has to launch, not 'within a few milliseconds' of it. The toggle-buffer press must land inside that window while a recording runs and the buffer is off, which leads to the state.rs:472 lock. (2) The boot scenario needs settings that are off by default: buffer.auto_start=true AND only_buffer_in_game=false (config.rs:40/61). With the defaults, start_buffer_if_configured returns at once, and engine_status runs only once per console page load. So this is a rare, user-self-inflicted race (two of the user's own actions colliding within about a millisecond). The outcome is a permanent hang that needs the process killed. It is not a critical, routinely hit defect. Severity: medium.",
+    "reachable_by": "Only the local user through ordinary use, as an accidental race. Worker side: record hotkey, tray Start buffer/Record, the UI's async start_buffer/toggle_recording buttons, the Stream Deck control port (local process with token), the auto-buffer thread when a game is detected, or the boot thread (non-default config). Main-thread side, at the same moment: toggle-buffer hotkey while a just-started recording runs with the buffer off, the console page's one-time engine_status at load, or set_config changing the capture source while buffering. No friend, server or remote party can trigger it. Likelihood per occurrence is low (the lock window is about a millisecond, longer under main-thread load), but it repeats over the life of the app and the outcome cannot be recovered.",
+    "fix_assessment": "Correct and sufficient for the two cited sites: bind `let game = state.current_game.lock().clone();` (or build the detail String) in its own statement before calling overlay::show, so no guard is alive across the window getters. A project-wide rule of no AppState guard across any WebviewWindow getter (is_visible, hwnd, monitors, positions) is worth it. Moving banners to a single overlay worker is optional extra hardening."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "high",
+    "evidence": "Guard lifetime: lib.rs:216-221 `overlay::show(app, BannerKind::Recording, \"Recording\", state.current_game.lock().clone());` and lib.rs:354-359 `overlay::show(..., Some(match state.current_game.lock().as_ref() {...}));`. current_game is a parking_lot::Mutex (state.rs:5,30; not reentrant), edition 2021 (Cargo.toml:5). A rustc test in the scratchpad confirmed that both forms keep the guard locked inside the callee (`inside show: locked = true` for both, `false` once the value is bound to a local first). Blocking calls under the guard: overlay.rs:404 `window.is_visible()` -> tauri-runtime-wry-2.11.4 lib.rs:2058 `window_getter!(self, WindowMessage::IsVisible)` -> lib.rs:197-203 `send_user_message(...)?; $rx.recv()`. send_user_message (lib.rs:239-253) runs inline only when `current_thread().id() == context.main_thread_id`, and otherwise posts through the proxy and waits. overlay.rs:479 `window.hwnd()` -> tauri window/mod.rs:1668 `dispatcher.window_handle()` -> runtime-wry lib.rs:1975 `window_getter!(dispatcher, WindowMessage::RawWindowHandle)`, which also blocks. With follow_active_screen on, overlay.rs:398 `place()` -> choose_monitor (monitor_from_point/available_monitors/primary_monitor) adds more round trips under the guard. Worker callers: lib.rs:465 `std::thread::spawn(move || start_buffer_and_notify(&app))`, lib.rs:803 record hotkey `std::thread::spawn(move || toggle_recording_and_notify(&app))`, tray.rs:113/122. Main-thread lockers: commands.rs:315-318 `#[tauri::command] pub fn engine_status` is sync. tauri-macros body_blocking runs it inline from tauri webview/mod.rs:1909 `manager.run_invoke_handler(invoke)`, which is reached from wry-0.55.1 webview2/mod.rs:1021 `custom_protocol_handler(...)` inside the WebResourceRequested callback on the UI thread. state.rs:736 `status.game = self.current_game.lock().clone();`. Toggle-buffer hotkey lib.rs:812-815 calls `toggle_buffer_and_notify(app)` directly. The handler runs on the main thread: global-hotkey-0.8.0 windows/mod.rs:47 creates a hidden window in the plugin setup (tauri-plugin-global-shortcut lib.rs:399, run from Builder::build app.rs:2440 on the main thread), and the wndproc (mod.rs:152) calls the handler synchronously (lib.rs:126-128). That path reaches start_pipeline, which locks current_game at state.rs:472 or state.rs:515. set_config (commands.rs:54, sync) -> commands.rs:120 start_buffer_and_notify does the same. Console.tsx:337 calls api.status() on mount, and the console is created hidden at boot (lib.rs:1241) just before start_buffer_if_configured (lib.rs:1268). Timing note on scenario 2: a toggle-buffer press that lands while the worker is still inside start_recording blocks the main thread on `lifecycle` (state.rs:460), not on current_game. The main thread then reaches state.rs:472 before the worker can finish the set_recording round trips, so that ordering does not deadlock. The deadlock window runs from the guard being taken at lib.rs:220 until the hwnd round trip in to_top completes, so it is narrow but real.",
+    "corrected_claim": "",
+    "reachable_by": "Ordinary use, no attacker needed. (1) At boot with buffer auto-start (and not only-in-game): the start_buffer_if_configured worker reaches lib.rs:356 while the console webview's mount-time engine_status IPC is dispatched on the main thread. (2) Record via hotkey, tray or Stream Deck (worker thread) racing the toggle-buffer hotkey (main thread). (3) Any worker banner path racing a set_config that changes the capture target while buffering.",
+    "fix_assessment": "Copying the value into a local before the call (`let game = state.current_game.lock().clone();`) at lib.rs:220 and lib.rs:356 removes both instances and is correct. A wider rule that no AppState guard is held across window or dispatcher calls (or a single banner worker fed by a channel) would also block the same pattern elsewhere, such as the guard at lib.rs:403."
+   }
+  ]
+ },
+ {
+  "id": "ST-2",
+  "title": "Toggle-buffer hotkey starts and stops the capture stack on the UI (main) thread",
+  "severity": "high",
+  "category": "perf",
+  "locations": [
+   "lib.rs:813-816",
+   "lib.rs:786",
+   "state.rs:486",
+   "mft.rs:1135",
+   "state.rs:1014-1020",
+   "src-tauri/src/lib.rs:811-816",
+   "src-tauri/src/lib.rs:416",
+   "src-tauri/src/tray.rs:113",
+   "src-tauri/src/lib.rs:786"
+  ],
+  "claim": "Global-shortcut Pressed handlers run on the main thread (inside the hidden hotkey window's window procedure). lib.rs:813-816: `if event.state() == ShortcutState::Pressed { toggle_buffer_and_notify(app); }` runs the toggle directly, while every other hotkey spawns a thread. The work done there: `launch_pipeline` spawns `ffmpeg -version` every time, because at state.rs:486 `!muxer::available() && tools::is_ready()` evaluates the expensive check first; `Pipeline::start` waits up to 10 s for encoder readiness (mft.rs:1135, `recv_timeout(10s)`); `lifecycle` may be held elsewhere, e.g. by `attach_recorder`'s 5 s keyframe loop (state.rs:1014-1020) or a `close_recording` whose writer is flushing to a slow disk; stop drains the encoder with unbounded joins. The comment at lib.rs:786 (\"the hotkey arrives on one of its own\") is wrong. Latent: the plugin's `unregister_all` holds its `shortcuts` lock while it waits on the main thread, and the hotkey handler takes the same lock on the main thread, so calling `register_hotkeys` off the main thread would deadlock (today only sync commands and `setup` call it, so it is not reachable yet).",
+  "scenario": "Pressing the toggle-buffer hotkey freezes every webview (main window, console, banner) while the pipeline starts or stops; every worker thread that needs a window query stalls too, including the status thread's `window_awake` and banner display. This is also what makes the current_game deadlock (ST-1) possible.",
+  "fix": "`std::thread::spawn(move || toggle_buffer_and_notify(&app))`, and swap the operand order at state.rs:486. Keep `register_hotkeys` on the main thread.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "severity_reported": "high",
+  "also": [
+   {
+    "id": "LS-10",
+    "slice": "05-local-surface",
+    "title": "Toggle-buffer hotkey starts/stops the pipeline inline on the UI thread; misleading comment",
+    "claim": "The toggle-buffer hotkey handler at lib.rs:811-816 calls `toggle_buffer_and_notify` inline. The tauri-plugin-global-shortcut 2.3.2 handler runs in the hidden window's wndproc on the main thread (lib.rs:416), so the pipeline starts and stops on the UI thread. The tray spawns a thread for the same action (tray.rs:113). The comment at lib.rs:786 (\"hotkey arrives on one of its own\") is wrong.",
+    "locations": [
+     "src-tauri/src/lib.rs:811-816",
+     "src-tauri/src/lib.rs:416",
+     "src-tauri/src/tray.rs:113",
+     "src-tauri/src/lib.rs:786"
+    ],
+    "fix": "Spawn a thread in the toggle hotkey handler (as the tray does) and correct the comment."
+   }
+  ],
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "App: src-tauri/src/lib.rs:814-815 `if event.state() == ShortcutState::Pressed { toggle_buffer_and_notify(app); }` runs inline. The save, screenshot and record handlers spawn threads. Tray does the same toggle via `std::thread::spawn(move || crate::toggle_buffer_and_notify(&app))` (tray.rs:113). Dispatch: the plugin is added at lib.rs:1175 and its setup runs during `.build()` on the main thread, where it calls `global_hotkey::GlobalHotKeyManager::new()` (tauri-plugin-global-shortcut-2.3.2/src/lib.rs:399), which creates the HWND (global-hotkey-0.8.0/src/platform_impl/windows/mod.rs CreateWindowExW). `global_hotkey_proc` (mod.rs:146-153) calls `GlobalHotKeyEvent::send(..Pressed)` synchronously inside WM_HOTKEY. That send calls the handler directly (global-hotkey lib.rs:126-128), and the plugin's handler runs user closures while holding `shortcuts_.lock()` (plugin lib.rs:417). Only Released comes from a spawned thread (mod.rs:157-160). Work on the main thread: state.rs:460 `self.lifecycle.lock()`; state.rs:486 `if !crate::muxer::available() && crate::tools::is_ready()`, where muxer.rs:81-86 runs `ffmpeg -version` `.output()`; Pipeline::start -> win::start makes the GpuDevice, the Converter and `VideoEncoder::start`, which waits in `ready_rx.recv_timeout(Duration::from_secs(10))` (mft.rs:1135), then `wgc::start`. Stop: VideoEncoder Drop does `thread.join()` with no timeout (mft.rs:1214-1215), after an async-MFT drain capped at 2 s (mft.rs:1405). Contention: start_recording holds lifecycle across launch_pipeline plus attach_recorder's 5 s keyframe wait (state.rs:974, 1014-1018), and stop_recording holds it across close_recording, which joins the writer (state.rs:1090, recorder.rs:340). The comment at lib.rs:786-787, \"the hotkey arrives on one of its own\", is wrong for Pressed. Latent claim: plugin `unregister_all` takes `self.shortcuts.lock()` and then `run_main_thread!`, which does `rx.recv()` (plugin lib.rs:220-225). Every register_hotkeys caller is setup (lib.rs:1265) or a sync #[tauri::command] (commands.rs), and those run on the main thread, where tauri-runtime-wry `send_user_message` runs the task inline (tauri-runtime-wry-2.11.4/src/lib.rs:239-248). So that deadlock is indeed not reachable today.",
+    "corrected_claim": "The core claim holds. Two details are off. (1) The ffmpeg spawn is not caused by operand order: once ffmpeg is installed, `tools::is_ready()` is true, so `muxer::available()` runs on every start whatever the order. Swapping the operands only saves the spawn while ffmpeg is downloading or has failed. (2) Not every other hotkey spawns a thread: the console handler uses run_on_main_thread, which on the main thread runs inline (cheap, so harmless). Stop is bounded in practice by the 2 s MFT drain rather than truly unbounded. Also, ST-1 does not depend on this alone: engine_status, a sync command on the main thread, is another main-thread taker of current_game.",
+    "reachable_by": "The local user pressing the configured toggle-buffer hotkey. Freezes are worse if they press it while a record start or stop holds `lifecycle`, or when encoder activation is slow.",
+    "fix_assessment": "Spawning a thread, as tray.rs:113 already does, is right and keeps register_hotkeys on the main thread. Two cautions. Off the main thread the overlay getters become blocking round trips, so this should land with the ST-1 fix. Rapid double presses can also race on the `buffer_active` read outside `lifecycle`, as the tray path already can. The operand swap is a minor optimisation only, not the cure for the per-start ffmpeg spawn; caching `muxer::available()` would be."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "Hotkey dispatch is synchronous on the main thread. global-hotkey-0.8.0 windows/mod.rs global_hotkey_proc: `if msg == WM_HOTKEY { GlobalHotKeyEvent::send(GlobalHotKeyEvent{.. Pressed}) ...}`. Only the Released event comes from a spawned thread. The hidden window is created by `GlobalHotKeyManager::new()` in the plugin's setup (tauri-plugin-global-shortcut-2.3.2 lib.rs:399), which runs on the main thread, so the tao loop's DispatchMessage calls the wndproc there. The handler also runs while the plugin holds its shortcuts lock (lib.rs:416-422 `if let Some(shortcut) = shortcuts_.lock().unwrap().get(&e.id) { ... handler(&app_handle, ...) }`). App code, src-tauri/src/lib.rs:811-816: `if event.state() == ShortcutState::Pressed { toggle_buffer_and_notify(app); }` runs inline. The other hotkeys spawn a thread (lib.rs:771, 801), and so does the tray (tray.rs:111-113 `std::thread::spawn(move || crate::toggle_buffer_and_notify(&app))`). The start_buffer command is `#[tauri::command(async)]` because 'bringing up the capture stack takes a few hundred milliseconds' (commands.rs:324-327). The work done inline: state.rs:460 takes `lifecycle`. state.rs:486 `if !crate::muxer::available() && crate::tools::is_ready()` runs `ffmpeg -version` (muxer.rs:81-86) on every start. pipeline.rs:616-700 creates the GPU device, Converter, `VideoEncoder::start` (waits up to 10 s at mft.rs:1135 `ready_rx.recv_timeout(Duration::from_secs(10))`) and WGC. On stop, pipeline.rs Running::stop joins the pacer and mixer threads and drops the encoder so it drains. Other holders of `lifecycle` (state.rs:974/1090/1103) include start_recording, whose attach_recorder polls for a keyframe for up to 5 s (state.rs:1013-1020). The comment at lib.rs:786 ('the hotkey arrives on one of its own') is factually wrong. Latent claim holds: the plugin's unregister_all (lib.rs:220-226) takes `shortcuts.lock()` and then `run_main_thread!`, which blocks on `rx.recv()`. The only register_hotkeys callers are setup (lib.rs:1265) and sync commands (commands.rs set_config, set_hotkeys, resume_hotkeys), all on the main thread, where send_user_message runs the task inline (tauri-runtime-wry lib.rs:239). So nothing deadlocks today.",
+    "corrected_claim": "Accurate. One detail: ST-2 is not the only main-thread path into ST-1's current_game deadlock. The sync engine_status command and set_config -> start_buffer_and_notify also take current_game on the main thread. The toggle hotkey adds another path, and the one most likely to be hit while a game is running.",
+    "reachable_by": "Ordinary use by the local user. The toggle-buffer hotkey is on by default (config.rs:48 `toggle_buffer_hotkey: \"Ctrl+Shift+B\"`), and every press that starts or stops the buffer blocks the Tauri event loop: all webviews, the tray and the other hotkeys, plus any worker thread doing a window getter. A normal start blocks it for a few hundred ms (the authors' own estimate) and a slow encoder or GPU for up to about 10 s. A stop blocks it for the encoder drain, or for as long as another holder keeps `lifecycle` (up to about 5 s in start_recording's keyframe wait). It happens on every toggle press. Combined with ST-1 (a worker holding current_game across a main-thread round trip) it can become a permanent hang. Friends, remote users and other local processes cannot trigger it through this path. The Stream Deck control port (control.rs:225-227) calls the same functions, on its own thread.",
+    "fix_assessment": "Correct and minimal. Spawn a thread in the handler (`let app = app.clone(); std::thread::spawn(move || toggle_buffer_and_notify(&app));`), as tray.rs does, and fix the comment. Swapping the operands at state.rs:486 to `crate::tools::is_ready() && !crate::muxer::available()` is a cheap extra that skips the ffmpeg spawn while tools are not ready, but the spawn is still paid whenever they are, so the thread move is the real fix."
+   },
+   {
+    "lens": "impact",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "Hotkeys arrive on the main thread. global-hotkey-0.8.0 windows/mod.rs:152-156 handles `if msg == WM_HOTKEY { GlobalHotKeyEvent::send(.. Pressed ..)` inside the wndproc of the hidden window, which `GlobalHotKeyManager::new()` creates in the plugin's `setup` (tauri-plugin-global-shortcut-2.3.2 lib.rs:399). Only the Released event goes to a spawned thread. The plugin handler runs with the shortcuts mutex held: lib.rs:416-420 `set_event_handler(.. shortcuts_.lock().unwrap().get(&e.id) .. handler(&app_handle, ..))`. In ClippiBoy, lib.rs:813-816 calls `if event.state() == ShortcutState::Pressed { toggle_buffer_and_notify(app); }` inline, while save, shot and record spawn threads (lib.rs:752, 772, 803) and so does the tray (tray.rs:113 `std::thread::spawn(move || crate::toggle_buffer_and_notify(&app))`). The comment at lib.rs:786-787 (\"the hotkey arrives on one of its own\") is therefore wrong. Blocking work on that path: state.rs:460 `self.lifecycle.lock()`; state.rs:486 `!crate::muxer::available() && ..`, where muxer.rs:81-86 spawns `ffmpeg -version` and waits for `.output()`; mft.rs:1135 `ready_rx.recv_timeout(Duration::from_secs(10))`; audio/capture.rs:127 `recv_timeout(5s)`; pipeline.rs:738-750 joins the pacer and mixer and drops the encoder so it drains. `lifecycle` can be held by start_recording -> attach_recorder, which polls for a keyframe for up to 5 s (state.rs:974, 1014-1020). Latent deadlock claim: plugin lib.rs:220-226 `unregister_all` locks `shortcuts`, then `run_main_thread!` blocks on `rx.recv()`, and the main-thread event handler takes the same lock. All register_hotkeys callers today are sync commands (commands.rs:132,182,226,236,257) or setup (lib.rs:1265), so it is not reachable now. The ffmpeg detail is wrong: tools.rs:67/157 show that `Ready` is the steady state, so `is_ready()` is normally true and swapping the operands still spawns ffmpeg on every start.",
+    "corrected_claim": "Core claim holds. The toggle-buffer hotkey runs start/stop of the capture stack inline on the main (event-loop) thread, while holding the plugin's shortcuts mutex, and the lib.rs:786 comment is wrong. Two corrections. (1) The operand order at state.rs:486 is not why ffmpeg is spawned every time: tools status is `Ready` in steady state, so `is_ready() && !available()` still spawns `ffmpeg -version` on every start. The swap only saves the spawn while tools are downloading or failed. (2) Normally the freeze is a few hundred ms (the authors' own estimate in commands.rs:325-326), up to about 15 s in bad cases (lifecycle contention plus encoder or audio timeouts). It is not permanent by itself. Its worst effect is enabling one ST-1 deadlock path: the record hotkey thread holds `current_game` across overlay::show, which needs the main thread, while the main-thread toggle blocks on `current_game` at state.rs:472. Also out of scope of the fix: set_config (sync command, commands.rs:117-121) restarts the pipeline on the main thread too.",
+    "reachable_by": "Any user who binds and presses the toggle-buffer hotkey (it can be unbound). Usually pressed in-game while ClippiBoy's windows are hidden, so the visible effect is mostly a stalled event loop: IPC, other hotkeys, tray and worker threads' window getters wait. A press within a few seconds of the record hotkey can also hit the ST-1 deadlock.",
+    "fix_assessment": "Spawning a thread, as tray.rs:113 does (`let app = app.clone(); std::thread::spawn(move || toggle_buffer_and_notify(&app));`), is correct, sufficient for this handler, and consistent with every other route. It also removes the main-thread side of the ST-1 hotkey-pair deadlock. Side effect: two quick presses no longer queue one after the other on the main thread and can both see buffer_active=false. That race already exists between tray and control port, and the result is harmless (start is idempotent, so you get a duplicate toast). The state.rs:486 swap is close to pointless in steady state. To really avoid a spawn per start, cache the result of `muxer::available()` once tools reach Ready. Also fix the lib.rs:786 comment, keep register_hotkeys on the main thread, and consider moving set_config's pipeline restart (commands.rs:117-121) off the main thread too."
+   }
+  ]
+ },
+ {
+  "id": "ST-3",
+  "title": "Persistent start failure makes the automation retry every 2 s with an error sound and banner",
+  "severity": "high",
+  "category": "bug",
+  "locations": [
+   "state.rs:188-190",
+   "state.rs:246-252",
+   "lib.rs:363-366"
+  ],
+  "claim": "state.rs:188-190: `if !buffer_active && !self.suppressed.load(SeqCst) { self.started.store(true, SeqCst); return AutoAction::Start; }`. `poll_always` (state.rs:246-252) has the same shape. Nothing records a start failure. Each failure runs `notify(error)`, `sounds::play(Error)` and `overlay::show(Error, \"Buffer will not start\")` (lib.rs:363-366). Error banners stay at least 6 s, so with a 2 s retry the banner never goes away. Each attempt also builds and tears down D3D, WGC, MFT and the ffmpeg probe during gameplay.",
+  "scenario": "ffmpeg is quarantined by antivirus after `tools` reported ready, encoder session limits are hit, or the GPU device is lost: the automation retries Start every 2 s forever, playing an error sound and keeping an error banner up permanently during gameplay.",
+  "fix": "Keep a failure count with exponential backoff. After N failures, set `suppressed` and announce it once.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "Entry: status tick, every 40 ticks (2 s), lib.rs:1021 `apply_auto_buffer(&handle, tick_game.playing);`. lib.rs:640-650 routes to `state.auto.poll(playing, active)` or `poll_always(active)` when `config.buffer.auto_start`. state.rs:188-190 `if !buffer_active && !self.suppressed.load(SeqCst) { self.started.store(true, SeqCst); return AutoAction::Start; }`; state.rs:248-252 `if buffer_active || self.suppressed.load(SeqCst) { return Nothing } ... AutoAction::Start`. lib.rs:661 spawns `start_buffer_and_notify`. On failure, launch_pipeline returns before `status.buffer_active = for_buffer` (state.rs:485-499 `?` on Pipeline::start), so buffer_active stays false and the next tick returns Start again. `suppressed` is only set by manual_stop (state.rs:266), reached only from toggle_buffer_and_notify when buffer_active is true (lib.rs:335-336); the hotkey/tray toggle on a failing buffer calls manual_start (lib.rs:339), which clears suppressed and retries. Failure branch lib.rs:363-366: `notify(app, \"error\", ...); sounds::play(app, SoundKind::Error); overlay::show(app, BannerKind::Error, \"Buffer will not start\", Some(err));`. No throttling: sounds.rs:55-58 plays whenever the setting is on; notify (lib.rs:57-65) just emits. overlay.rs:375 `BannerKind::Error => config.duration_ms.max(6000)`, and the hide at overlay.rs:441-445 is skipped when `SEQUENCE != ticket`, so a fresh banner every ~2 s keeps the window up. Realistic persistent errors: muxer::available() spawns `ffmpeg -version` on every attempt (muxer.rs:81-87, state.rs:485-490); wgc.rs:157/160 `\"The selected window is no longer open.\"` for a window target whose HWND is gone (window capture is offered in src/routes/Recording.tsx:122-270); GPU/MFT errors gpu.rs:220-243, mft.rs:685/717. Defaults: Setup.tsx:83 `useState(true)` for autoStart, config.rs:61 `only_buffer_in_game: true`.",
+    "corrected_claim": "The mechanism is as described. One detail is off: how much each retry builds depends on where it fails. The ffmpeg check (state.rs:485) runs first, so with ffmpeg missing an attempt only spawns `ffmpeg -version`. Only failures later on (window target gone, encoder session limit) build and drop the D3D11 device, converter and MFT each time, and WGC is the last step. A second detail: in only-in-game mode the loop stops once the game has been out of the foreground for 15 polls, and in either mode it stops if the user turns off auto-start. The tray/hotkey toggle cannot stop it.",
+    "reachable_by": "Ordinary use, no attacker needed. The setup wizard turns auto-start on by default (Setup.tsx:83), and only-in-game is the default (config.rs:61). Then any lasting start failure triggers it every 2 s. Examples: a window capture target whose game window was closed or relaunched (new HWND), NVENC/encoder session limits while OBS or Discord holds sessions, a lost or failing GPU device, or ffmpeg removed after tools reported ready. Plausible for a minority of users, and it does not fix itself while the game is in the foreground (or ever, in always-on mode).",
+    "fix_assessment": "Backoff plus a failure counter in AutoBuffer is the right fix (e.g. record_start_failure() called from the automation's Err branch, exponential delay, then set suppressed with one announcement after N failures). It should also stop repeating the sound and banner when the error text has not changed. Reset it on manual_start, on game end, and on a config change that touches the recording target."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "state.rs:184-191 poll(): `if !buffer_active && !self.suppressed.load(SeqCst) { self.started.store(true, SeqCst); return AutoAction::Start; }`; state.rs:246-252 poll_always() has the same shape. `suppressed` is only written at state.rs:200 (game gone), :259 manual_start and :266 manual_stop, so a failure is never recorded. On failure launch_pipeline returns Err before anything sets status.buffer_active (state.rs:483-499; it is set only at :519), so the next tick sees active=false again. The tick: lib.rs:944 `sleep(50ms)`, lib.rs:997 `if tick % 40 == 0` -> lib.rs:1021 apply_auto_buffer -> lib.rs:661 spawns start_buffer_and_notify, whose Err arm (lib.rs:362-366) runs notify + sounds::play(Error) + overlay::show(Error, \"Buffer will not start\"). Nothing throttles it: sounds.rs:55-58 and lib.rs:57-65 have no rate limit. overlay.rs:375 `BannerKind::Error => config.duration_ms.max(6000)`; overlay.rs:441-444 hides only when `SEQUENCE == ticket`, so a new banner every 2 s keeps the window up and calls to_top each time. It also keeps IMPORTANT_UNTIL ahead, so notices are blocked (overlay.rs:378-384).",
+    "corrected_claim": "Mostly accurate, with three caveats. (1) What each attempt costs depends on where it fails. In the ffmpeg-gone scenario launch_pipeline returns at state.rs:485-490 (`!muxer::available() && tools::is_ready()`), so each attempt only spawns `ffmpeg -version` (muxer.rs:81-87) and never builds D3D/WGC/MFT. The D3D/encoder churn only happens for failures inside Pipeline::start (GpuDevice::new, Converter::new, VideoEncoder::start, wgc::start, pipeline.rs:625-671). (2) In always-on mode (poll_always) the retries go on outside gameplay too. In only-in-game mode (the default) they run only while a game is in the foreground. (3) It needs buffer.auto_start, which defaults to false (config.rs:40), and the banner/sound respect overlay.on_error and the sound settings.",
+    "reachable_by": "A user who turned on buffer auto-start, on any machine where starting fails persistently (ffmpeg removed or quarantined after tools reported Ready, a GPU or encoder init failure, a WGC target that cannot be captured). The automation tick fires every 2 s while a game is in the foreground, or all the time in always-on mode.",
+    "fix_assessment": "The proposed fix fits: count consecutive automation start failures in AutoBuffer and back off. After N failures set `suppressed` (which is already cleared when the game ends, state.rs:200) and announce it once. Reset the counter on success, in manual_start and when the game ends. Optionally only announce the first failure."
+   }
+  ]
+ },
+ {
+  "id": "ST-17",
+  "title": "Banner can get the wrong size or land partly off-screen on monitors with different scaling",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "overlay.rs:532-533"
+  ],
+  "claim": "overlay.rs:532-533 calls `set_size(PhysicalSize)` and then `set_position`. Crossing to a monitor with another scale triggers WM_DPICHANGED, and tao rescales the window (allow_resize is true for non-maximized windows; checked in tao source), altering the size just set. The console works around this by placing twice; the overlay does not.",
+  "scenario": "A banner shown on a monitor with a different scale factor than the one it was last on ends up the wrong size or partly off-screen.",
+  "fix": "Position, then size, then position again.",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/src/overlay.rs:532-533 `window.set_size(PhysicalSize::new(width, height))?; window.set_position(PhysicalPosition::new(origin.x + x, origin.y + y))`. width/height are `WIDTH * scale` of the *target* monitor (overlay.rs:515-519), and the size is applied while the window is still on the old monitor. tao-0.35.3 event_loop.rs:1910 `allow_resize = fullscreen.is_none() && !MAXIMIZED`; :1966-1971 `old_physical_inner_size.to_logical(old_scale_factor).to_physical(new_scale_factor)`; on Win11 :2102-2104 `new_outer_rect = suggested_rect` (Windows' DPI-scaled rect); :2107 `SetWindowPos(window, None, new_outer_rect...)`. tao window.rs:229-249 `set_outer_position` posts an async SetWindowPos (`SWP_ASYNCWINDOWPOS|SWP_NOSIZE`) that runs after the async resize. The console does the opposite: console.rs:355-358 sets position first, then size, and its comment says `open()` places twice, before and after showing.",
+    "corrected_claim": "After a move from scale sA to sB the overlay ends up WIDTH*sB*(sB/sA) wide, not WIDTH*sB. For example, 100% to 150% gives 936x288 instead of 624x192, so a right or bottom corner banner overhangs the work area by about 312/96 px. The effect is transient and depends on the path. With follow_active_screen, the next banner on the same monitor sets the correct size without a DPI change and heals it. With a fixed screen (the default, model.rs:275), `place` runs only from `create()` via `reposition` (overlay.rs:197), on settings save, on screen change and in `set_recording`. So a window created on a primary monitor whose scale differs from the chosen monitor stays wrong until the next recording start or settings save, and a settings save while recording places twice (commands.rs:100-105), which heals it. The visible-window path is certain: REC badge up, follow mode, a banner arriving for another monitor. Whether Windows sends WM_DPICHANGED for the hidden-window paths (startup, set_recording before show) is platform behaviour and cannot be checked here.",
+    "reachable_by": "Users with monitors at different scaling: (a) overlay pinned to a non-primary monitor with a different scale, from startup on; (b) follow_active_screen on, with focus moving between monitors.",
+    "fix_assessment": "Copying the console pattern works: set_position, then set_size, ideally repeated once after show() or with a guard that only touches what changed. One SetWindowPos with an explicit rect still lets tao's WM_DPICHANGED handler rescale it, so the second, size-only pass after the move is what makes it reliable."
+   }
+  ]
+ },
+ {
+  "id": "ST-18",
+  "title": "Overlay appears in Alt+Tab and Task View while visible (the whole recording with the REC badge on)",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "overlay.rs"
+  ],
+  "claim": "tao implements `skip_taskbar` with `ITaskbarList::DeleteTab` only. The overlay window is not `focusable(false)` and has no WS_EX_TOOLWINDOW or WS_EX_NOACTIVATE, so it is listed in Alt+Tab and Task View whenever it is visible, which is the whole recording when the REC badge is on.",
+  "scenario": "During a recording with the REC badge enabled, the overlay shows up in Alt+Tab and Task View for the whole recording.",
+  "fix": "`.focusable(false)`, or add WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE.",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "tao-0.35.3 window.rs:1529-1538 `set_skip_taskbar`: `if skip { taskbar_list.DeleteTab(hwnd)?; }`, nothing else. window.rs:1163-1165 `Parent::None => { window_flags.set(WindowFlags::ON_TASKBAR, true); None }`. window_state.rs:258-259 `if ON_TASKBAR { style_ex |= WS_EX_APPWINDOW; }`. window_state.rs:296-297 adds WS_EX_NOACTIVATE only `if !FOCUSABLE`. There is no WS_EX_TOOLWINDOW anywhere for normal windows. overlay.rs:173-188 builder: `.skip_taskbar(true) .focused(false) .visible(false)`, with no `.focusable(false)`, `.parent()` or `.owner()`. overlay.rs:220-224 `set_recording`: `if wanted { place(..); window.show(); to_top(..) }`, and the window stays up for the whole recording (BADGE). Defaults: model.rs:264,270 `enabled: true`, `rec_badge: true`.",
+    "corrected_claim": "This is worse than stated: tao gives every unowned window WS_EX_APPWINDOW (ON_TASKBAR is set for Parent::None), so the overlay is explicitly marked as an app window, not just missing TOOLWINDOW or NOACTIVATE. It is also visible, and so listed, while any banner stands, not only during recordings. The Alt+Tab and Task View rule (APPWINDOW, visible, unowned and not cloaked windows are listed) is Windows behaviour and is not checked from source here.",
+    "reachable_by": "Any user who starts a recording with the overlay and REC badge on (both on by default), or presses Alt+Tab or Win+Tab while a banner is showing.",
+    "fix_assessment": "Both proposed fixes are weak. `.focusable(false)` only adds WS_EX_NOACTIVATE and leaves WS_EX_APPWINDOW in place, which keeps the window in Alt+Tab. Setting WS_EX_TOOLWINDOW by hand with SetWindowLong is overwritten by tao: window_state.rs apply_diff rewrites GWL_EXSTYLE from its flags on every flag change, including each show()/hide() (VISIBLE). A durable fix gives the window an owner, so tao uses Parent::OwnedBy, which means WS_POPUP and no APPWINDOW. The owner should be a hidden helper window rather than the main window, because owned windows hide when their owner is minimized. The alternative is re-applying TOOLWINDOW and clearing APPWINDOW after every show."
+   }
+  ]
+ },
+ {
+  "id": "ST-19",
+  "title": "Free space of 0 means both \"unknown\" and \"disk completely full\"",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "lib.rs:860",
+   "lib.rs:890-893"
+  ],
+  "claim": "lib.rs:860: `disk::free_bytes(...).unwrap_or(0)`, and `guard_recording_room` returns early when it reads 0 (lib.rs:890-893). A failed free-space query and a completely full disk are indistinguishable, and the room guard is off exactly at 0.",
+  "scenario": "A recording can start on a full disk, and the recording-room guard does nothing once free space reaches 0.",
+  "fix": "A separate \"known\" flag, or `u64::MAX` as the sentinel.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/src/lib.rs:860 `let free = disk::free_bytes(std::path::Path::new(&dir)).unwrap_or(0);`. lib.rs:890-893 `let free = state.free_bytes.load(..); if free == 0 { return; }`. state.rs:983-984 (start guard) `if free != 0 && free < crate::RECORDING_MIN_START_BYTES { return Err(..) }`, whose comment says \"0 means not known yet\". state.rs:749-751 maps 0 to `None` in the status as well. disk.rs:42 uses `lpFreeBytesAvailableToCaller`, which reads 0 on a full volume or when the user's quota is used up.",
+    "corrected_claim": "Scope: during a recording, the recording alone cannot reach 0 without first passing the `needed + 512 MiB` stop threshold on an earlier 10 s tick (lib.rs:900). So the room guard being off at 0 matters only when something else fills the drive within one tick. The more realistic effect is on starting: with the drive (or the user's quota) already at exactly 0, `start_recording` passes its 2 GiB check (state.rs:984), and the console and status show the free space as unknown instead of 0.",
+    "reachable_by": "A user whose clip drive or disk quota is completely full and who starts a recording; or another program filling the drive to 0 within one 10 s tick during a recording.",
+    "fix_assessment": "Either sentinel works if all three readers change together: lib.rs:890, state.rs:984 and state.rs:749. With `u64::MAX` the existing comparisons stay safe (`free < needed + SPARE` is false), but `2 * needed + ...` must not overflow. That holds, because `needed` is the recording size."
+   }
+  ]
+ },
+ {
+  "id": "ST-20",
+  "title": "A user override in games.json may or may not win, at random",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "game.rs:198-206"
+  ],
+  "claim": "game.rs:198-206: `map.extend(extra)` runs before keys are lowercased. A user key `\"CS2.exe\"` and the built-in `\"cs2.exe\"` then collide in `.collect()`, and HashMap iteration order picks the winner.",
+  "scenario": "A user overrides `\"CS2.exe\"` in games.json; on some runs the built-in `\"cs2.exe\"` entry wins instead.",
+  "fix": "Lowercase the user's keys before `extend`.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "game.rs:187-205: built-in map loaded via serde_json into HashMap<String,String> (RandomState); user file merged with `map.extend(extra);` (game.rs:198) and only afterwards `map.into_iter().map(|(exe, name)| (exe.to_lowercase(), name)).collect()` (game.rs:204-206). All 148 built-in keys are already lower case (checked games.json, e.g. line 2 `\"cs2.exe\": \"Counter-Strike 2\"`), so a user key `\"CS2.exe\"` survives extend as a separate entry, both map to `cs2.exe` in collect, and HashMap's FromIterator/insert keeps whichever comes last in the randomly seeded iteration order. Lookups (resolve_name game.rs:367, is_known_exe game.rs:220) lowercase the exe, so only the collapsed key matters.",
+    "corrected_claim": "",
+    "reachable_by": "A user who writes a games.json override whose key differs only in case from a built-in key (e.g. copying the on-disk exe case from the 'game ... from the list (Exe.exe)' log line at state.rs:616). Lower-case keys as in the README example override correctly; two user keys differing only in case are also resolved at random.",
+    "fix_assessment": "Correct and sufficient: lowercase the built-in and user keys before merging (e.g. insert user entries with `exe.to_lowercase()` after lowercasing the base), so the user entry deterministically wins."
+   }
+  ]
+ },
+ {
+  "id": "ST-21",
+  "title": "Title-derived game name is overwritten on every tick",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "state.rs:671"
+  ],
+  "claim": "state.rs:671 `(Some(_), _) => *held = name.clone()` overwrites a title-derived game name on every tick. Titles that change (\"Loading\", map names) fragment clip folders and spam presence updates.",
+  "scenario": "A game whose window title changes between \"Loading\" and map names has its clips filed into several folders and sends repeated presence updates.",
+  "fix": "Pin the name per PID.",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "state.rs:669-675: `match (&name, now) { (Some(_), _) => *held = name.clone(), ... }` - every tick with a detection replaces the held name; name comes from detect_detailed -> resolve_name, which for an unknown exe in fullscreen returns `clean_title(title)` (game.rs:375-380). The GameTick doc (state.rs:127) promises 'The name to show and to file under, held for the process's life', but nothing pins it per PID. The held name feeds current_game/buffering_game (state.rs:677-682) used by game_for/assigned_game for the clip folder, and friends::set_game (lib.rs:998-999) which, on any name change, resets the 'since' timestamp and calls send_presence (friends.rs:165-175). game.rs:216-218 itself admits 'a title can change from one look to the next'.",
+    "corrected_claim": "Real, with a detail: presence is not spammed every tick - friends::set_game only sends when the name actually differs, so it is one presence message (and a reset of the friend-visible 'since' time) per title change, at most every 2 s. The PID-bound session clock (game_since) is not reset. Only title-derived names (unknown exe, fullscreen) are affected; exes in games.json are stable.",
+    "reachable_by": "Any game not in games.json, running fullscreen/borderless, whose window title changes during play (loading screens, map/server names); clips saved under each title land in separate folders.",
+    "fix_assessment": "Pinning the first title-derived name to the bound (pid, exe) and only replacing it on a PID change, or when the exe is a known one, fixes it; care is needed so an initial junk title like 'Loading' does not get pinned forever."
+   }
+  ]
+ },
+ {
+  "id": "ST-26",
+  "title": "set_config replaces the whole config from the page's copy, reverting repair_screens corrections",
+  "severity": "low",
+  "category": "robustness",
+  "locations": [
+   "commands.rs"
+  ],
+  "claim": "`set_config` replaces the whole config object with the page's copy. A stale settings page reverts `repair_screens`' monitor corrections, because `keep_once_flags` only covers two flags.",
+  "scenario": "`repair_screens` corrects the monitor settings while a settings page is open with an older copy; the next save from that page reverts the correction.",
+  "fix": "Send patch-style updates from the UI.",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "commands.rs:55-84 set_config takes the whole `config: AppConfig`, patches only control.token (65-67), the target fields while recording (71-80) and `keep_once_flags` (82), then `state.replace_config(config)` (85). config.rs:189-192 keep_once_flags only ORs `usage_stats_noticed` and `tray_hint_shown`. lib.rs:472-507 repair_screens writes recording.target_id/target_stable_id, overlay.monitor/monitor_stable_id, console_monitor/_stable_id straight into `state.config` and saves, but emits nothing to the UI. It runs at runtime from watch_monitors (lib.rs:542) and the drift restart (lib.rs:586). UI: store.ts:263 reads the config once, and store.ts:362-367 `patchConfig` sends `{ ...get().config, ...patch }`, the full stale copy. ipc.ts:47 `invoke<void>(\"set_config\")` ignores the returned config. No listener reloads the config (ipc.ts:207-253 has no config event). So the next patchConfig after a screen change writes the old device names back to disk. Also: because next.target_id != previous.target_id, commands.rs:121-128 sees `target_changed && is_buffering()` and restarts the buffer. That throws away the buffered footage and pops a 'Replay buffer running' banner when the user changes an unrelated setting.",
+    "corrected_claim": "",
+    "reachable_by": "Any user who changes a setting in the main window after a monitor change (re-plug, dock, sign-in, resolution change) that made repair_screens rename the device or add a stable id. The main window's store stays alive for the whole session.",
+    "fix_assessment": "Patch-style updates from the UI would fix it. A smaller fix on the core side is to re-run capture::repair / repair_overlay / repair_monitor_choice on the incoming config inside set_config (or carry the repaired fields over when the stable id matches), or to emit the repaired config so the store reloads."
+   }
+  ]
+ },
+ {
+  "id": "ST-27",
+  "title": "Tray buffer CheckMenuItem stays checked after a failed start",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "tray.rs:345-357"
+  ],
+  "claim": "The tray's CheckMenuItem is toggled automatically by the menu library when clicked. After a failed start it stays checked, because `refresh` only calls `set_checked` when `buffer_active` changes (tray.rs:345-357).",
+  "scenario": "The user clicks the tray buffer item, the start fails, and the item remains checked although the buffer is off.",
+  "fix": "No explicit fix in the report (implied: re-sync the checked state after each click regardless of whether `buffer_active` changed).",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "muda-0.19.3 src/platform_impl/windows/mod.rs:1194-1197 menu_selected: `MenuItemType::Check => { let checked = !item.checked; item.set_checked(checked); }`, reached through WM_COMMAND in menu_subclass_proc (mod.rs:1124-1140), which tray-icon-0.24.2 attaches to its window (platform_impl/windows/mod.rs:159,206) before TrackPopupMenu (546). tray.rs:111-114 'toggle' only spawns toggle_buffer_and_notify. lib.rs:345-367 on Err only notifies, plays a sound and shows a banner; status.buffer_active stays false (it is only written at state.rs:474/519/545/563). tray.rs:344-356 `if was_active != status.buffer_active { ... handles.toggle.set_checked(status.buffer_active) }`: with false==false it never runs, and set_checked has no other caller. So the item stays checked while the buffer is off, until the next real buffer transition. The next click unchecks it and retries the start.",
+    "corrected_claim": "",
+    "reachable_by": "A user clicking 'Replay buffer running' in the tray menu while the start fails (ffmpeg missing per state.rs:486-491, Pipeline::start error, etc.).",
+    "fix_assessment": "Calling handles.toggle.set_checked(status.buffer_active) on every refresh, outside the was_active guard (cheap), or re-syncing right after toggle_buffer_and_notify returns, fixes it."
+   }
+  ]
+ },
+ {
+  "id": "ST-34",
+  "title": "Stale comments",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "state.rs",
+   "tray.rs",
+   "lib.rs",
+   "src-tauri/src/state.rs:26-27"
+  ],
+  "claim": "Stale comments: the `shared` field doc says `save_clip` holds `pipeline` across ffmpeg; \"stopping waits for a save in progress\"; the console hotkey thread comment; tray.rs \"several times a second\"; \"Reassign the two global hotkeys\" (there are five).",
+  "scenario": "Maintainers trust the comments (e.g. that stopping waits for a save, or which thread a hotkey runs on) and introduce concurrency bugs.",
+  "fix": "No explicit fix in the report (implied: update or remove the stale comments).",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "VP-32",
+    "slice": "03-video-pipeline",
+    "title": "Stale doc comment about save_clip holding pipeline across ffmpeg",
+    "claim": "The doc at state.rs:26-27 says save_clip holds `pipeline` across the ffmpeg run, which is no longer true.",
+    "locations": [
+     "src-tauri/src/state.rs:26-27"
+    ],
+    "fix": "Not given explicitly in the report (implied: update the doc)."
+   }
+  ],
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "(1) state.rs:26-27 `save_clip() holds pipeline across the whole seal and ffmpeg run` vs state.rs:818-834 `Grab everything under a short lock and release it again right away ... There is no sealing step any more` - the lock covers only `pipeline.snapshot(seconds)`, muxer::build at :852 runs unlocked. (2) commands.rs:340-341, lib.rs:579, lib.rs:658 `stopping waits, if need be, for a save in progress` vs state.rs:533-567 stop_pipeline/halt_pipeline never consult `saving`; they can only contend with the brief snapshot lock. (3) lib.rs:783-784 `Showing a window belongs on the main thread; the hotkey arrives on one of its own` vs global-hotkey-0.8.0/src/platform_impl/windows/mod.rs:152-156 (Pressed is sent from `global_hotkey_proc`, the wndproc of a hidden window created in tauri-plugin-global-shortcut-2.3.2/src/lib.rs:399 plugin setup, i.e. dispatched on the main thread; only Released comes from a spawned thread). (4) tray.rs:233-235 `in RGB mode a new one comes several times a second` vs src/lib/accent.ts:135-145 (icon sent only when the accent itself changes, debounced) and tint.rs:13-15 `It stands still`. (5) commands.rs:162 `Reassign the two global hotkeys.` while set_hotkeys takes save_clip, toggle_buffer, screenshot, record, console (five).",
+    "corrected_claim": "All five stale comments exist. Exact places: state.rs:26-27; commands.rs:340-341, lib.rs:579 and lib.rs:658 (stopping only waits for the short snapshot copy, not for muxing); lib.rs:783-784 (the Pressed callback already runs on the main thread on Windows); tray.rs:233-235; commands.rs:162.",
+    "reachable_by": "Maintainers reading the comments; no runtime effect by itself.",
+    "fix_assessment": "Update the comments. The hotkey-thread one matters most, because the toggle-buffer hotkey (lib.rs:812-814) calls toggle_buffer_and_notify inline, and the 'own thread' belief hides that this blocks the main thread."
+   }
+  ]
+ },
+ {
+  "id": "ST-36",
+  "title": "Missing tests for fullscreen heuristic, games.json merge and AutoBuffer automation",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [
+   "game.rs",
+   "state.rs"
+  ],
+  "claim": "game.rs's naming tests are meaningful, but there are no tests for the fullscreen heuristic, the games.json merge, or `AutoBuffer::poll`, `poll_always` and the manual-action interplay, which is exactly where the retry-storm (ST-3), Stream Deck bypass (ST-5) and alt-tab suppression (ST-9) bugs sit. Only `poll_lock` and `assigned_game` are tested.",
+  "scenario": "Regressions in the buffer automation and game detection logic go unnoticed because the logic has no tests.",
+  "fix": "No explicit fix in the report (implied: add tests for these areas; make `track_game` pure to enable it).",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "state.rs tests (1263-1381) call only `assigned_game` and `poll_lock`. `manual_start`/`manual_stop` show up only in the poll_lock test at :1345-1352. No test anywhere calls `poll(` or `poll_always` (grep: only lib.rs:647/649 call them), although both are pure atomics logic (state.rs:184-209, 246-253). game.rs: `covers_monitor` (game.rs:438-459) is Win32-only and untested. The games.json overlay/merge (game.rs:184-206: user file `map.extend(extra)` then lowercasing) is only touched by `the_builtin_list_parses` (game.rs:752-755), which checks the built-in list, not the merge. `track_game` (state.rs:604) has no test, and there is no src-tauri/tests dir.",
+    "corrected_claim": "Accurate, with two nuances: the effect of the fullscreen flag on naming is tested (game.rs:613 `unknown_app_counts_only_in_fullscreen`); what is untested is the covers_monitor geometry. ST-5 (the Stream Deck path bypasses manual_start/stop) sits in control.rs routing and would not be caught by AutoBuffer unit tests alone.",
+    "reachable_by": "Developers changing the automation or detection code; regressions ship unnoticed.",
+    "fix_assessment": "Tests for poll/poll_always plus manual_* are easy now, since the code is pure. covers_monitor and the games.json merge need small refactors first (a pure rect-compare helper, a merge function taking two maps)."
+   }
+  ]
+ },
+ {
+  "id": "ST-24",
+  "title": "from_exe does not trim an upper-case \".EXE\" suffix",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "game.rs"
+  ],
+  "claim": "`from_exe` does not trim \".EXE\" in upper case when deriving a name from the executable.",
+  "scenario": "An executable named e.g. `GAME.EXE` yields a name that still carries the \".EXE\" suffix.",
+  "fix": "No explicit fix in the report (implied: trim the extension case-insensitively).",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "game.rs:343-344: `fn from_exe(exe: &str) -> String { let stem = exe.trim_end_matches(\".exe\").replace(['_', '-'], \" \"); ...` - str::trim_end_matches with a &str pattern is case-sensitive, so `GAME.EXE` keeps its suffix and the capitalisation pass returns `GAME.EXE`. The exe comes straight from the on-disk image name (game.rs:420-421), not lowercased. from_exe is used when `clean_title(title)` is empty (game.rs:376-380), after the fullscreen and is_foreign_title checks (is_foreign_title returns false for an empty title, game.rs:225-228).",
+    "corrected_claim": "Correct, but narrow: it only matters for an unknown exe (not in games.json) running fullscreen whose window title is empty or cleans down to empty, and whose file name has an upper- or mixed-case extension.",
+    "reachable_by": "A fullscreen game not in the list with an empty/blank window title and an exe named like `GAME.EXE` or `Game.Exe`.",
+    "fix_assessment": "Strip the extension case-insensitively (e.g. check `exe.len() >= 4 && exe[exe.len()-4..].eq_ignore_ascii_case(\".exe\")`, or use Path::file_stem). Trivial and correct."
+   }
+  ]
+ },
+ {
+  "id": "ST-32",
+  "title": "lib.rs is 1385 lines",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "lib.rs"
+  ],
+  "claim": "lib.rs is 1385 lines and mixes notify/actions, hotkeys, the status loop and setup.",
+  "scenario": "Maintainability: unrelated concerns in one file make concurrency rules (e.g. which code runs on the main thread) hard to see.",
+  "fix": "Split into notify/actions, hotkeys, status loop and setup modules.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "`wc -l src-tauri/src/lib.rs` = 1385. Top-level items: notify/actions (lib.rs:57 `notify`, :105 `save_clip_and_notify`, :157 `take_screenshot_and_notify`, :201-437 recording/buffer *_and_notify), automation/screen watching (:472 `repair_screens`, :518 `watch_monitors`, :559 `watch_screen`, :630 `apply_auto_buffer`), autostart (:693-698), hotkeys (:722 `parse_hotkey`, :738 `register_hotkeys`), the status loop (:928 `spawn_ui_updates`, ~165 lines), clip-dir scope (:1095, :1105), window handling (:1124 `hide_to_tray`) and setup (:1152 `pub fn run()`, ~230 lines), plus the 40 `pub mod` lines.",
+    "corrected_claim": "",
+    "reachable_by": "Maintainers only; no runtime effect.",
+    "fix_assessment": "Splitting into actions/hotkeys/status-loop/setup modules is a reasonable, purely mechanical refactor; it does not by itself fix any bug and should not be bundled with behavioural fixes."
+   }
+  ]
+ },
+ {
+  "id": "ST-35",
+  "title": "German text mixed into an English codebase, including user-facing log lines",
+  "severity": "low",
+  "category": "quality",
+  "locations": [],
+  "claim": "German is mixed into an English codebase, including user-facing log lines: \"Overlay bleibt klickbar\", \"Unbekannter Tray-Eintrag\", \"Pegel:\", \"blieb liegen\", \"Taktgeber\", \"Mischer\".",
+  "scenario": "Users and contributors reading logs see untranslated German messages.",
+  "fix": "No explicit fix in the report (implied: translate to English).",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "overlay.rs:195 `log::warn!(\"Overlay bleibt klickbar: {err}\")`; tray.rs:150 `log::warn!(\"Unbekannter Tray-Eintrag: {other}\")`; lib.rs:978 `log::info!(\"Pegel: {}\", ...)`; commands.rs:762 `log::warn!(\"Clip '{id}' blieb liegen: {err}\")`; pipeline.rs:712 `.map_err(|err| format!(\"Taktgeber: {err}\"))?` and :722 `format!(\"Mischer: {err}\")`. German doc comments too, e.g. lib.rs:858-862 (`Wie viel auf dem Clip-Laufwerk frei ist`), state.rs:1290 test comment, src/routes/AudioMixer.tsx:124/599, src/console/Audio.tsx:13-17.",
+    "corrected_claim": "The strings are as listed. 'User-facing' is a stretch for four of them: they go to the log file (logging.rs:19-24), which testers send in. Only Taktgeber/Mischer can reach the UI: they propagate Pipeline::start -> start_pipeline -> start_buffer_and_notify (lib.rs:367-371, notify + error banner), and only if thread spawning fails.",
+    "reachable_by": "Anyone reading clippiboy.log; the two pipeline strings appear in a toast/banner only if OS thread creation fails.",
+    "fix_assessment": "Translating the six strings and the German comments is trivial and safe; nothing parses these strings."
+   }
+  ]
+ },
+ {
+  "id": "ST-37",
+  "title": "SourceKind::Leftovers has no TypeScript counterpart",
+  "severity": "info",
+  "category": "quality",
+  "locations": [
+   "model.rs",
+   "src/lib/types.ts"
+  ],
+  "claim": "`SourceKind::Leftovers` in model.rs has no counterpart in src/lib/types.ts; it is only read and is migrated at load.",
+  "scenario": "None expected today (the variant is migrated at load); a note on type parity.",
+  "fix": "None proposed.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "model.rs:35-46 `#[serde(tag = \"type\", rename_all = \"camelCase\")] pub enum SourceKind { Game, /// Only ever **read**, never written ... Leftovers, OutputDevice..., InputDevice..., Process...}`; src/lib/types.ts:19-31 union has only game/outputDevice/inputDevice/process. config.rs:151-164 load() runs `migrate_sources`, which rewrites Leftovers to `OutputDevice { device_id: \"\" }` (config.rs:119-145). The only other `SourceKind::Leftovers` construction is in a test (config.rs:272). Backend consumers still handle it defensively (audio/engine.rs:47, audio/capture.rs:520, audio/mod.rs:180,333).",
+    "corrected_claim": "",
+    "reachable_by": "Nobody in practice: a config with the old kind is migrated at load before the UI can see it, and the UI never sends it.",
+    "fix_assessment": "Nothing needed; the backend-only variant is intentional for backward-compatible deserialization. At most, add a comment in types.ts."
+   }
+  ]
+ },
+ {
+  "id": "ST-38",
+  "title": "Banner.avatar and corner are always sent but optional in TS",
+  "severity": "info",
+  "category": "quality",
+  "locations": [
+   "model.rs",
+   "src/lib/types.ts"
+  ],
+  "claim": "`Banner.avatar` and `corner` are always sent by Rust but typed as optional in src/lib/types.ts.",
+  "scenario": "None expected; the TS type is looser than the data actually sent.",
+  "fix": "None proposed.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/src/overlay.rs:110-123 `#[derive(Clone, serde::Serialize)] #[serde(rename_all = \"camelCase\")] pub struct Banner { ... pub avatar: Option<String>, ... pub corner: OverlayCorner, }`. There is no skip_serializing_if, so `avatar` always goes out (null when None) and `corner` always goes out (model.rs:217-224, OverlayCorner, camelCase). The only emitter is overlay.rs:438 `window.emit(\"overlay-banner\", banner)`. TS src/lib/types.ts:557-559 `avatar?: string | null; corner?: \"topLeft\" | ...`. The consumer src/overlay/Overlay.tsx:290 `banner.corner ?? \"topRight\"` is a fallback that can never fire.",
+    "corrected_claim": "The claim is right, but the struct is `Banner` in src-tauri/src/overlay.rs:112, not in model.rs. Only the `OverlayCorner` enum is in model.rs:219. The TS `corner` field also writes out the literal union again instead of reusing `OverlayCorner` (types.ts:140).",
+    "reachable_by": "Nothing can trigger it. This is a type-precision nit: the TS type is looser than what Rust actually sends, and there is no behaviour change at runtime.",
+    "fix_assessment": "No fix was proposed. Optionally make both fields required (`avatar: string | null; corner: OverlayCorner`) and drop the dead `?? \"topRight\"` fallback in Overlay.tsx:290."
+   }
+  ]
+ },
+ {
+  "id": "ST-39",
+  "title": "UpdateProgress.finished exists only in TS",
+  "severity": "info",
+  "category": "quality",
+  "locations": [
+   "src/lib/types.ts"
+  ],
+  "claim": "`UpdateProgress.finished` exists only in TS, and is handled with `Omit<…>`.",
+  "scenario": "None expected; handled via `Omit<…>`.",
+  "fix": "None proposed.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/src/updater.rs:44-50 `pub struct UpdateProgress { pub downloaded: u64, pub total: Option<u64>, }` has no `finished` field. TS src/lib/types.ts:579-585 adds `finished: boolean`. src/lib/ipc.ts:227-231 `listen<Omit<UpdateProgress, \"finished\">>(\"update-progress\", ...)`. src/store.ts:322-330 sets `finished: false` on every progress event and `finished: true` on `update-downloaded` (emitted at updater.rs:137). It is read in src/components/UpdateProgress.tsx:8,20.",
+    "corrected_claim": "",
+    "reachable_by": "Nothing can trigger it. `finished` is UI-side state put together from two events, and the IPC wrapper types it correctly.",
+    "fix_assessment": "No fix is needed. The `Omit<>` at the IPC edge keeps the wire type correct; a separate UI-only type could document it more clearly, but that is cosmetic."
+   }
+  ]
+ },
+ {
+  "id": "ST-23",
+  "title": "UWP games behind applicationframehost.exe are never detected",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "game.rs"
+  ],
+  "claim": "UWP games run behind `applicationframehost.exe`, which game detection ignores, so UWP games are never detected.",
+  "scenario": "A UWP/Microsoft Store game in the foreground is never detected as a game.",
+  "fix": "No explicit fix in the report (see the Xbox Game Bar / full-path detection proposals).",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "game.rs:15-20: IGNORED contains `\"applicationframehost.exe\"`; resolve_name returns None for ignored exes before any games.json lookup (game.rs:363-365: `if exe.is_empty() || is_ignored(exe) { return None; }`), and win::foreground (game.rs:476-489) only looks at GetForegroundWindow's own PID - there is no descent into the hosted Windows.UI.Core.CoreWindow child to find the real app process. So any game whose foreground window is owned by ApplicationFrameHost.exe yields no detection, and the user cannot fix it via games.json either.",
+    "corrected_claim": "The mechanism is real but 'UWP games are never detected' overstates the scope. Only true UWP/CoreWindow apps whose top-level frame is hosted by ApplicationFrameHost are affected; most current Microsoft Store / Game Pass games are MSIX-packaged Win32 (GDK) titles with their own HWND, and they are detected normally. Whether a fullscreen CoreWindow game is still fronted by ApplicationFrameHost is Windows runtime behaviour that cannot be checked here.",
+    "reachable_by": "A user playing a genuine UWP (CoreWindow) game whose foreground window is the ApplicationFrameHost frame.",
+    "fix_assessment": "When the foreground exe is applicationframehost.exe, enumerate child windows (EnumChildWindows) for one owned by a different PID and use that process instead; keep the frame host itself ignored."
+   }
+  ]
+ },
+ {
+  "id": "ST-31",
+  "title": "AppState is a god object with fragmented game-tracking locks and two sources of truth for capture state",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "state.rs:859",
+   "state.rs:941",
+   "state.rs:1123"
+  ],
+  "claim": "AppState mixes config persistence, capture lifecycle, game tracking, automation, file naming, and building `Clip` (written out three times: state.rs:859, 941, 1123); `now_ms` is duplicated. Seven game-tracking mutexes are always updated together, which forces a \"one lock at a time\" dance, and `game_for` reads three locks separately and can get an inconsistent picture. `status.buffer_active` and `is_buffering()` are two sources of truth for capture state. `track_game` is not a pure, testable function.",
+  "scenario": "`game_for` reads three separate game-tracking locks and can observe an inconsistent combination while another thread updates them; capture state can disagree between `status.buffer_active` and `is_buffering()`.",
+  "fix": "Make the seven game-tracking mutexes one `Mutex<GameTracker>`; move pipeline, recorder, buffer_wanted, active_recording and `lifecycle` into a `CaptureController` with a single state enum; make `track_game` a pure, testable function.",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "state.rs:18-105 AppState holds config, library, status, audio, pipeline, shared, the game fields, automation (`auto`), recorder, lifecycle and so on. Seven game mutexes: current_game(30), bound_game(37), game_since(44), game_pid(57), logged_game(60), buffering_game(73), game_ended(76). Clip literals at state.rs:859, 941 and 1123. 859 and 941 inline the same SystemTime->ms code as `fn now_ms` at state.rs:1205, and now_ms is also defined in share.rs:1209, links.rs:190, friends.rs:805 and overlay.rs:536. game_for (state.rs:589-594, 'One lock at a time, see `launch_pipeline`') reads current_game, buffering_game and game_ended under separate locks. track_game writes them in another order (current -> game_ended=None -> buffering, state.rs:678-682). An interleave R(current)=None, W(current), R(buffering)=old P, W(ended)=None, R(ended)=None gives assigned_game(P, None, None) = P (state.rs:1190-1203), a stale game label. is_buffering() = `pipeline.is_some() && buffer_wanted` (state.rs:428-430) vs status.buffer_active (state.rs:474/519/545/563). They briefly disagree inside launch_pipeline (buffer_wanted stored at 507-508, status set at 519) and start_pipeline (464 vs 474), because readers do not take `lifecycle`. track_game calls detect_detailed, still_running, foreground_is_ours and config_snapshot, so it is not pure (assigned_game already is).",
+    "corrected_claim": "The structural criticism holds. Two details are overstated. First, the seven game mutexes are not 'always updated together': game_pid, logged_game and bound_game are each touched alone, and buffering_game is also written by start_pipeline/launch_pipeline (state.rs:473, 516). Second, the inconsistency only shows up in a nanosecond-wide race between a save and the 1-second status tick at the moment a game switches, and can at worst put the previous game's name on a clip. The buffer_active / is_buffering split only disagrees transiently while a start/stop is in progress, not persistently.",
+    "reachable_by": "Maintainers (design/refactor debt). Runtime effect needs a clip/screenshot save racing the status tick during a game change.",
+    "fix_assessment": "One Mutex<GameTracker> (with track_game split into a pure transition over detected state plus a thin I/O shell) and a single capture-state enum are sound. A shared Clip constructor and a single now_ms util are cheap wins."
+   }
+  ]
+ },
+ {
+  "id": "ST-28",
+  "title": "Stream Deck \"stop\" while the buffer is already off still announces \"Replay buffer stopped\"",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "control.rs"
+  ],
+  "claim": "A Stream Deck \"stop\" while the buffer is already off still plays \"Replay buffer stopped\" with sound and banner (stop is not idempotent / does not check current state).",
+  "scenario": "The buffer is off; pressing Stream Deck stop plays the stop sound and shows the \"Replay buffer stopped\" banner anyway.",
+  "fix": "No explicit fix in the report (implied: idempotent `set_buffer(on)` as in the capture state machine proposal).",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "control.rs:223-227 `\"stop\" => crate::stop_buffer_and_notify(app)` with no state check. lib.rs:437-443 stop_buffer_and_notify always does stop_pipeline, then `notify(app, \"ok\", \"Replay buffer stopped\")`, sounds::play(BufferOff) and `overlay::show(app, BannerKind::BufferOff, \"Replay buffer off\", None)`. state.rs:533-567 stop_pipeline is otherwise harmless when already off. But the shipped Stream Deck plugin never sends 'stop': streamdeck/src/actions/toggle-buffer.ts:17 `this.press(ev.action, \"/v1/buffer\", { action: \"toggle\" })`, and toggle (lib.rs:333-342) checks buffer_active first. 'start' has the same problem: start_pipeline returns Ok early when a pipeline exists (state.rs:461-477), and start_buffer_and_notify then announces 'Replay buffer running' again with sound and banner.",
+    "corrected_claim": "Only a direct control-port client that POSTs {\"action\":\"stop\"} to /v1/buffer with the token gets a false 'Replay buffer stopped' toast, the BufferOff sound and a 'Replay buffer off' banner (not 'Replay buffer stopped') while the buffer is already off. The ClippiBoy Stream Deck plugin only sends 'toggle', so it cannot trigger this. 'start' while the buffer runs has the same non-idempotent announcement.",
+    "reachable_by": "Third-party scripts or integrations using the documented local control port (/v1/buffer) with the token. Not the bundled Stream Deck plugin.",
+    "fix_assessment": "In control.rs, check status.buffer_active before 'start'/'stop' (as /v1/recording already does at control.rs:252-258) and skip the notify when it is already in the requested state."
+   }
+  ]
+ },
+ {
+  "id": "ST-22",
+  "title": "exe_name uses a MAX_PATH buffer, so games at longer paths are never detected",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "game.rs:408"
+  ],
+  "claim": "`exe_name` uses a MAX_PATH-sized buffer (game.rs:408), so executables with longer paths are never detected.",
+  "scenario": "A game installed under a path longer than MAX_PATH is never detected as a game.",
+  "fix": "No explicit fix in the report (implied: support paths longer than MAX_PATH).",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "unverified",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "unverifiable",
+    "severity_suggestion": "info",
+    "evidence": "game.rs:407-421: `let mut buf = [0u16; MAX_PATH as usize]; let mut len = buf.len() as u32; let result = QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len); ... result.ok()?;` - a failed call returns None, and foreground() (game.rs:488) does `let exe = exe_name(pid)?;`, so detection yields None; still_running (game.rs:513) also relies on exe_name. The code half of the claim is true: a path of 260+ UTF-16 units does not fit and there is no retry with a larger buffer.",
+    "corrected_claim": "The code does use a fixed 260-unit buffer and silently gives up on failure. Whether this ever happens depends on Windows: it requires that a game executable can actually be launched from a Win32 path of >= 260 characters (long-path opt-in, and CreateProcess/working-directory limits allowing it) and that QueryFullProcessImageNameW then fails with ERROR_INSUFFICIENT_BUFFER rather than truncating (Microsoft documents the failure). Neither can be checked from source; in practice launchers like Steam run games with the install folder as working directory, which itself is MAX_PATH-limited, so the case is very rare.",
+    "reachable_by": "Only a game process whose full image path is >= 260 characters on a long-path-enabled Windows system.",
+    "fix_assessment": "Retrying with a larger buffer (e.g. 32768 units) on ERROR_INSUFFICIENT_BUFFER is cheap and harmless, but the benefit is marginal."
+   }
+  ]
+ },
+ {
+  "id": "ST-30",
+  "title": "tao's set_focus can inject a synthetic Alt press via SendInput",
+  "severity": "low",
+  "category": "robustness",
+  "locations": [
+   "tao 0.35.3 (dependency): set_focus"
+  ],
+  "claim": "tao's `set_focus` falls back to injecting a synthetic Alt press via `SendInput` when `SetForegroundWindow` fails, which some anti-cheats flag (speculative).",
+  "scenario": "The app focuses one of its windows while a game with anti-cheat runs; `SetForegroundWindow` fails, tao injects a synthetic Alt key press, and the anti-cheat flags it.",
+  "fix": "No explicit fix in the report.",
+  "reported_confidence": "speculative",
+  "slice": "07-state-concurrency",
+  "status": "unverified",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "unverifiable",
+    "severity_suggestion": "info",
+    "evidence": "tao-0.35.3 src/platform_impl/windows/window.rs:175-186 set_focus calls `force_window_active(window.0)` when the window is visible, not minimized and not foreground. window.rs:1500-1527: `if SetForegroundWindow(handle).as_bool() { return; }`, then two KEYEVENTF_EXTENDEDKEY VK_LMENU inputs (down/up), `SendInput(&inputs, ...)`, then SetForegroundWindow again. Its comment even says 'We only call this function in the window creation', which set_focus contradicts. tauri-runtime-wry-2.11.4 lib.rs:3559-3561 routes WindowMessage::SetFocus to tao's set_focus. App callers: console.rs:187 (console hotkey over a game), tray.rs:288 show_main_window (tray click/menu, the single-instance second start at lib.rs:1167, show_clip_in_app at commands.rs:840). The hotkey arrives via RegisterHotKey (global-hotkey-0.8.0 windows/mod.rs:96). tauri-plugin-single-instance-2.4.4 sends WM_COPYDATA without AllowSetForegroundWindow.",
+    "corrected_claim": "The mechanism is as claimed: tao's set_focus injects a synthetic left-Alt down/up through SendInput whenever the first SetForegroundWindow fails. Whether that happens in practice depends on Windows' foreground-lock rules, which cannot be checked here. The console hotkey path normally owns foreground rights after WM_HOTKEY; the single-instance and tray paths may not. Whether any anti-cheat flags a single injected Alt tap is speculation. The injected Alt also goes to the current foreground window (possibly the game).",
+    "reachable_by": "Console hotkey while in a game, tray open/left-click, a second launch of the exe, the console's 'show in app'. Only when Windows refuses the first SetForegroundWindow.",
+    "fix_assessment": "There is no app-level switch in tao. Avoiding the fallback would mean calling SetForegroundWindow (or AllowSetForegroundWindow from the second instance) directly instead of window.set_focus() on the hot paths, or patching tao. Worth doing only if a real anti-cheat report surfaces."
+   }
+  ]
+ },
+ {
+  "id": "ST-4",
+  "title": "Starting a second instance rotates and destroys the running instance's log",
+  "severity": "high",
+  "category": "bug",
+  "locations": [
+   "lib.rs:1153",
+   "lib.rs:1185",
+   "logging.rs:59-63"
+  ],
+  "claim": "lib.rs:1153: `logging::init()` runs before `.plugin(tauri_plugin_single_instance…)`. Plugin setup only runs at `.build()`, and `.manage(AppState::new())` (lib.rs:1185) is also evaluated eagerly before that. `rotate()` (logging.rs:59-63) renames the live `clippiboy.log` over `clippiboy.log.1`, destroying the previous session's log, then creates a new file. Rust opens files with share-delete, so the rename succeeds while the first instance has the log open. The second instance also loads config, enumerates MFT encoders (`encode::resolve`), runs SQLite migrations with no busy_timeout against the live database, and starts audio streams before it exits. Report severity: Medium-High.",
+  "scenario": "Every relaunch from the Start menu while the app sits in the tray, and every `clippiboy://` deep link (each Discord sign-in), leaves a 5-line stub as `clippiboy.log`. The live log moves to `.log.1` and the previous session's log is gone.",
+  "fix": "Do the single-instance check first (a named mutex in `main()` before `logging::init`, or a lazy `AppState`), and rotate only once this is known to be the primary instance.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "not-verified",
+  "final_severity": "high",
+  "votes": []
+ },
+ {
+  "id": "ST-10",
+  "title": "Duplicate start/stop actions while one is still in progress (decisions taken outside lifecycle)",
+  "severity": "medium",
+  "category": "robustness",
+  "locations": [
+   "lib.rs:660",
+   "lib.rs:335",
+   "commands.rs:326-348",
+   "state.rs"
+  ],
+  "claim": "`buffer_active` only becomes true at the end of `launch_pipeline`, so any 2 s automation tick during a slow start (cold boot, or `Pipeline::start` taking up to 10 s) spawns another Start (lib.rs:660). That thread waits on `lifecycle`, sees the pipeline running and returns Ok, producing a second \"Replay buffer running\" toast, sound and banner, plus another device enumeration. `toggle_buffer_and_notify` (lib.rs:335) and the `start_buffer`/`stop_buffer` commands also decide outside the lock; both commands are implemented as toggles (commands.rs:326-348), so a race can act in the wrong direction. `AutoBuffer` is five separate atomics, so `manual_stop` can tear against `poll` between its load of `suppressed` and its store to `started`.",
+  "scenario": "At boot, `start_buffer_if_configured` and the first `poll_always` both start the buffer, giving duplicate toast/sound/banner and an extra device enumeration; a race on the toggle-implemented `start_buffer`/`stop_buffer` commands can turn the buffer the wrong way.",
+  "fix": "An \"in-flight\" flag or `lifecycle.try_lock()` in `apply_auto_buffer`; an idempotent `set_buffer(on)` checked under `lifecycle`; `AutoBuffer` as one `Mutex<AutoState>`.",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ST-11",
+  "title": "Game detection treats maximized windows as fullscreen games",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "game.rs:453-456"
+  ],
+  "claim": "game.rs:453-456 checks `rect.left <= screen.left && rect.top <= screen.top && rect.right >= screen.right && rect.bottom >= screen.bottom` against `rcMonitor`. A maximized framed window's `GetWindowRect` hangs about 8 px past the work area on every side. On a monitor with no taskbar (common on secondary screens) or with an auto-hide taskbar, the work area is the whole monitor, so any maximized unknown app counts as a fullscreen game (blender.exe, photoshop.exe, unity.exe, mstsc.exe, …).",
+  "scenario": "In only-in-game mode, a maximized app on a monitor without a taskbar starts the buffer, game audio binds to that app, and clips are filed under its title.",
+  "fix": "Require `!IsZoomed(hwnd)` and no `WS_CAPTION`/`WS_THICKFRAME`, or use `SHQueryUserNotificationState` (QUNS_BUSY or D3D fullscreen).",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ST-12",
+  "title": "Heavy sync Tauri commands block the UI thread",
+  "severity": "medium",
+  "category": "perf",
+  "locations": [
+   "commands.rs:117-121",
+   "commands.rs",
+   "src-tauri/src/clipboard.rs:42-47",
+   "src-tauri/src/commands.rs"
+  ],
+  "claim": "These commands are sync, so they run on the main thread: `set_config` (stops and restarts the pipeline on a source change, commands.rs:117-121), `list_encoders` (MFT enumeration), `list_capture_targets` (EnumWindows + QueryDisplayConfig), `list_audio_devices` and `list_audio_processes` (COM). `file_clip` holds the library lock across `filing::place`, whose rename retries sleep up to 600 ms in total. `delete_clip` does file I/O; `set_clip_dir` writes a probe file, which can stall on a network path.",
+  "scenario": "Changing the capture source in settings, or pointing the clip directory at a slow network path, freezes all windows, the tray and hotkeys while the command runs on the main thread.",
+  "fix": "`#[tauri::command(async)]` for all of these.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "LS-9",
+    "slice": "05-local-surface",
+    "title": "Other sync commands do blocking IO, COM/MFT enumeration and retry sleeps on the main thread",
+    "claim": "These sync commands block the event-loop thread: `set_clip_dir` (create and write on what may be a network path); `list_audio_devices`, `list_audio_processes`, `list_capture_targets` and `list_encoders` (COM and MFT enumeration); `copy_clip_file` and `clipboard_*` (up to about 0.5 s of retry sleeps, clipboard.rs:42-47); `open_clip` (ShellExecute); `delete_clip` (`remove_dir_all` plus full library scans); `regenerate_control_token`.",
+    "locations": [
+     "src-tauri/src/clipboard.rs:42-47",
+     "src-tauri/src/commands.rs"
+    ],
+    "fix": "Mark these commands `#[tauri::command(async)]` or use `spawn_blocking`."
+   },
+   {
+    "id": "AU-36",
+    "slice": "04-audio-edit",
+    "title": "`list_audio_devices`/`list_audio_processes` are synchronous Tauri commands doing COM work on the main thread",
+    "claim": "`list_audio_devices` and `list_audio_processes` are synchronous Tauri commands, so their COM work runs on the main thread.",
+    "locations": [
+     "src-tauri/src/commands.rs"
+    ],
+    "fix": "No explicit fix given; implied: make them async commands."
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ST-13",
+  "title": "Status loop mixes 20 Hz UI work with slow polling, and polling is costly",
+  "severity": "medium",
+  "category": "perf",
+  "locations": [
+   "lib.rs:928",
+   "lib.rs:946",
+   "lib.rs:963"
+  ],
+  "claim": "The status thread (`spawn_ui_updates`, lib.rs:928) runs one 50 ms loop forever (no stop flag, no join) that mixes 20 Hz UI work with slow polling, so any stall freezes the meters, game detection and the automation together (e.g. `refresh_free_bytes` on a dead network drive, or COM `list_devices` on a bad audio driver). Per 2 s tick: `QueryDisplayConfig` twice (watch_monitors, screen_drift) — frequent display-config polling is a reported cause of periodic stutter on some drivers (speculative); `OpenInputDesktop` three times; endpoint enumeration plus property stores; a freshly spawned thread doing a Toolhelp snapshot with one String per process, plus audio session enumeration; foreground detection with a second `OpenProcess` in `foreground_is_ours`. Per 50 ms: `config_snapshot().sources` clones the whole `AppConfig` (lib.rs:946), and `std::env::var(\"CLIPPIBOY_LOG_LEVELS\")` is looked up (lib.rs:963).",
+  "scenario": "`refresh_free_bytes` stalls on a dead network drive (or COM `list_devices` on a bad audio driver), freezing the audio meters, game detection and buffer automation at once; the continuous polling adds per-tick cost during gameplay.",
+  "fix": "Separate threads for meters and monitoring; an `Arc<AppConfig>` swapped on change; event-driven sources (see proposals).",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ST-14",
+  "title": "Two stop requests for one recording produce a spurious \"Recording failed\" banner",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "lib.rs:1043-1048"
+  ],
+  "claim": "lib.rs:1043-1048 spawns `stop_recording_and_notify` every second while `recording_failure()` is Some, with no guard; only `guard_recording_room` uses `STOPPING`. Both conditions fire together when the disk fills. The losing thread returns \"No recording is running.\" and plays an error sound and banner on top of \"Saving recording…\". Report severity: Low-Medium; likely in the disk-full case.",
+  "scenario": "The disk fills during a recording: the failure path and the room guard both request a stop, and the user gets an error sound and banner over the \"Saving recording…\" banner.",
+  "fix": "A shared stopping flag, or make the failure report one-shot.",
+  "reported_confidence": "likely",
+  "slice": "07-state-concurrency",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ST-15",
+  "title": "Alt+F4 on the console destroys it for the rest of the session",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "lib.rs:1276-1280"
+  ],
+  "claim": "lib.rs:1276-1280 only prevents close for the `\"main\"` window. The console takes focus, so Alt+F4 destroys it. After that, `console::open` logs \"console window missing\" until the app restarts. Report severity: Low-Medium; confirmed by Tauri semantics.",
+  "scenario": "The user presses Alt+F4 while the console is focused; the console can no longer be opened until the app restarts.",
+  "fix": "Prevent close for the console and call `console::close`, or recreate it lazily in `open()`.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ST-16",
+  "title": "tint.rs:36 panics on a non-ASCII accent colour (release build aborts on every start)",
+  "severity": "medium",
+  "category": "robustness",
+  "locations": [
+   "tint.rs:36"
+  ],
+  "claim": "tint.rs:36: `u8::from_str_radix(&hex[at..at + 2], 16)` runs after a byte-length check only, so the byte slice can split a multi-byte character and panic; `\"#€ab1\"` passes the check and panics (confirmed by test). `config::load` does not call `clean_accent` (only `set_config` does), so a bad value from config.json reaches `tray::build`. Release builds abort on panic. Report severity: Low-Medium.",
+  "scenario": "A hand-edited config.json with an accent like `\"#€ab1\"` crashes the app at `tray::build` on every start.",
+  "fix": "`if !hex.is_ascii() { return None }`, and sanitize the accent in `load`.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ST-5",
+  "title": "Stream Deck start/stop bypass the automation's \"user decided\" flags",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "control.rs:225-226",
+   "src-tauri/src/control.rs:225-226",
+   "src-tauri/src/lib.rs:333-342",
+   "src-tauri/src/state.rs:184-191"
+  ],
+  "claim": "control.rs:225-226 call `\"start\" => crate::start_buffer_and_notify(app)` and `\"stop\" => crate::stop_buffer_and_notify(app)` directly, with no `auto.manual_start()` / `manual_stop()` call, so the buffer automation does not know the user decided.",
+  "scenario": "With auto-start on, a Stream Deck \"stop\" is undone 2 s later by `poll_always` or `poll(playing)`.",
+  "fix": "Route through one `set_buffer(app, on, Origin::User)`.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "LS-14",
+    "slice": "05-local-surface",
+    "title": "Stream Deck \"start\"/\"stop\" on `/v1/buffer` is undone by the in-game automation",
+    "claim": "control.rs:225-226 calls `start_buffer_and_notify` and `stop_buffer_and_notify` directly; only the toggle path calls `state.auto.manual_stop()` and `manual_start()` (lib.rs:333-342). The shipped plugin sends only \"toggle\", but \"start\"/\"stop\" are part of the API.",
+    "locations": [
+     "src-tauri/src/control.rs:225-226",
+     "src-tauri/src/lib.rs:333-342",
+     "src-tauri/src/state.rs:184-191"
+    ],
+    "fix": "Call `manual_*` on the start and stop branches too."
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ST-6",
+  "title": "Failed recording close leaves status.recording = true and an orphaned capture pipeline running",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "state.rs:1072-1078",
+   "src-tauri/src/state.rs:1072-1078"
+  ],
+  "claim": "state.rs:1072-1078: `Err(err) => { log::error!(…); return None; }` returns before `if !self.buffer_wanted() { self.halt_pipeline(); }` and before `self.status.lock().recording = false`. The recorder has already been removed from both AppState and the pipeline. `finish` fails when `write_meta` fails, which is exactly the disk-full case the room guard is there for.",
+  "scenario": "The disk fills during a recording, `write_meta` fails and close returns early: the UI and tray show \"recording\" forever, and a recording-only pipeline (capture plus encoder) keeps running with the buffer off.",
+  "fix": "A scope guard that always halts the pipeline (when the buffer is not wanted) and clears the recording flag.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "VP-12",
+    "slice": "03-video-pipeline",
+    "title": "Recording stop error path skips halt_pipeline() and status.recording = false",
+    "claim": "state.rs:1072-1078 is `let meta = match recorder.finish(..) { Ok(meta) => meta, Err(err) => { log::error!(..); return None; } };`. The early return skips both halt_pipeline() and `status.recording = false`.",
+    "locations": [
+     "src-tauri/src/state.rs:1072-1078"
+    ],
+    "fix": "Always reset the status and halt the pipeline, even on error."
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ST-7",
+  "title": "Quit does not wait for a save in progress and can hang on the main thread",
+  "severity": "medium",
+  "category": "robustness",
+  "locations": [
+   "tray.rs:139-148"
+  ],
+  "claim": "tray.rs:139-148 Quit runs `abandon_recording(); stop_pipeline(); app.exit(0)`, and so does the updater's `on_before_exit`. None of them check `is_saving()`. The save thread dies while ffmpeg is running (there is no Job object). In addition, the Quit handler runs on the main thread and joins encoder threads with no timeout.",
+  "scenario": "Quitting during a clip save: ffmpeg finishes the MP4, but it is never inserted into the library and gets no thumbnail, so the clip is missing from the gallery; a quick restart's `discard_leftovers()` can delete ffmpeg's temp inputs mid-read. A driver hang during encoder shutdown makes Quit hang.",
+  "fix": "Do Quit on a worker thread: show a \"finishing clip…\" banner, wait for saving to clear with a timeout, then exit. Optionally handle WM_QUERYENDSESSION so a Windows logoff closes recordings cleanly.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "ST-9",
+  "title": "\"Only buffer in game\": an alt-tab of 30 s or more cancels the user's manual stop, contradicting the README",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "state.rs:195-200"
+  ],
+  "claim": "`poll` is fed `GameTick::playing`, which depends on what is in the foreground. state.rs:195-200: after `GRACE_POLLS` checks without the game in front, `self.suppressed.store(false, SeqCst)`. The README says the automation \"holds back until the game has ended\".",
+  "scenario": "A user stops the buffer by hand, checks Discord for 30 s, returns, and the buffer starts again. The same 30 s alt-tab also discards an automation-started buffer and its history.",
+  "fix": "Clear `suppressed` only when the bound game process exits (`game_pid` becomes None); consider pausing rather than stopping while the game process is still alive.",
+  "reported_confidence": "confirmed",
+  "slice": "07-state-concurrency",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ }
+]

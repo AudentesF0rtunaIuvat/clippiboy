@@ -1,0 +1,1140 @@
+{
+  "slice": "10-frontend-player-console",
+  "defects": [
+    {
+      "id": "FP-1",
+      "title": "Hidden console keeps an infinite CSS animation (and full-screen glow layer) running for the whole session over the game",
+      "severity": "high",
+      "category": "perf",
+      "locations": [
+        "Console.tsx:1025",
+        "motion.css:132",
+        "console.css:273"
+      ],
+      "claim": "When the console closes, the dock is only faded to opacity 0 by `.cb-ui[data-leaving=\"true\"] { animation: cb-fade-out 160ms ease-in both; pointer-events: none; }` (console.css:273) and stays mounted. Console.tsx:1025 renders `<LiveDot />` in the dock whenever the buffer is running, and its ring uses `.cb-live-ring { animation: cb-live-ring 2s var(--ease-out-soft) infinite; }` (motion.css:132), so the infinite animation keeps running while the console is hidden. The window is hidden with `ShowWindow(SW_HIDE)`; Tauri's hide never calls WebView2 `SetIsVisible(false)` (only `webview.hide()` would). The console runs with `--disable-renderer-backgrounding --disable-backgrounding-occluded-windows` and `CalculateNativeWinOcclusion` off, so nothing throttles it, and with `--disable-gpu` the frames are rasterised and composited on the CPU. The full-screen `.cb-glow` layer (`will-change: opacity`) also stays alive. Related: the main window has the same flags, so any infinite animation it shows (e.g. LiveDot) also runs while it sits in the tray.",
+      "scenario": "The user plays a game for hours or days with the buffer running; the hidden console's Chromium keeps producing compositor frames at about 60 fps, rasterised and composited on the CPU, while the game is in the foreground.",
+      "fix": "After the exit animation (`finishClose` or `console-closed`) render an empty page instead of an invisible dock: a `visible` flag that unmounts `.cb-ui` and the glow. At minimum add `.cb-ui[data-leaving=\"true\"] * { animation-play-state: paused }` and drop `will-change` when hidden. Optionally call `webview.hide()` from Rust after `window.hide()` and `webview.show()` before showing.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FP-2",
+      "title": "Dashboard player tracks its clip by position; a newly saved clip silently swaps the clip and discards unsaved edits",
+      "severity": "high",
+      "category": "bug",
+      "locations": [
+        "Dashboard.tsx:80",
+        "Dashboard.tsx:272",
+        "ClipPlayer.tsx:86",
+        "ClipPlayer.tsx:287"
+      ],
+      "claim": "Dashboard.tsx:80 `const recent = useMemo(() => clips.filter((clip) => !clip.screenshot && !clip.recording).slice(0, 3), [clips]);` and Dashboard.tsx:272 `<ClipPlayer clips={recent} index={Math.min(playing, recent.length - 1)} ...` pass a position, and ClipPlayer.tsx:86 resolves `const clip = clips[index];`. When `onClipSaved` prepends a new clip (save hotkey, a finished recording, or a friend's clip arriving), `recent[playing]` becomes a different clip; the player's reset effect (ClipPlayer.tsx:287) clears the trim and `useClipMix` drops the mix. Deletes made from the console shift the list the same way. Clips.tsx already solves this with an id playlist plus `shownId`.",
+      "scenario": "The user is trimming the newest clip from the dashboard and presses the save hotkey (or a recording finishes / a friend's clip arrives); the player silently switches to another clip and the unsaved trim and mix are discarded.",
+      "fix": "Track the clip by id: pass a playlist snapshot of ids, or reuse the Clips.tsx playlist logic through a shared hook.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-3",
+      "title": "Dashboard player never files favorites on close",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "Dashboard.tsx"
+      ],
+      "claim": "The dashboard's ClipPlayer never files favorites when it closes; the gallery (Clips.tsx) does that in `closePlayer`, so behaviour differs between the two players.",
+      "scenario": "The user favorites a clip in the dashboard player and closes it; the clip is not filed the way it would be when closed from the gallery.",
+      "fix": "Reuse the Clips.tsx playlist/close logic (including `closePlayer` filing) through a shared hook.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-4",
+      "title": "Console \"Shrink to 10/25 MB and copy\" can copy a stale or half-written file",
+      "severity": "high",
+      "category": "bug",
+      "locations": [
+        "commands.rs:876",
+        "Console.tsx:498"
+      ],
+      "claim": "commands.rs:876 `let ready = std::fs::metadata(&output).map(|meta| meta.len() > 0 && meta.len() <= target_bytes).unwrap_or(false);` treats any existing non-empty file under the limit as a finished export. `shrink()` runs ffmpeg directly into `output`, with no temporary file and rename, and the cache is not tied to the source's mtime/size. Console.tsx:498 keeps a single busy slot `setBusy(what)`, so starting another action re-enables the shrink button while the first run is still writing.",
+      "scenario": "Stale: export at 10 MB, trim the clip later, export at 10 MB again - the old untrimmed \"(10 MB).mp4\" is reused and pasted into Discord. Partial: click 10 MB, then \"Clip\"; `busy` switches to \"clip\" so 10 MB is enabled again; a second click sees the first run's partially written (non-empty, under-limit) file and puts a truncated MP4 on the clipboard. Crash: after a crash or quit mid-export the partial file stays and is reused forever.",
+      "fix": "Write to `*.part` and rename on success; treat the cache as valid only if its mtime is later than the source's (or key it on the source size and mtime); in the console keep busy state per job (a `Set<string>`) and show the `clip-progress` value.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-5",
+      "title": "A running Save/Undo-trim does not block paging, closing or deleting",
+      "severity": "high",
+      "category": "bug",
+      "locations": [
+        "ClipPlayer.tsx:547-582",
+        "ClipPlayer.tsx:253"
+      ],
+      "claim": "`save()` at ClipPlayer.tsx:547-582 (`resumeAt`, `veil.freeze`, `await applyClipEdit`, then in `finally` `setReload((n)=>n+1)` and `setJustSaved(true)`) runs while the keyboard handler (`n`/`p` -> `step`, Escape -> `close`), the Step buttons, Delete and the close button stay enabled. ClipPlayer.tsx:253 resets `justSaved` only when the clip changes, before the save finishes. Paging to clip B during A's save: B plays under A's frozen frame; when A finishes, `setJustSaved(true)` makes B show \"Saved. That is how the clip sits in the folder now\"; `setReload` re-creates B's `<video>` so B restarts; the editor shows \"Saving...\" for B and the progress bar stalls because the listener now filters on B's id. Closing during a save calls Clips.closePlayer, which runs `fileClip` while the edit job may be between ffmpeg and `swap_in`; deleting during a save runs `delete_clip` while `apply` runs. The core's render lock does not cover filing or deletion. (UI part confirmed; Rust races speculative.)",
+      "scenario": "The user saves clip A (a re-encode can take minutes) and presses `n`; clip B is wrongly reported as saved, restarts, and shows a stalled progress bar. Closing or deleting during the save races `fileClip`/`delete_clip` against the edit job.",
+      "fix": "While `saving || restoring`, disable step, close, delete and the shortcuts; alternatively key `saving` and `justSaved` by clip id and ignore results for a clip that is no longer shown.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-6",
+      "title": "No app ACL manifest: every custom command is callable from the overlay and console windows",
+      "severity": "medium",
+      "category": "security",
+      "locations": [
+        "build.rs",
+        "overlay.json"
+      ],
+      "claim": "build.rs is a plain `tauri_build::build()`, so there is no app ACL manifest. Tauri (webview/mod.rs:1823) only checks the ACL for app commands `if (plugin_command.is_some() || has_app_acl_manifest || !is_local)`, so every command in `generate_handler!` can be invoked from the overlay and the console, including `delete_clip`, `set_config`, `set_clip_dir`, `reveal_path`, `install_update` and `friends_delete_account`, despite overlay.json describing the overlay as \"only listens, controls nothing\". Defense in depth only: no XSS sink was found and the CSP blocks inline scripts.",
+      "scenario": "If script ever runs in the overlay or console webview (e.g. a future XSS), it can call destructive commands such as `delete_clip`, `set_clip_dir`, `install_update` or `friends_delete_account`.",
+      "fix": "Switch to `tauri_build::try_build(Attributes::new().app_manifest(AppManifest::new().commands(&[...])))` and add `permissions/*.toml` with per-window sets: none for the overlay; for the console only `list_clips`, `engine_status`, `get_config`, `save_clip`, `toggle_recording`, `take_screenshot`, `close_console`, `show_clip_in_app`, `export_for_discord`, `copy_clip_file`, `set_clip_favorite`, `file_clip`, `update_clip`, `delete_clip`, `link_exists`, `update_audio_source`, the share commands and the friends accept/remove/state commands.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-7",
+      "title": "Overlay capability `core:event:default` lets the overlay emit events to the main window",
+      "severity": "medium",
+      "category": "security",
+      "locations": [
+        "overlay.json"
+      ],
+      "claim": "overlay.json grants `\"permissions\": [\"core:event:default\"]` with the description \"only listens, controls nothing\". `core:event:default` includes `allow-emit` and `allow-emit-to`, so the overlay can send `share-state`, `focus-clip`, `update-available` or `main-hidden` to the main window.",
+      "scenario": "Compromised overlay script emits `update-available` or `share-state` events that the main window trusts.",
+      "fix": "Give the overlay `core:event:allow-listen` and `core:event:allow-unlisten` only.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-8",
+      "title": "Console capability grants unused window permissions and broad `core:default`",
+      "severity": "medium",
+      "category": "security",
+      "locations": [
+        "console capability"
+      ],
+      "claim": "The console capability grants `core:window:allow-hide/show/set-focus`, which its JavaScript never uses, and `core:default` (tray, menu and more).",
+      "scenario": "Script in the console webview can manipulate windows, the tray or menus beyond what the console needs.",
+      "fix": "Drop the unused window permissions from the console capability (and restrict it to the listed command set).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-9",
+      "title": "Player's global key handler ignores menus/dialogs and hijacks keys on sliders",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "ClipPlayer.tsx:463-469",
+        "ClipPlayer.tsx:499",
+        "ClipPlayer.tsx:492",
+        "Menu.tsx:156",
+        "Share.tsx:36",
+        "ClipEditor.tsx:84"
+      ],
+      "claim": "ClipPlayer.tsx:463-469 skips only text inputs, deliberately not range sliders: `(target instanceof HTMLInputElement && target.type !== \"range\") || target instanceof HTMLTextAreaElement`. Line 499 looks up `handlers[event.key]` without checking `event.defaultPrevented` or modifier keys; line 492's Escape only respects `askingDelete` and `exporting`. Conflicts: the context menu (Menu.tsx:156) handles Escape and arrows in the capture phase with `preventDefault` but no `stopPropagation`, so Escape closes the menu and the player, and ArrowDown moves the menu selection and lowers the volume. SharePicker (Share.tsx:36), opened from the player's menu, closes on Escape and so does the player; Space, `n`, `p` act on the player behind it. ClipEditor's \"Free up space\" ConfirmDelete (`discarding`, ClipEditor.tsx:84) cancels on Escape and the player closes too. With a track-gain or volume slider focused, ArrowLeft/Right seek +/-5 s and ArrowUp/Down change master volume, so keyboard users cannot move any slider; Home/End are taken too. Ctrl+N/Ctrl+P page clips, Ctrl+F toggles fullscreen, and key repeat is not filtered.",
+      "scenario": "User opens the context menu in the player and presses Escape: both the menu and the player close. User focuses a track-gain slider and presses ArrowRight: the video seeks +5 s instead of the slider moving.",
+      "fix": "Return early when `event.defaultPrevented`, when Ctrl/Meta/Alt is held, or when the target is any `input`, `select`, `textarea`, `[contenteditable]` or `[role=slider]` other than the scrubber; give dialogs and menus a shared modal stack (zustand counter, or `stopPropagation` in Menu, SharePicker and ConfirmDelete) and lift `discarding` up to the player.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-10",
+      "title": "Unsaved trim and mix are lost without warning on close or paging",
+      "severity": "medium",
+      "category": "ux",
+      "locations": [
+        "ClipPlayer.tsx"
+      ],
+      "claim": "Closing and paging in ClipPlayer have no check of `dirty`: Escape, `n`/`p` or the close button drop a carefully set trim and mix, with only the \"Not saved yet\" line as warning. ShotViewer, by contrast, asks \"Discard unsaved marks?\". There is also no Ctrl+S save shortcut.",
+      "scenario": "User sets a trim and mix, presses Escape or `n`; the edits are discarded without a prompt.",
+      "fix": "Add a dirty guard (an inline \"Discard changes?\" chip, as ShotViewer has) for close, paging and delete, and a Ctrl+S save shortcut.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-11",
+      "title": "Any reload of the video element resets the unsaved trim via restoreTrim on loadedmetadata",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "ClipPlayer.tsx:756-759",
+        "ClipPlayer.tsx:799",
+        "Console.tsx:752"
+      ],
+      "claim": "ClipPlayer.tsx:756-759 runs `restoreTrim(clip.edit, length)` and then `if (restored) setTrim(restored)` on every `loadedmetadata`, and ClipPlayer.tsx:799 retries a failed load with `setReload(n+1)`. So whenever the source changes under the open player or a load error triggers a retry, the unsaved trim is overwritten and playback restarts. Example: the user hearts the same clip in the console; Console.tsx:752 calls `fileClip`; the rename succeeds (the asset protocol opens files per request with Rust's default share flags, which allow deletion); the store reloads with the new `clip.path`, the `<video>` src changes, `loadedmetadata` resets the trim. A single transient load error does the same.",
+      "scenario": "User trims a clip in the main player, then favorites the same clip in the console; the clip is filed/moved, the main player's video reloads and the trim is reset.",
+      "fix": "Restore the trim only on the first metadata load for a clip id, or after save and restore (use a \"trimRestoredFor\" ref).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-12",
+      "title": "Clips without audio, or whose track query failed, can never be trimmed",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "ClipPlayer.tsx:535",
+        "stems.rs",
+        "useClipMix.ts:163",
+        "ClipEditor.tsx:123"
+      ],
+      "claim": "ClipPlayer.tsx:535 `const dirty = duration > 0 && mix.tracks.length > 0 && !sameEdit(...)` requires at least one track. stems.rs `tracks()` returns `in_file` (an empty list) when the file has no audio stream, and useClipMix.ts:163 turns a failed `clipTracks` call into an empty list (`.catch(() => undefined)`). Setup allows \"no audio source\" (\"your clips are silent\"); such clips, and any clip while ffprobe is unavailable (ffmpeg still downloading or failed), keep Save disabled forever. The editor then also says \"This clip carries a single audio track\" (ClipEditor.tsx:123), which is wrong when the query failed.",
+      "scenario": "User chose \"no audio source\" in Setup (or ffmpeg is still downloading), sets a trim, and Save never becomes enabled.",
+      "fix": "Use `!mix.loading` instead of `tracks.length > 0`, and show a separate \"Tracks could not be read\" message on error.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-13",
+      "title": "Clip menu actions in the main window fail silently and give no success feedback",
+      "severity": "medium",
+      "category": "ux",
+      "locations": [
+        "clipMenu.tsx:136",
+        "clipMenu.tsx:170",
+        "clipMenu.tsx:180",
+        "clipMenu.tsx:209",
+        "clipMenu.tsx:216",
+        "ClipPlayer.tsx:959"
+      ],
+      "claim": "Menu actions fire-and-forget promises: clipMenu.tsx:136 `onSelect: () => void api.openClip(clip.id)`, and likewise 170 (`copyClipImage`), 180 (`copyClipFile`), 209 (`clipboardWriteText`), 216 (`revealClip`); ClipPlayer.tsx:959 `onClick={() => inTauri && api.revealClip(clip.id)}`. There is no `unhandledrejection` handler anywhere. \"Copy clip\" when the file is missing rejects with \"The clip file is no longer there.\" and nothing is shown; on success nothing confirms the copy (the console says \"Copied - Ctrl+V in Discord\"; the app says nothing).",
+      "scenario": "User clicks \"Copy clip\" for a clip whose file is gone; the promise rejects unhandled and the UI shows nothing. On success the user gets no confirmation.",
+      "fix": "Route every menu action through a helper that shows a success toast or `lastError`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-14",
+      "title": "Offer Accept/Decline buttons have no error handling",
+      "severity": "medium",
+      "category": "robustness",
+      "locations": [
+        "Offers.tsx:29",
+        "Share.tsx:298"
+      ],
+      "claim": "The Accept/Decline buttons in Offers.tsx:29 and Share.tsx:298 use `action.finally(...)` with no catch, so failures are unhandled rejections with no feedback.",
+      "scenario": "Accepting a friend offer fails in Rust; the rejection is unhandled and the user sees nothing.",
+      "fix": "Route the actions through a helper that shows a success toast or `lastError`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-15",
+      "title": "Friends.tsx swallows errors",
+      "severity": "medium",
+      "category": "robustness",
+      "locations": [
+        "Friends.tsx:78"
+      ],
+      "claim": "Friends.tsx:78 swallows errors with `.catch(() => {})`, so failures are never shown.",
+      "scenario": "A friends action fails and the user gets no indication.",
+      "fix": "Show the error via a toast or `lastError` instead of swallowing it.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-16",
+      "title": "Optimistic deleteClip never rolls back on failure",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "store.ts:484"
+      ],
+      "claim": "store.ts:484 `deleteClip` removes the clip from the store optimistically and never rolls back if `api.deleteClip` throws, so the clip disappears from the UI but stays on disk and in the database until the next reload.",
+      "scenario": "`delete_clip` fails (e.g. file in use); the clip vanishes from the gallery but is still on disk and in the DB, reappearing after reload.",
+      "fix": "Roll back `deleteClip` on failure and show the error.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-17",
+      "title": "Stem-preview silence watchdog mistakes real silence for a broken audio graph",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "useClipMix.ts:246-251"
+      ],
+      "claim": "useClipMix.ts:246-251 `quiet = samples.some((value) => value !== 0) ? 0 : quiet + 1; if (quiet >= SILENT_TICKS) { ... setGraphMode(\"off\"); }` (8 ticks of 250 ms = 2 s) is meant to catch a CORS-silent `MediaElementSource`, but stems are often digitally zero (game loopback in menus or pauses, a noise-gated mic). Two seconds of real silence while playing switches the clip permanently to the `volume` fallback, losing the +dB preview (other tracks get quieter instead), and all audio elements are rebuilt mid-playback, which is audible as a glitch.",
+      "scenario": "User previews a clip whose mic stem is noise-gated silent for 2 s; the graph switches to fallback mode, audio glitches, and boost preview is lost for the rest of the session.",
+      "fix": "Detect the CORS case deterministically, e.g. `fetch(url, { mode: \"cors\", method: \"HEAD\" })` once, or decide only during the first seconds and only if the video's own audio is not silent.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FP-18",
+      "title": "Stem drift correction is coarse and uses hard seeks",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "useClipMix.ts:317",
+        "useClipMix.ts:353"
+      ],
+      "claim": "`align()` re-seeks the stems only when drift exceeds 0.12 s (useClipMix.ts:317), checked once per second (line 353). Up to 120 ms of lip-sync error stays, and each correction is a hard seek.",
+      "scenario": "During stem preview, audio drifts up to 120 ms from the video before being hard-seeked, causing audible jumps.",
+      "fix": "Correct drift by nudging `playbackRate` (+/-1-2 %) and hard-seek only above about 250 ms.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FP-19",
+      "title": "Stems are not paused while the video is seeking",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "useClipMix.ts"
+      ],
+      "claim": "useClipMix does not pause the stem `<audio>` elements on the video's `seeking` event, so audio from the old position keeps playing until `seeked`.",
+      "scenario": "User seeks during playback and hears audio from the previous position until the seek completes.",
+      "fix": "Pause the stems on `seeking`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FP-20",
+      "title": "AudioContext leaked if createMediaElementSource throws",
+      "severity": "low",
+      "category": "robustness",
+      "locations": [
+        "useClipMix.ts:207-228"
+      ],
+      "claim": "In useClipMix.ts:207-228, if `createMediaElementSource` throws after `new AudioContext()` succeeded, the AudioContext is never closed.",
+      "scenario": "Repeated failures to create the media element source leak AudioContexts (browsers cap the number of contexts).",
+      "fix": "Close the AudioContext in the error path.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-21",
+      "title": "Single-track clips: track gain and mute have no audible preview but are saved",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "useClipMix.ts:128",
+        "useClipMix.ts:280"
+      ],
+      "claim": "useClipMix.ts:128 `const separate = tracks.length > 1 && ...`; the audio-elements effect returns early when not separate, and useClipMix.ts:280 sets `video.current.volume = separate ? 0 : master;`. With one track, ClipEditor still renders a TrackRow (mute, solo, -30...+12 dB); moving it changes nothing in the preview, but Save bakes it into the file.",
+      "scenario": "User with a single-track clip raises the track to +12 dB, hears no change, saves, and the exported file is unexpectedly louder/clipped.",
+      "fix": "Apply the single track's gain to the video element (attenuation via `volume`, or route the video through the same WebAudio graph for boost), or hide the row.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-22",
+      "title": "Waveform is not refreshed after a trim and is misaligned with the new timeline",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "ClipPlayer.tsx:316-326"
+      ],
+      "claim": "ClipPlayer.tsx:316-326 fetches `api.clipWaveform(clipId)` with dependencies `[clipId]` only, and the URL has no cache-busting. Rust (`preview.rs`, `is_newer`) would regenerate the image, but the frontend never asks again after save or restore, so the old full-length waveform is stretched over the trimmed clip, and the WebView may serve the cached PNG under the same URL.",
+      "scenario": "User trims a clip and saves; the scrubber still shows the untrimmed waveform stretched across the shorter clip.",
+      "fix": "Add `reload` (or `clip.sizeBytes`) to the dependencies and append `?v=${clip.sizeBytes}`, as is already done for thumbnails.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-23",
+      "title": "Frame step is hard-coded to 30 fps",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "ClipPlayer.tsx:59",
+        "ClipPlayer.tsx:478"
+      ],
+      "claim": "ClipPlayer.tsx:59 `const FRAME = 1 / 30;` is used at line 478 `\".\": () => seek(FRAME)`. Recordings default to 60 fps, so a \"single frame\" step moves two frames.",
+      "scenario": "User frame-steps a 60 fps clip with `.` and skips every other frame, making precise cuts impossible.",
+      "fix": "Carry fps in `Clip`, or derive it from `requestVideoFrameCallback` metadata.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-24",
+      "title": "Trim marks and the selection loop use currentTime instead of the presented frame",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "ClipPlayer.tsx"
+      ],
+      "claim": "Marks set while playing take `currentTime` (the audio clock), not the presented frame, and the end-of-selection loop check uses rAF plus `currentTime`.",
+      "scenario": "User sets an out-mark while playing; the mark lands on a different time than the frame visible on screen.",
+      "fix": "Use `rVFC.mediaTime` (requestVideoFrameCallback) for marks and for the end-of-selection loop check instead of rAF plus `currentTime`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-25",
+      "title": "Time display and trim readout show whole seconds only",
+      "severity": "medium",
+      "category": "ux",
+      "locations": [
+        "PlayerControls.tsx:15",
+        "ClipEditor.tsx"
+      ],
+      "claim": "PlayerControls.tsx:15 `clock()` floors to seconds, and ClipEditor shows `clock(trim.start) – clock(trim.end)`, so the handle tooltip and trim readout cannot show the sub-second precision a cut needs.",
+      "scenario": "User adjusts a trim by 300 ms; the readout does not change, so the user cannot tell where the cut is.",
+      "fix": "Display m:ss.cc or frames.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-26",
+      "title": "Export dialog: shown size can differ from the exported target size",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "ExportDialog.tsx:177-181"
+      ],
+      "claim": "ExportDialog.tsx:177-181 updates the target only for valid input: `setCustom(text); ... if (Number.isFinite(value) && value >= 1) setTargetMb(value);`. Typing \"0.5\" keeps the previous 25 MB target while the field shows 0.5. Typing \"7\" and then clearing the field leaves `targetMb = 7` with no preset highlighted and an empty field, yet Export is enabled.",
+      "scenario": "User types 0.5 MB and clicks Export; a 25 MB file is produced.",
+      "fix": "Derive `targetMb` from `custom` when it is non-empty and disable Export for invalid input.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-27",
+      "title": "Export cannot be cancelled",
+      "severity": "medium",
+      "category": "ux",
+      "locations": [
+        "ExportDialog.tsx"
+      ],
+      "claim": "There is no way to cancel a long export: Cancel is disabled while busy, and Rust has no cancel command.",
+      "scenario": "User starts a long export by mistake and has to wait for it to finish.",
+      "fix": "Add a cancel that kills ffmpeg.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-28",
+      "title": "Export uses the file on disk, not the unsaved selection, without saying so",
+      "severity": "medium",
+      "category": "ux",
+      "locations": [
+        "ExportDialog.tsx"
+      ],
+      "claim": "ExportDialog exports the file on disk, not the unsaved trim selection, and does not tell the user.",
+      "scenario": "User sets a trim (unsaved) and exports a copy; the export contains the full untrimmed clip.",
+      "fix": "Add a hint when `dirty`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-29",
+      "title": "Player keeps reacting behind the Export dialog and the dialog follows the player's clip",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "ExportDialog.tsx"
+      ],
+      "claim": "While ExportDialog is open, `n`/`p` still page the player. ExportDialog's `clip` prop follows the player's clip, so mid-run the dialog shows the next clip's numbers and the progress stalls.",
+      "scenario": "User starts an export and presses `n`; the dialog switches to the next clip's info and the progress bar stops updating.",
+      "fix": "Capture the clip at mount.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-30",
+      "title": "Export dialog lacks dialog semantics and focus management",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "ExportDialog.tsx"
+      ],
+      "claim": "ExportDialog has no `role=\"dialog\"`, `aria-modal`, initial focus or focus trap.",
+      "scenario": "Screen-reader and keyboard users are not moved into the dialog and can tab behind it.",
+      "fix": "Add `role=\"dialog\"`, `aria-modal`, initial focus and a focus trap.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-31",
+      "title": "Usage stats are on by default and a self-dismissing notice counts as consent",
+      "severity": "medium",
+      "category": "privacy",
+      "locations": [
+        "config.rs:66",
+        "Setup.tsx:88",
+        "Setup.tsx:113",
+        "telemetry.rs"
+      ],
+      "claim": "config.rs:66 `usage_stats: true`; Setup.tsx:88 `useState(true)` then line 113 `setUsageStats(config.usageStats)` - a pre-ticked toggle on the last setup step. UsageNotice marks itself as read after 10 s with the window focused: `if (due && shownMs >= SHOWN_MS) void patchConfig({ usageStatsNoticed: true })`. telemetry.rs `send_if_due` sends a persistent UUID `id` plus `source` and `heard`. Existing users who update are opted in by a notice that dismisses itself. Under GDPR and German TTDSG §25, a pre-ticked box is not valid consent (CJEU Planet49).",
+      "scenario": "An existing user updates; the notice auto-dismisses after 10 s focused and telemetry with a persistent install ID starts without an explicit choice.",
+      "fix": "Make it opt-in (default `false`, toggle unticked), or at least require an explicit choice.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FP-32",
+      "title": "Usage notice text omits the persistent install ID and attribution fields",
+      "severity": "medium",
+      "category": "privacy",
+      "locations": [
+        "UsageNotice",
+        "telemetry.rs"
+      ],
+      "claim": "The UsageNotice text (\"the version, how many clips, which features. No content, no account.\") does not mention that telemetry.rs `send_if_due` sends a persistent install UUID `id` and the attribution fields `source` and `heard`.",
+      "scenario": "A user reads the notice believing only aggregate counts are sent, while a persistent ID and \"where did you hear\" attribution are transmitted.",
+      "fix": "List the install ID and the source/heard fields in the notice.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FP-33",
+      "title": "Console mini-player (ClipStage) has no error state",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "Console.tsx:1314-1340"
+      ],
+      "claim": "In Console.tsx:1314-1340 the `<video>` has no `onError`, and the `<img>` path has none either. A clip deleted or moved by the main window, which `kept.current` keeps showing, leaves a black box with live controls.",
+      "scenario": "User deletes a clip in the main window while it is shown in the console mini-player; the console shows a black box with working-looking controls.",
+      "fix": "Add an `onError` state (\"File not found\"); better, share one `useVideoTransport` hook between ClipPlayer and ClipStage.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-34",
+      "title": "Console seek shortcut can throw before metadata is loaded",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "Console.tsx:1274"
+      ],
+      "claim": "Console.tsx:1274 `jump(element, element.currentTime + 5)` has no `Number.isFinite(duration)` guard; `jump` computes `Math.min(x, NaN)`, so assigning `currentTime = NaN` throws a TypeError before metadata is loaded.",
+      "scenario": "User presses the seek key in the console mini-player before the video's metadata has loaded; a TypeError is thrown.",
+      "fix": "Guard the seek with `Number.isFinite(duration)`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-35",
+      "title": "Console player shortcuts die once the volume slider has focus",
+      "severity": "medium",
+      "category": "ux",
+      "locations": [
+        "Console.tsx:1270"
+      ],
+      "claim": "Console.tsx:1270 skips all inputs including range inputs, so once the volume slider has focus every console player shortcut is dead (the opposite of the main player's choice).",
+      "scenario": "User adjusts volume in the console mini-player, then presses Space; nothing happens.",
+      "fix": "Share one `useVideoTransport`/shortcut logic between ClipPlayer and ClipStage with consistent input filtering.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-36",
+      "title": "Trim tolerance mismatch: UI says dirty/\"Saved\" for an end cut the core ignores",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "ClipPlayer.tsx:1069",
+        "edit.rs:43"
+      ],
+      "claim": "ClipPlayer.tsx:1069 compares with `Math.abs(x - y) <= 50` while edit.rs:43 uses `EDGE_TOLERANCE_MS: u64 = 250`. Trimming 60-250 ms off the end enables Save; the core treats it as uncut, and the reload restores the full range, while the UI said \"Saved\".",
+      "scenario": "User trims 200 ms off the end and saves; the UI reports \"Saved\" but the file is unchanged and the trim resets.",
+      "fix": "Share one tolerance (250 ms) for `dirty`, the \"trimmed\" flag and the core.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-37",
+      "title": "mark() does not clamp the end to duration and silently moves the start",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "ClipPlayer.tsx:451-455"
+      ],
+      "claim": "`mark()` (ClipPlayer.tsx:451-455) does not clamp the end to the duration (`Math.max(at, current.start + 0.5)`), and silently moves the start to `end - 0.5` when the playhead is past it.",
+      "scenario": "User marks an end near the clip's end with start close by; the end can exceed duration, or the start silently shifts.",
+      "fix": "Clamp the end to `[start + 0.5, duration]`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-38",
+      "title": "Solo is a listening aid in the UI but is saved as mutes",
+      "severity": "low",
+      "category": "ux",
+      "locations": [
+        "useClipMix.ts:391-401"
+      ],
+      "claim": "useClipMix.ts:391-401 builds the saved state with `muted: !audible(state, anySolo)`, so soloing a track and pressing Save permanently mutes every other track in the file (recoverable because stems remain, but surprising).",
+      "scenario": "User solos the game track to check something, presses Save, and the saved file has all other tracks muted.",
+      "fix": "Exclude solo from the saved state and from `dirty`, or label it clearly (\"Solo is saved as mute\").",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-39",
+      "title": "Dragging a trim handle re-renders the whole player and editor on every pointer move",
+      "severity": "low",
+      "category": "perf",
+      "locations": [
+        "PlayerControls.tsx:146"
+      ],
+      "claim": "PlayerControls.tsx:146 calls `onTrim(...)` on every `pointermove`, which calls `setTrim` in ClipPlayer; each change re-renders ClipPlayer, ClipEditor, ClipMeta, Tags and all TrackRows, and tears down and re-creates the rAF effect (deps `[playing, trim.start, trim.end, paint]`) and the keydown listener. The authors note WebView2 drops video frames when React renders at frame rate. The drag also does not handle `pointercancel` or use `setPointerCapture`.",
+      "scenario": "User drags a trim handle during playback; video frames drop due to frame-rate React renders.",
+      "fix": "Keep the trim in a ref during the drag and paint the handles directly (as for the playhead), commit on `pointerup`; read trim from a ref inside the rAF loop and key handler; handle `pointercancel` and use `setPointerCapture`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-40",
+      "title": "Tauri event listener leak in ClipPlayer when cleanup runs before listen() resolves",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "ClipPlayer.tsx:303-314"
+      ],
+      "claim": "ClipPlayer.tsx:303-314 uses `.then((off) => { unlisten = off; }); return () => unlisten?.();`. If cleanup runs before `listen()` resolves (StrictMode, which `main.tsx` uses, or fast paging), the listener is never removed. ExportDialog.tsx:84-95 does this correctly.",
+      "scenario": "User pages quickly through clips; listeners accumulate and keep firing for old clips.",
+      "fix": "Add a `useTauriEvent(name, cb)` hook with a `cancelled` flag and use it everywhere.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-41",
+      "title": "Close timeout scheduled inside a setState updater fires twice under StrictMode",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "ClipPlayer.tsx:191-195"
+      ],
+      "claim": "ClipPlayer.tsx:191-195 schedules `goodbye.current = window.setTimeout(onClose, LEAVE_MS)` inside a `setLeaving` updater function. StrictMode calls updaters twice, so in development `onClose` fires twice.",
+      "scenario": "In development (StrictMode), closing the player calls `onClose` twice.",
+      "fix": "Move the timeout out of the updater.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-42",
+      "title": "Overlay timer cleanup clears the initial array, not the current timers",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "Overlay.tsx:112-115"
+      ],
+      "claim": "Overlay.tsx:112-115 `const running = timers.current; ... running.forEach(clearTimeout)` captures the initial array, so on cleanup it clears that array rather than the timers that later replaced it.",
+      "scenario": "On unmount, pending banner timers that were stored in a replaced array are not cleared and still fire.",
+      "fix": "Clear `timers.current` at cleanup time (read the ref when cleaning up).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-43",
+      "title": "Waveform CSS url() is unquoted",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "PlayerControls.tsx:185"
+      ],
+      "claim": "PlayerControls.tsx:185 ``backgroundImage: `url(${waveform})` `` leaves the URL unquoted. `convertFileSrc` uses `encodeURIComponent`, which leaves `(` and `)` unescaped, so a path containing parentheses breaks the declaration.",
+      "scenario": "A Windows profile such as `C:\\Users\\Max (Work)\\...` makes the background-image declaration invalid and the waveform never shows.",
+      "fix": "Write `` `url(\"${waveform}\")` ``.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-44",
+      "title": "Scrubber slider lacks own key handling and live ARIA values",
+      "severity": "low",
+      "category": "a11y",
+      "locations": [
+        "PlayerControls.tsx:162-178"
+      ],
+      "claim": "The scrubber (PlayerControls.tsx:162-178) is `role=\"slider\"` with `tabIndex={0}` but has no key handling of its own (it relies on the global arrow keys). `aria-valuenow` is a percentage that is not updated while playing (the rAF loop writes the DOM directly), and there is no `aria-valuetext`.",
+      "scenario": "A screen-reader user focuses the scrubber and hears a stale percentage with no time text.",
+      "fix": "Give the scrubber arrow keys and a time text (`aria-valuetext`).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-45",
+      "title": "Trim handles are pointer-only and have German labels in an English UI",
+      "severity": "low",
+      "category": "a11y",
+      "locations": [
+        "PlayerControls.tsx:252"
+      ],
+      "claim": "The trim handles can only be operated with a pointer, and their labels are German in an English UI: PlayerControls.tsx:252 ``aria-label={`${label} des Ausschnitts`}``.",
+      "scenario": "Keyboard users cannot set trim handles; screen readers announce German labels.",
+      "fix": "Make the handles keyboard-operable (arrow = 1 frame, shift = 1 s) and translate the labels.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-46",
+      "title": "Track mute/solo buttons have confusing or missing accessible names",
+      "severity": "low",
+      "category": "a11y",
+      "locations": [
+        "ClipEditor.tsx"
+      ],
+      "claim": "The track mute buttons flip both their label and `aria-pressed` (double state change), and the Solo buttons have no track context in their accessible name.",
+      "scenario": "A screen-reader user hears ambiguous \"Solo\" buttons and contradictory mute state announcements.",
+      "fix": "Keep a stable label with `aria-pressed`, and include the track name in Solo labels.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-47",
+      "title": "Slider has no focus ring",
+      "severity": "low",
+      "category": "a11y",
+      "locations": [
+        "Controls.tsx:116"
+      ],
+      "claim": "The Slider uses `outline-none` (Controls.tsx:116), so there is no visible focus ring.",
+      "scenario": "Keyboard users cannot see which slider is focused.",
+      "fix": "Add a visible focus style.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-48",
+      "title": "Space on a focused button toggles playback instead of activating the button",
+      "severity": "low",
+      "category": "a11y",
+      "locations": [
+        "ClipPlayer.tsx"
+      ],
+      "claim": "In the player, pressing Space while a button has focus toggles playback (global shortcut) instead of activating the focused button.",
+      "scenario": "A keyboard user tabs to the Save button and presses Space; playback toggles and Save is not triggered.",
+      "fix": "Skip the global Space shortcut when a button or other interactive control is focused.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-49",
+      "title": "ClipPlayer, ExportDialog and SharePicker have no dialog role or focus management",
+      "severity": "low",
+      "category": "a11y",
+      "locations": [
+        "ClipPlayer.tsx",
+        "ExportDialog.tsx",
+        "Share.tsx"
+      ],
+      "claim": "ClipPlayer, ExportDialog and SharePicker have no dialog role, no focus trap, and do not move focus in or restore it on close.",
+      "scenario": "Keyboard/screen-reader users can tab behind the modal and lose their place after closing it.",
+      "fix": "Add dialog roles and focus management (move focus in, trap, restore).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-50",
+      "title": "Setup step dots put aria-label on a plain div with no role",
+      "severity": "low",
+      "category": "a11y",
+      "locations": [
+        "Setup.tsx"
+      ],
+      "claim": "The Setup step dots carry `aria-label` on a plain `div` with no role, so the label is not reliably exposed.",
+      "scenario": "Screen readers ignore the step indicator label.",
+      "fix": "Give the element an appropriate role (or use visually hidden text).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-51",
+      "title": "Whole Console tree re-renders on every 1 Hz status event, even while hidden",
+      "severity": "low",
+      "category": "perf",
+      "locations": [
+        "Console.tsx:349-353",
+        "Trouble.tsx:41-42"
+      ],
+      "claim": "The whole Console tree re-renders on every `engine-status`, `audio-errors` and `audio-warnings` event (1 Hz each, always fresh objects), including while hidden (Console.tsx:349-353, Trouble.tsx:41-42).",
+      "scenario": "While the user plays, the hidden console re-renders three times a second for no visible change.",
+      "fix": "Compare payloads before calling setState, or skip while `hidden.current`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FP-52",
+      "title": "backdrop-blur in the transparent GPU-less console costs CPU and blurs nothing",
+      "severity": "low",
+      "category": "perf",
+      "locations": [
+        "Console.tsx:642",
+        "Friends.tsx:157"
+      ],
+      "claim": "`backdrop-blur` is used inside the transparent, `--disable-gpu` console (Console.tsx:642, Friends.tsx:157). It costs CPU and, as overlay.css itself notes, blurs nothing behind the window.",
+      "scenario": "Opening the console over a game spends CPU on a blur that has no visible effect.",
+      "fix": "Remove `backdrop-blur` from the console.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FP-53",
+      "title": "REC badge blink composites at 60 fps on the CPU for the whole recording",
+      "severity": "low",
+      "category": "perf",
+      "locations": [
+        "overlay.css:321"
+      ],
+      "claim": "The REC badge uses `cb-rec-blink 1.4s infinite` (overlay.css:321), a smooth animation that composites at 60 fps on the CPU for the whole recording.",
+      "scenario": "During a long manual recording, the overlay continuously renders frames for the blink.",
+      "fix": "Use `steps(2)` or an opacity toggle.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FP-54",
+      "title": "SaveVeil canvases keep video-resolution size after every save",
+      "severity": "low",
+      "category": "perf",
+      "locations": [
+        "dom.ts"
+      ],
+      "claim": "SaveVeil's two canvases keep their size at video resolution (dom.ts `freezeFrame`) after every save: about 30 MB at 1440p and 66 MB at 4K stay allocated.",
+      "scenario": "After saving a 4K clip, ~66 MB of canvas memory remains allocated while the veil is hidden.",
+      "fix": "Reset the canvases to 0x0 when the veil hides.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FP-55",
+      "title": "Store initialisation races invoke() against listen()",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "share.ts:39-42",
+        "friends.ts"
+      ],
+      "claim": "share.ts:39-42 and friends.ts initialise with `invoke(...)` racing `listen(...)`, so an older snapshot can overwrite a newer event.",
+      "scenario": "A share-state event arrives before the initial invoke resolves; the stale snapshot then overwrites it.",
+      "fix": "Fetch after listening, or keep a version counter.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-56",
+      "title": "Fake RESTING mock status is the console's initial state in production",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "Console.tsx:54-69"
+      ],
+      "claim": "Console.tsx:54-69 defines a `RESTING` mock status (`game: \"ARC Raiders\"`, 96 s buffered) that is used as the initial state in production too.",
+      "scenario": "On first open before the real status arrives, the console shows \"ARC Raiders\" and 96 s buffered regardless of reality.",
+      "fix": "Use null and a skeleton.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-57",
+      "title": "Friends \"Latest clip\" sends the newest item in one click without confirmation",
+      "severity": "low",
+      "category": "ux",
+      "locations": [
+        "Friends.tsx:135-144"
+      ],
+      "claim": "The Friends \"Latest clip\" button (Friends.tsx:135-144) sends the newest item, which may be a screenshot or a 1-hour recording, in one click mid-game with no confirmation.",
+      "scenario": "User clicks \"Latest clip\" mid-game expecting a short clip and sends a 1-hour recording to a friend.",
+      "fix": "Add a confirm or undo, or restrict to clips.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-58",
+      "title": "Offers cannot distinguish same-named friends and do not strip bidi characters",
+      "severity": "low",
+      "category": "ux",
+      "locations": [
+        "Offers.tsx"
+      ],
+      "claim": "Offers show only `friendName` (taken from the local friend list) with no avatar, so two friends with the same display name cannot be told apart. The sender controls `t.name` and `t.game`, and bidi control characters are not stripped.",
+      "scenario": "A friend sends a file whose name uses bidi control characters to disguise its extension, or two friends share a name and the user accepts from the wrong one.",
+      "fix": "Show an avatar; strip bidi control characters from sender-controlled fields.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-59",
+      "title": "Dead ipc wrapper screenshotHasOriginal calls an unregistered command",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "ipc.ts:150"
+      ],
+      "claim": "ipc.ts:150 `screenshotHasOriginal` is a dead wrapper that calls a command that is not registered.",
+      "scenario": "Any future caller of `screenshotHasOriginal` gets a command-not-found rejection.",
+      "fix": "Remove the wrapper (or register the command).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-60",
+      "title": "Duplicated helpers: zuletzt() and three clock() copies",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "Friends.tsx:232",
+        "PlayerControls.tsx",
+        "ClipEditor.tsx",
+        "Setup.tsx"
+      ],
+      "claim": "`zuletzt()` (Friends.tsx:232) duplicates `lastSeenText`, and there are three `clock()` copies (PlayerControls, ClipEditor, Setup).",
+      "scenario": "Fixing time formatting in one copy leaves the others inconsistent.",
+      "fix": "Consolidate into shared helpers.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-61",
+      "title": "FfmpegNotice countdown never counts down and Retry has no busy state",
+      "severity": "low",
+      "category": "ux",
+      "locations": [
+        "FfmpegNotice"
+      ],
+      "claim": "FfmpegNotice's \"trying again in X\" text never counts down, and \"Retry now\" has no busy state.",
+      "scenario": "User sees a frozen \"trying again in X\" and clicks Retry repeatedly with no feedback.",
+      "fix": "Tick the countdown and show a busy state on Retry.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-62",
+      "title": "Setup finish does not mention that ffmpeg may still be missing",
+      "severity": "low",
+      "category": "ux",
+      "locations": [
+        "Setup.tsx"
+      ],
+      "claim": "Setup's finish step does not mention that ffmpeg may still be missing (downloading or failed).",
+      "scenario": "User finishes setup expecting everything to work while ffmpeg is still unavailable.",
+      "fix": "Mention ffmpeg status on the finish step.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-63",
+      "title": "Player volume and mute are not persisted",
+      "severity": "low",
+      "category": "ux",
+      "locations": [
+        "ClipPlayer.tsx:109",
+        "Console.tsx:1210"
+      ],
+      "claim": "Player volume and mute are not persisted (ClipPlayer.tsx:109, Console.tsx:1210); they reset each time.",
+      "scenario": "User lowers the volume, closes and reopens the player, and it is loud again.",
+      "fix": "Add a small localStorage preference.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-64",
+      "title": "`playing` stays true during save; Space calls play() on a source-less element",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "ClipPlayer.tsx",
+        "useClipMix.ts"
+      ],
+      "claim": "While saving, the `pause` event never arrives (see the comment in useClipMix), so `playing` stays true, the rAF loop runs throughout, and Space calls `play()` on a source-less element, which is an unhandled rejection.",
+      "scenario": "User presses Space during a save; an unhandled promise rejection occurs and the rAF loop keeps running.",
+      "fix": "Call `setPlaying(false)` in `save()`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-65",
+      "title": "ClipPlayer.tsx is a 1100-line component duplicating logic with ShotViewer and ClipStage",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "ClipPlayer.tsx"
+      ],
+      "claim": "ClipPlayer.tsx is about 1100 lines. ShotViewer duplicates `LEAVE_MS`, the close animation and the `Step` component; ClipStage (console) re-implements paint, rAF, toggle and seek.",
+      "scenario": "Fixes to playback/transport or close behaviour must be made in several places and drift apart (e.g. the different input filtering in the console).",
+      "fix": "Split into `useOpenCloseFlight` (shared with ShotViewer), `useVideoTransport` (playing, time, duration, rAF paint, toggle, seek, trim loop; shared with ClipStage), `usePlayerShortcuts` with a modal stack, `useSaveFlow` (save, restore, discard, veil, reload) and `FullscreenBar`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-66",
+      "title": "Console.tsx is a 1500-line file with a ~1000-line Console() component",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "Console.tsx"
+      ],
+      "claim": "Console.tsx is about 1500 lines; `Console()` alone is about 1000 lines.",
+      "scenario": "Hard to review and maintain; changes risk regressions across unrelated console parts.",
+      "fix": "Split into `useConsoleLifecycle` (open/close tickets, `untilSized`, `finishClose`), `Dock`, `ClipsSheet`, `PerfSheet`, `ClipStage`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-67",
+      "title": "Comments and some strings mix German and English",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "src/"
+      ],
+      "claim": "Comments and some UI strings mix German and English (e.g. the German trim-handle aria-labels and `zuletzt()`).",
+      "scenario": "Non-German contributors cannot read comments; German strings leak into the English UI.",
+      "fix": "Standardise on one language for comments and strings.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-68",
+      "title": "Custom CSS properties require repeated `as CSSProperties` casts",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "src/"
+      ],
+      "claim": "Inline styles setting custom CSS properties need `as CSSProperties` casts throughout; one typed helper would do.",
+      "scenario": "Casts hide type errors in style objects.",
+      "fix": "Add one typed helper for custom CSS properties.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FP-69",
+      "title": "Misleading comments about clip file locking (\"fails quietly\" and \"let go of the file\")",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "Console.tsx",
+        "ClipPlayer.tsx"
+      ],
+      "claim": "Tauri's asset protocol opens files per range request (at most 1 MB) with Rust's default Windows share flags, which allow deletion, so open video elements do not lock clip files. The \"let go of the file\" step in save is therefore not needed for locking (only the `?v=` cache-busting is), and the console's comment that filing a clip open in the main window \"fails quietly\" is likely wrong: the move succeeds (see FP-11).",
+      "scenario": "Developers rely on the comment and assume filing an open clip is a no-op, missing that it actually moves the file and resets the main player's trim.",
+      "fix": "Correct the comments to reflect that the move succeeds.",
+      "reported_confidence": "likely"
+    }
+  ],
+  "proposals": [
+    {
+      "id": "FP-P-1",
+      "title": "Frame- and fps-aware stepping with an editable m:ss.ff timecode readout",
+      "area": "Player and editor",
+      "value": "Precise cuts at the clip's real frame rate with in/out points that can be typed.",
+      "effort": "?",
+      "sketch": "Use `requestVideoFrameCallback` for fps-aware stepping; show an m:ss.ff readout with editable in/out timecodes (ClipPlayer, PlayerControls, ClipEditor)."
+    },
+    {
+      "id": "FP-P-2",
+      "title": "Drag-to-scrub with hover thumbnail preview",
+      "area": "Player and editor",
+      "value": "Faster navigation to the right moment in a clip.",
+      "effort": "?",
+      "sketch": "Scrubber hover/drag preview using a thumbnail sprite or WebCodecs (PlayerControls Scrubber)."
+    },
+    {
+      "id": "FP-P-3",
+      "title": "Keyboard-nudgeable trim handles",
+      "area": "Player and editor",
+      "value": "Keyboard users and precise editing.",
+      "effort": "?",
+      "sketch": "Arrow keys move the focused trim handle (PlayerControls trim handles)."
+    },
+    {
+      "id": "FP-P-4",
+      "title": "Unsaved-changes guard plus Ctrl+S; undo/redo for trim and mix",
+      "area": "Player and editor",
+      "value": "Prevents losing edits and allows recovering from mistakes.",
+      "effort": "?",
+      "sketch": "Dirty guard on close/paging/delete, Ctrl+S shortcut, undo/redo history for trim and mix state (ClipPlayer, useClipMix)."
+    },
+    {
+      "id": "FP-P-5",
+      "title": "Cancel for save, restore and export",
+      "area": "Player and editor",
+      "value": "Users can abort long ffmpeg jobs.",
+      "effort": "?",
+      "sketch": "Add a Rust cancel command that kills ffmpeg and wire Cancel buttons in the save/restore flow and ExportDialog."
+    },
+    {
+      "id": "FP-P-6",
+      "title": "Playback speed, J/K/L shuttle and a loop toggle",
+      "area": "Player and editor",
+      "value": "Standard editor transport controls; looping is currently forced inside a selection.",
+      "effort": "?",
+      "sketch": "Add playback-rate control and J/K/L shuttle (`useClipMix` already follows `ratechange`); add a loop toggle in ClipPlayer."
+    },
+    {
+      "id": "FP-P-7",
+      "title": "\"Export selection\" honouring the unsaved trim",
+      "area": "Player and editor",
+      "value": "Export exactly what the user selected without saving first, with expectations set.",
+      "effort": "?",
+      "sketch": "Export the unsaved trim selection, show estimated size and time, and offer \"open folder\" afterwards (ExportDialog, export_clip)."
+    },
+    {
+      "id": "FP-P-8",
+      "title": "Autocomplete for the Game field",
+      "area": "Player and editor",
+      "value": "Avoids typo folders.",
+      "effort": "?",
+      "sketch": "Add autocomplete to the Game field in ClipMeta, as Tags already have."
+    },
+    {
+      "id": "FP-P-9",
+      "title": "Persisted player volume",
+      "area": "Player and editor",
+      "value": "Volume and mute survive reopening the player.",
+      "effort": "?",
+      "sketch": "Store volume/mute in a small localStorage preference (ClipPlayer, Console ClipStage)."
+    },
+    {
+      "id": "FP-P-10",
+      "title": "Split and multi-segment cuts",
+      "area": "Player and editor",
+      "value": "Cut out the middle of a clip or keep several segments.",
+      "effort": "?",
+      "sketch": "Extend the edit model and trim UI to multiple segments (ClipEditor, edit.rs)."
+    },
+    {
+      "id": "FP-P-11",
+      "title": "Choose the thumbnail frame",
+      "area": "Player and editor",
+      "value": "Users pick a representative thumbnail for a clip.",
+      "effort": "?",
+      "sketch": "Add a \"use this frame as thumbnail\" action in the player."
+    },
+    {
+      "id": "FP-P-12",
+      "title": "Unmount or pause console content while hidden",
+      "area": "Console",
+      "value": "Removes the CPU cost of the hidden console over the game (see FP-1).",
+      "effort": "?",
+      "sketch": "Unmount `.cb-ui` and the glow after the exit animation, or pause animations while hidden (Console.tsx, console.css)."
+    },
+    {
+      "id": "FP-P-13",
+      "title": "Per-job busy state with progress and cancel for \"Shrink to 10/25 MB\"",
+      "area": "Console",
+      "value": "Users see progress for each shrink job and can cancel it.",
+      "effort": "?",
+      "sketch": "Track busy per job in Console.tsx, show `clip-progress`, add a cancel command."
+    },
+    {
+      "id": "FP-P-14",
+      "title": "Error state in ClipStage",
+      "area": "Console",
+      "value": "A missing file is reported instead of a black box.",
+      "effort": "?",
+      "sketch": "Add `onError` handling to ClipStage's video/img (Console.tsx)."
+    },
+    {
+      "id": "FP-P-15",
+      "title": "Arrow-key navigation across the dock and a visible focus ring",
+      "area": "Console",
+      "value": "Keyboard/controller-friendly console.",
+      "effort": "?",
+      "sketch": "Roving tabindex with arrow keys across dock buttons; visible focus styles (Console.tsx, console.css)."
+    },
+    {
+      "id": "FP-P-16",
+      "title": "Undo toast after delete; confirm or undo for one-click \"Latest clip\" sends",
+      "area": "Console",
+      "value": "Recover from accidental deletes and sends.",
+      "effort": "?",
+      "sketch": "Undo toast after delete in the console; confirm/undo step on the Friends \"Latest clip\" button."
+    },
+    {
+      "id": "FP-P-17",
+      "title": "Offers with avatar and expiry countdown",
+      "area": "Console",
+      "value": "Users can tell senders apart and know how long an offer stays valid.",
+      "effort": "?",
+      "sketch": "Show friend avatar and an expiry countdown on offers (Offers.tsx)."
+    },
+    {
+      "id": "FP-P-18",
+      "title": "Option to turn off decorative motion",
+      "area": "Console",
+      "value": "Saves CPU on low-end PCs.",
+      "effort": "?",
+      "sketch": "A setting that disables the live ring and rim animations."
+    },
+    {
+      "id": "FP-P-19",
+      "title": "Short queue for important overlay banners",
+      "area": "Overlay",
+      "value": "Important banners are not lost when replaced by newer ones.",
+      "effort": "?",
+      "sketch": "Queue important banners instead of replacing them (Overlay.tsx, overlay.rs)."
+    },
+    {
+      "id": "FP-P-20",
+      "title": "steps() blink for the REC badge",
+      "area": "Overlay",
+      "value": "Cheaper rendering during recordings.",
+      "effort": "?",
+      "sketch": "Change `cb-rec-blink` to `steps(2)` timing (overlay.css)."
+    },
+    {
+      "id": "FP-P-21",
+      "title": "Second guard against overlay focus",
+      "area": "Overlay",
+      "value": "Extra protection against the overlay stealing focus from the game.",
+      "effort": "?",
+      "sketch": "Optionally set `WS_EX_NOACTIVATE` or `focusable(false)` on the overlay window (overlay.rs)."
+    },
+    {
+      "id": "FP-P-22",
+      "title": "\"Do not disturb while recording a manual session\" mode for friend notices",
+      "area": "Overlay",
+      "value": "No friend banners interrupt a manual recording.",
+      "effort": "?",
+      "sketch": "Suppress friend notice banners while a manual recording runs."
+    }
+  ],
+  "positives": [
+    "No XSS sinks: there is no `dangerouslySetInnerHTML`, `innerHTML`, `window.open` or opener use in `src/`; friend names, statuses, games and clip titles are rendered as React text; avatars are limited by `img-src https://cdn.discordapp.com`; share links are only copied, never opened.",
+    "The CSP blocks inline scripts.",
+    "No object URLs: there are no `URL.createObjectURL` calls, so nothing leaks there.",
+    "The overlay never takes focus: tao keeps `MARKER_DONT_FOCUS` from `.focused(false)`, so every `show()` uses `SW_SHOWNOACTIVATE`; `set_ignore_cursor_events` makes it click-through; `to_top` uses `SWP_NOACTIVATE`.",
+    "Overlay banners are coalesced by a sequence ticket and the frontend replaces rather than queues, so nothing accumulates.",
+    "The console hands focus back correctly (`take_foreground` before hide; `Focused(false)` clears `PREVIOUS`).",
+    "The audio-levels stream goes only to windows that are actually visible (`window_awake` plus `emit_to`).",
+    "Element fullscreen works: tauri-runtime-wry handles `ContainsFullScreenElementChanged` by making the window fullscreen.",
+    "Open video elements do not lock clip files: Tauri's asset protocol opens the file per range request (at most 1 MB) with Rust's default Windows share flags, which allow deletion.",
+    "Double save is prevented by the core's render lock plus the disabled button.",
+    "Incoming file names from friends are sanitised in `share.rs` (`safe_file_name`).",
+    "Offers show `friendName` taken from the local friend list rather than a sender-supplied name.",
+    "ExportDialog.tsx:84-95 handles Tauri `listen()`/unlisten cleanup correctly.",
+    "Thumbnails already use `?v=${clip.sizeBytes}` cache-busting."
+  ]
+}

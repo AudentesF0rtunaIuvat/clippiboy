@@ -1,0 +1,567 @@
+{
+  "slice": "07-state-concurrency",
+  "defects": [
+    {
+      "id": "ST-1",
+      "title": "current_game MutexGuard held across overlay::show, which blocks on the main thread: possible permanent deadlock",
+      "severity": "critical",
+      "category": "bug",
+      "locations": ["lib.rs:216-221", "lib.rs:356", "overlay.rs:404", "overlay.rs:479", "commands.rs:316", "state.rs:736", "state.rs:472", "state.rs:515", "Console.tsx:337"],
+      "claim": "At lib.rs:216-221 `overlay::show(app, BannerKind::Recording, \"Recording\", state.current_game.lock().clone());` and at lib.rs:356 `Some(match state.current_game.lock().as_ref() { … })` the MutexGuard is a temporary in a call argument (or a `match` scrutinee), so it lives until the end of the statement, which includes the whole of `overlay::show`. Inside `overlay::show`, `window.is_visible()` (overlay.rs:404) and `window.hwnd()` (overlay.rs:479) are blocking main-thread round trips when called from a worker thread (tauri-runtime-wry's `getter!` sends a message to the main thread and waits on `rx.recv()`). These main-thread paths lock `current_game`: `engine_status` (sync command, commands.rs:316) -> `status_snapshot` (state.rs:736); the toggle-buffer hotkey (runs on the main thread) -> `start_pipeline` (state.rs:472/515); `set_config` -> `start_buffer_and_notify`. The worker holds `current_game` while waiting on the main thread, and the main thread waits on `current_game`, so the app deadlocks. Report: rare but a permanent hang; the pattern is confirmed, the interleaving is plausible.",
+      "scenario": "At boot, `start_buffer_if_configured`'s thread takes `current_game` at lib.rs:356 and queues IsVisible. At the same moment the console page mounts and calls `api.status()` (Console.tsx:337); the main thread dispatches that IPC first and blocks on `current_game`. Neither side can continue: the event loop is dead, so all windows, the tray and the hotkeys (which arrive through the same message loop) hang for good. A second trigger: the record hotkey, then the toggle-buffer hotkey within a few milliseconds.",
+      "fix": "Read the value into a local first (`let game = state.current_game.lock().clone(); overlay::show(…, game)`) at both sites. Make it a rule that no AppState guard is alive while calling window APIs. Better still, send banners through a channel to one overlay worker thread.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-2",
+      "title": "Toggle-buffer hotkey starts and stops the capture stack on the UI (main) thread",
+      "severity": "high",
+      "category": "perf",
+      "locations": ["lib.rs:813-816", "lib.rs:786", "state.rs:486", "mft.rs:1135", "state.rs:1014-1020"],
+      "claim": "Global-shortcut Pressed handlers run on the main thread (inside the hidden hotkey window's window procedure). lib.rs:813-816: `if event.state() == ShortcutState::Pressed { toggle_buffer_and_notify(app); }` runs the toggle directly, while every other hotkey spawns a thread. The work done there: `launch_pipeline` spawns `ffmpeg -version` every time, because at state.rs:486 `!muxer::available() && tools::is_ready()` evaluates the expensive check first; `Pipeline::start` waits up to 10 s for encoder readiness (mft.rs:1135, `recv_timeout(10s)`); `lifecycle` may be held elsewhere, e.g. by `attach_recorder`'s 5 s keyframe loop (state.rs:1014-1020) or a `close_recording` whose writer is flushing to a slow disk; stop drains the encoder with unbounded joins. The comment at lib.rs:786 (\"the hotkey arrives on one of its own\") is wrong. Latent: the plugin's `unregister_all` holds its `shortcuts` lock while it waits on the main thread, and the hotkey handler takes the same lock on the main thread, so calling `register_hotkeys` off the main thread would deadlock (today only sync commands and `setup` call it, so it is not reachable yet).",
+      "scenario": "Pressing the toggle-buffer hotkey freezes every webview (main window, console, banner) while the pipeline starts or stops; every worker thread that needs a window query stalls too, including the status thread's `window_awake` and banner display. This is also what makes the current_game deadlock (ST-1) possible.",
+      "fix": "`std::thread::spawn(move || toggle_buffer_and_notify(&app))`, and swap the operand order at state.rs:486. Keep `register_hotkeys` on the main thread.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-3",
+      "title": "Persistent start failure makes the automation retry every 2 s with an error sound and banner",
+      "severity": "high",
+      "category": "bug",
+      "locations": ["state.rs:188-190", "state.rs:246-252", "lib.rs:363-366"],
+      "claim": "state.rs:188-190: `if !buffer_active && !self.suppressed.load(SeqCst) { self.started.store(true, SeqCst); return AutoAction::Start; }`. `poll_always` (state.rs:246-252) has the same shape. Nothing records a start failure. Each failure runs `notify(error)`, `sounds::play(Error)` and `overlay::show(Error, \"Buffer will not start\")` (lib.rs:363-366). Error banners stay at least 6 s, so with a 2 s retry the banner never goes away. Each attempt also builds and tears down D3D, WGC, MFT and the ffmpeg probe during gameplay.",
+      "scenario": "ffmpeg is quarantined by antivirus after `tools` reported ready, encoder session limits are hit, or the GPU device is lost: the automation retries Start every 2 s forever, playing an error sound and keeping an error banner up permanently during gameplay.",
+      "fix": "Keep a failure count with exponential backoff. After N failures, set `suppressed` and announce it once.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-4",
+      "title": "Starting a second instance rotates and destroys the running instance's log",
+      "severity": "high",
+      "category": "bug",
+      "locations": ["lib.rs:1153", "lib.rs:1185", "logging.rs:59-63"],
+      "claim": "lib.rs:1153: `logging::init()` runs before `.plugin(tauri_plugin_single_instance…)`. Plugin setup only runs at `.build()`, and `.manage(AppState::new())` (lib.rs:1185) is also evaluated eagerly before that. `rotate()` (logging.rs:59-63) renames the live `clippiboy.log` over `clippiboy.log.1`, destroying the previous session's log, then creates a new file. Rust opens files with share-delete, so the rename succeeds while the first instance has the log open. The second instance also loads config, enumerates MFT encoders (`encode::resolve`), runs SQLite migrations with no busy_timeout against the live database, and starts audio streams before it exits. Report severity: Medium-High.",
+      "scenario": "Every relaunch from the Start menu while the app sits in the tray, and every `clippiboy://` deep link (each Discord sign-in), leaves a 5-line stub as `clippiboy.log`. The live log moves to `.log.1` and the previous session's log is gone.",
+      "fix": "Do the single-instance check first (a named mutex in `main()` before `logging::init`, or a lazy `AppState`), and rotate only once this is known to be the primary instance.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-5",
+      "title": "Stream Deck start/stop bypass the automation's \"user decided\" flags",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["control.rs:225-226"],
+      "claim": "control.rs:225-226 call `\"start\" => crate::start_buffer_and_notify(app)` and `\"stop\" => crate::stop_buffer_and_notify(app)` directly, with no `auto.manual_start()` / `manual_stop()` call, so the buffer automation does not know the user decided.",
+      "scenario": "With auto-start on, a Stream Deck \"stop\" is undone 2 s later by `poll_always` or `poll(playing)`.",
+      "fix": "Route through one `set_buffer(app, on, Origin::User)`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-6",
+      "title": "Failed recording close leaves status.recording = true and an orphaned capture pipeline running",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["state.rs:1072-1078"],
+      "claim": "state.rs:1072-1078: `Err(err) => { log::error!(…); return None; }` returns before `if !self.buffer_wanted() { self.halt_pipeline(); }` and before `self.status.lock().recording = false`. The recorder has already been removed from both AppState and the pipeline. `finish` fails when `write_meta` fails, which is exactly the disk-full case the room guard is there for.",
+      "scenario": "The disk fills during a recording, `write_meta` fails and close returns early: the UI and tray show \"recording\" forever, and a recording-only pipeline (capture plus encoder) keeps running with the buffer off.",
+      "fix": "A scope guard that always halts the pipeline (when the buffer is not wanted) and clears the recording flag.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-7",
+      "title": "Quit does not wait for a save in progress and can hang on the main thread",
+      "severity": "medium",
+      "category": "robustness",
+      "locations": ["tray.rs:139-148"],
+      "claim": "tray.rs:139-148 Quit runs `abandon_recording(); stop_pipeline(); app.exit(0)`, and so does the updater's `on_before_exit`. None of them check `is_saving()`. The save thread dies while ffmpeg is running (there is no Job object). In addition, the Quit handler runs on the main thread and joins encoder threads with no timeout.",
+      "scenario": "Quitting during a clip save: ffmpeg finishes the MP4, but it is never inserted into the library and gets no thumbnail, so the clip is missing from the gallery; a quick restart's `discard_leftovers()` can delete ffmpeg's temp inputs mid-read. A driver hang during encoder shutdown makes Quit hang.",
+      "fix": "Do Quit on a worker thread: show a \"finishing clip…\" banner, wait for saving to clear with a timeout, then exit. Optionally handle WM_QUERYENDSESSION so a Windows logoff closes recordings cleanly.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-8",
+      "title": "halt_pipeline holds the pipeline lock during the whole Pipeline::stop",
+      "severity": "medium",
+      "category": "robustness",
+      "locations": ["state.rs:559"],
+      "claim": "state.rs:559: `if let Some(mut pipeline) = self.pipeline.lock().take() { pipeline.stop(); }`. In edition 2021 the guard temporary lives through the whole `if let`, so the `pipeline` mutex is held across `Pipeline::stop`'s joins (the entire encoder drain).",
+      "scenario": "While the pipeline stops, `is_buffering()` (status thread, every 2 s), `save_clip` and `set_config` block for the entire encoder drain.",
+      "fix": "`let p = self.pipeline.lock().take(); if let Some(mut p) = p { p.stop(); }`",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-9",
+      "title": "\"Only buffer in game\": an alt-tab of 30 s or more cancels the user's manual stop, contradicting the README",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["state.rs:195-200"],
+      "claim": "`poll` is fed `GameTick::playing`, which depends on what is in the foreground. state.rs:195-200: after `GRACE_POLLS` checks without the game in front, `self.suppressed.store(false, SeqCst)`. The README says the automation \"holds back until the game has ended\".",
+      "scenario": "A user stops the buffer by hand, checks Discord for 30 s, returns, and the buffer starts again. The same 30 s alt-tab also discards an automation-started buffer and its history.",
+      "fix": "Clear `suppressed` only when the bound game process exits (`game_pid` becomes None); consider pausing rather than stopping while the game process is still alive.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-10",
+      "title": "Duplicate start/stop actions while one is still in progress (decisions taken outside lifecycle)",
+      "severity": "medium",
+      "category": "robustness",
+      "locations": ["lib.rs:660", "lib.rs:335", "commands.rs:326-348", "state.rs"],
+      "claim": "`buffer_active` only becomes true at the end of `launch_pipeline`, so any 2 s automation tick during a slow start (cold boot, or `Pipeline::start` taking up to 10 s) spawns another Start (lib.rs:660). That thread waits on `lifecycle`, sees the pipeline running and returns Ok, producing a second \"Replay buffer running\" toast, sound and banner, plus another device enumeration. `toggle_buffer_and_notify` (lib.rs:335) and the `start_buffer`/`stop_buffer` commands also decide outside the lock; both commands are implemented as toggles (commands.rs:326-348), so a race can act in the wrong direction. `AutoBuffer` is five separate atomics, so `manual_stop` can tear against `poll` between its load of `suppressed` and its store to `started`.",
+      "scenario": "At boot, `start_buffer_if_configured` and the first `poll_always` both start the buffer, giving duplicate toast/sound/banner and an extra device enumeration; a race on the toggle-implemented `start_buffer`/`stop_buffer` commands can turn the buffer the wrong way.",
+      "fix": "An \"in-flight\" flag or `lifecycle.try_lock()` in `apply_auto_buffer`; an idempotent `set_buffer(on)` checked under `lifecycle`; `AutoBuffer` as one `Mutex<AutoState>`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-11",
+      "title": "Game detection treats maximized windows as fullscreen games",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["game.rs:453-456"],
+      "claim": "game.rs:453-456 checks `rect.left <= screen.left && rect.top <= screen.top && rect.right >= screen.right && rect.bottom >= screen.bottom` against `rcMonitor`. A maximized framed window's `GetWindowRect` hangs about 8 px past the work area on every side. On a monitor with no taskbar (common on secondary screens) or with an auto-hide taskbar, the work area is the whole monitor, so any maximized unknown app counts as a fullscreen game (blender.exe, photoshop.exe, unity.exe, mstsc.exe, …).",
+      "scenario": "In only-in-game mode, a maximized app on a monitor without a taskbar starts the buffer, game audio binds to that app, and clips are filed under its title.",
+      "fix": "Require `!IsZoomed(hwnd)` and no `WS_CAPTION`/`WS_THICKFRAME`, or use `SHQueryUserNotificationState` (QUNS_BUSY or D3D fullscreen).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-12",
+      "title": "Heavy sync Tauri commands block the UI thread",
+      "severity": "medium",
+      "category": "perf",
+      "locations": ["commands.rs:117-121", "commands.rs"],
+      "claim": "These commands are sync, so they run on the main thread: `set_config` (stops and restarts the pipeline on a source change, commands.rs:117-121), `list_encoders` (MFT enumeration), `list_capture_targets` (EnumWindows + QueryDisplayConfig), `list_audio_devices` and `list_audio_processes` (COM). `file_clip` holds the library lock across `filing::place`, whose rename retries sleep up to 600 ms in total. `delete_clip` does file I/O; `set_clip_dir` writes a probe file, which can stall on a network path.",
+      "scenario": "Changing the capture source in settings, or pointing the clip directory at a slow network path, freezes all windows, the tray and hotkeys while the command runs on the main thread.",
+      "fix": "`#[tauri::command(async)]` for all of these.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-13",
+      "title": "Status loop mixes 20 Hz UI work with slow polling, and polling is costly",
+      "severity": "medium",
+      "category": "perf",
+      "locations": ["lib.rs:928", "lib.rs:946", "lib.rs:963"],
+      "claim": "The status thread (`spawn_ui_updates`, lib.rs:928) runs one 50 ms loop forever (no stop flag, no join) that mixes 20 Hz UI work with slow polling, so any stall freezes the meters, game detection and the automation together (e.g. `refresh_free_bytes` on a dead network drive, or COM `list_devices` on a bad audio driver). Per 2 s tick: `QueryDisplayConfig` twice (watch_monitors, screen_drift) — frequent display-config polling is a reported cause of periodic stutter on some drivers (speculative); `OpenInputDesktop` three times; endpoint enumeration plus property stores; a freshly spawned thread doing a Toolhelp snapshot with one String per process, plus audio session enumeration; foreground detection with a second `OpenProcess` in `foreground_is_ours`. Per 50 ms: `config_snapshot().sources` clones the whole `AppConfig` (lib.rs:946), and `std::env::var(\"CLIPPIBOY_LOG_LEVELS\")` is looked up (lib.rs:963).",
+      "scenario": "`refresh_free_bytes` stalls on a dead network drive (or COM `list_devices` on a bad audio driver), freezing the audio meters, game detection and buffer automation at once; the continuous polling adds per-tick cost during gameplay.",
+      "fix": "Separate threads for meters and monitoring; an `Arc<AppConfig>` swapped on change; event-driven sources (see proposals).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-14",
+      "title": "Two stop requests for one recording produce a spurious \"Recording failed\" banner",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["lib.rs:1043-1048"],
+      "claim": "lib.rs:1043-1048 spawns `stop_recording_and_notify` every second while `recording_failure()` is Some, with no guard; only `guard_recording_room` uses `STOPPING`. Both conditions fire together when the disk fills. The losing thread returns \"No recording is running.\" and plays an error sound and banner on top of \"Saving recording…\". Report severity: Low-Medium; likely in the disk-full case.",
+      "scenario": "The disk fills during a recording: the failure path and the room guard both request a stop, and the user gets an error sound and banner over the \"Saving recording…\" banner.",
+      "fix": "A shared stopping flag, or make the failure report one-shot.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-15",
+      "title": "Alt+F4 on the console destroys it for the rest of the session",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["lib.rs:1276-1280"],
+      "claim": "lib.rs:1276-1280 only prevents close for the `\"main\"` window. The console takes focus, so Alt+F4 destroys it. After that, `console::open` logs \"console window missing\" until the app restarts. Report severity: Low-Medium; confirmed by Tauri semantics.",
+      "scenario": "The user presses Alt+F4 while the console is focused; the console can no longer be opened until the app restarts.",
+      "fix": "Prevent close for the console and call `console::close`, or recreate it lazily in `open()`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-16",
+      "title": "tint.rs:36 panics on a non-ASCII accent colour (release build aborts on every start)",
+      "severity": "medium",
+      "category": "robustness",
+      "locations": ["tint.rs:36"],
+      "claim": "tint.rs:36: `u8::from_str_radix(&hex[at..at + 2], 16)` runs after a byte-length check only, so the byte slice can split a multi-byte character and panic; `\"#€ab1\"` passes the check and panics (confirmed by test). `config::load` does not call `clean_accent` (only `set_config` does), so a bad value from config.json reaches `tray::build`. Release builds abort on panic. Report severity: Low-Medium.",
+      "scenario": "A hand-edited config.json with an accent like `\"#€ab1\"` crashes the app at `tray::build` on every start.",
+      "fix": "`if !hex.is_ascii() { return None }`, and sanitize the accent in `load`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-17",
+      "title": "Banner can get the wrong size or land partly off-screen on monitors with different scaling",
+      "severity": "low",
+      "category": "bug",
+      "locations": ["overlay.rs:532-533"],
+      "claim": "overlay.rs:532-533 calls `set_size(PhysicalSize)` and then `set_position`. Crossing to a monitor with another scale triggers WM_DPICHANGED, and tao rescales the window (allow_resize is true for non-maximized windows; checked in tao source), altering the size just set. The console works around this by placing twice; the overlay does not.",
+      "scenario": "A banner shown on a monitor with a different scale factor than the one it was last on ends up the wrong size or partly off-screen.",
+      "fix": "Position, then size, then position again.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-18",
+      "title": "Overlay appears in Alt+Tab and Task View while visible (the whole recording with the REC badge on)",
+      "severity": "low",
+      "category": "bug",
+      "locations": ["overlay.rs"],
+      "claim": "tao implements `skip_taskbar` with `ITaskbarList::DeleteTab` only. The overlay window is not `focusable(false)` and has no WS_EX_TOOLWINDOW or WS_EX_NOACTIVATE, so it is listed in Alt+Tab and Task View whenever it is visible, which is the whole recording when the REC badge is on.",
+      "scenario": "During a recording with the REC badge enabled, the overlay shows up in Alt+Tab and Task View for the whole recording.",
+      "fix": "`.focusable(false)`, or add WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-19",
+      "title": "Free space of 0 means both \"unknown\" and \"disk completely full\"",
+      "severity": "low",
+      "category": "bug",
+      "locations": ["lib.rs:860", "lib.rs:890-893"],
+      "claim": "lib.rs:860: `disk::free_bytes(...).unwrap_or(0)`, and `guard_recording_room` returns early when it reads 0 (lib.rs:890-893). A failed free-space query and a completely full disk are indistinguishable, and the room guard is off exactly at 0.",
+      "scenario": "A recording can start on a full disk, and the recording-room guard does nothing once free space reaches 0.",
+      "fix": "A separate \"known\" flag, or `u64::MAX` as the sentinel.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-20",
+      "title": "A user override in games.json may or may not win, at random",
+      "severity": "low",
+      "category": "bug",
+      "locations": ["game.rs:198-206"],
+      "claim": "game.rs:198-206: `map.extend(extra)` runs before keys are lowercased. A user key `\"CS2.exe\"` and the built-in `\"cs2.exe\"` then collide in `.collect()`, and HashMap iteration order picks the winner.",
+      "scenario": "A user overrides `\"CS2.exe\"` in games.json; on some runs the built-in `\"cs2.exe\"` entry wins instead.",
+      "fix": "Lowercase the user's keys before `extend`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-21",
+      "title": "Title-derived game name is overwritten on every tick",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["state.rs:671"],
+      "claim": "state.rs:671 `(Some(_), _) => *held = name.clone()` overwrites a title-derived game name on every tick. Titles that change (\"Loading\", map names) fragment clip folders and spam presence updates.",
+      "scenario": "A game whose window title changes between \"Loading\" and map names has its clips filed into several folders and sends repeated presence updates.",
+      "fix": "Pin the name per PID.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-22",
+      "title": "exe_name uses a MAX_PATH buffer, so games at longer paths are never detected",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["game.rs:408"],
+      "claim": "`exe_name` uses a MAX_PATH-sized buffer (game.rs:408), so executables with longer paths are never detected.",
+      "scenario": "A game installed under a path longer than MAX_PATH is never detected as a game.",
+      "fix": "No explicit fix in the report (implied: support paths longer than MAX_PATH).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-23",
+      "title": "UWP games behind applicationframehost.exe are never detected",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["game.rs"],
+      "claim": "UWP games run behind `applicationframehost.exe`, which game detection ignores, so UWP games are never detected.",
+      "scenario": "A UWP/Microsoft Store game in the foreground is never detected as a game.",
+      "fix": "No explicit fix in the report (see the Xbox Game Bar / full-path detection proposals).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-24",
+      "title": "from_exe does not trim an upper-case \".EXE\" suffix",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["game.rs"],
+      "claim": "`from_exe` does not trim \".EXE\" in upper case when deriving a name from the executable.",
+      "scenario": "An executable named e.g. `GAME.EXE` yields a name that still carries the \".EXE\" suffix.",
+      "fix": "No explicit fix in the report (implied: trim the extension case-insensitively).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-25",
+      "title": "config::save uses one fixed tmp file; concurrent saves can corrupt config.json",
+      "severity": "low",
+      "category": "robustness",
+      "locations": ["config.rs"],
+      "claim": "`config::save` uses one fixed `config.json.tmp`. `replace_config` (main thread, saves outside the lock) can race `repair_screens` (status thread). Interleaved writes could corrupt the file, and `load()` then falls back to defaults, losing all settings. Speculative and rare.",
+      "scenario": "A settings save from the UI coincides with `repair_screens` saving from the status thread; the interleaved tmp writes corrupt config.json and the next start loads defaults, losing all settings.",
+      "fix": "Serialize saves, use unique tmp names, keep a `.bak`, and use struct-level `#[serde(default)]`.",
+      "reported_confidence": "speculative"
+    },
+    {
+      "id": "ST-26",
+      "title": "set_config replaces the whole config from the page's copy, reverting repair_screens corrections",
+      "severity": "low",
+      "category": "robustness",
+      "locations": ["commands.rs"],
+      "claim": "`set_config` replaces the whole config object with the page's copy. A stale settings page reverts `repair_screens`' monitor corrections, because `keep_once_flags` only covers two flags.",
+      "scenario": "`repair_screens` corrects the monitor settings while a settings page is open with an older copy; the next save from that page reverts the correction.",
+      "fix": "Send patch-style updates from the UI.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-27",
+      "title": "Tray buffer CheckMenuItem stays checked after a failed start",
+      "severity": "low",
+      "category": "bug",
+      "locations": ["tray.rs:345-357"],
+      "claim": "The tray's CheckMenuItem is toggled automatically by the menu library when clicked. After a failed start it stays checked, because `refresh` only calls `set_checked` when `buffer_active` changes (tray.rs:345-357).",
+      "scenario": "The user clicks the tray buffer item, the start fails, and the item remains checked although the buffer is off.",
+      "fix": "No explicit fix in the report (implied: re-sync the checked state after each click regardless of whether `buffer_active` changed).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-28",
+      "title": "Stream Deck \"stop\" while the buffer is already off still announces \"Replay buffer stopped\"",
+      "severity": "low",
+      "category": "ux",
+      "locations": ["control.rs"],
+      "claim": "A Stream Deck \"stop\" while the buffer is already off still plays \"Replay buffer stopped\" with sound and banner (stop is not idempotent / does not check current state).",
+      "scenario": "The buffer is off; pressing Stream Deck stop plays the stop sound and shows the \"Replay buffer stopped\" banner anyway.",
+      "fix": "No explicit fix in the report (implied: idempotent `set_buffer(on)` as in the capture state machine proposal).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-29",
+      "title": "Audio process picker opens every audio-session process (including the game) with PROCESS_VM_READ",
+      "severity": "low",
+      "category": "robustness",
+      "locations": ["audio/devices.rs:91-98"],
+      "claim": "The audio process picker (audio/devices.rs:91-98) opens every audio-session process, including the game, with `PROCESS_VM_READ`, which is an anti-cheat concern (game.rs, by contrast, uses only `PROCESS_QUERY_LIMITED_INFORMATION`).",
+      "scenario": "Opening the audio process picker while a game with anti-cheat is running opens the game process with VM-read rights, which anti-cheat software may flag.",
+      "fix": "Use `QueryFullProcessImageNameW` like game.rs does.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-30",
+      "title": "tao's set_focus can inject a synthetic Alt press via SendInput",
+      "severity": "low",
+      "category": "robustness",
+      "locations": ["tao 0.35.3 (dependency): set_focus"],
+      "claim": "tao's `set_focus` falls back to injecting a synthetic Alt press via `SendInput` when `SetForegroundWindow` fails, which some anti-cheats flag (speculative).",
+      "scenario": "The app focuses one of its windows while a game with anti-cheat runs; `SetForegroundWindow` fails, tao injects a synthetic Alt key press, and the anti-cheat flags it.",
+      "fix": "No explicit fix in the report.",
+      "reported_confidence": "speculative"
+    },
+    {
+      "id": "ST-31",
+      "title": "AppState is a god object with fragmented game-tracking locks and two sources of truth for capture state",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["state.rs:859", "state.rs:941", "state.rs:1123"],
+      "claim": "AppState mixes config persistence, capture lifecycle, game tracking, automation, file naming, and building `Clip` (written out three times: state.rs:859, 941, 1123); `now_ms` is duplicated. Seven game-tracking mutexes are always updated together, which forces a \"one lock at a time\" dance, and `game_for` reads three locks separately and can get an inconsistent picture. `status.buffer_active` and `is_buffering()` are two sources of truth for capture state. `track_game` is not a pure, testable function.",
+      "scenario": "`game_for` reads three separate game-tracking locks and can observe an inconsistent combination while another thread updates them; capture state can disagree between `status.buffer_active` and `is_buffering()`.",
+      "fix": "Make the seven game-tracking mutexes one `Mutex<GameTracker>`; move pipeline, recorder, buffer_wanted, active_recording and `lifecycle` into a `CaptureController` with a single state enum; make `track_game` a pure, testable function.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "ST-32",
+      "title": "lib.rs is 1385 lines",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["lib.rs"],
+      "claim": "lib.rs is 1385 lines and mixes notify/actions, hotkeys, the status loop and setup.",
+      "scenario": "Maintainability: unrelated concerns in one file make concurrency rules (e.g. which code runs on the main thread) hard to see.",
+      "fix": "Split into notify/actions, hotkeys, status loop and setup modules.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-33",
+      "title": "Errors are Result<_, String> everywhere although thiserror is already a dependency",
+      "severity": "low",
+      "category": "quality",
+      "locations": [],
+      "claim": "Everything returns `Result<_, String>`, while thiserror is already a dependency.",
+      "scenario": "Callers cannot match on error kinds (e.g. to back off on a specific start failure); error context is stringly typed.",
+      "fix": "No explicit fix in the report (implied: typed errors with thiserror).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-34",
+      "title": "Stale comments",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["state.rs", "tray.rs", "lib.rs"],
+      "claim": "Stale comments: the `shared` field doc says `save_clip` holds `pipeline` across ffmpeg; \"stopping waits for a save in progress\"; the console hotkey thread comment; tray.rs \"several times a second\"; \"Reassign the two global hotkeys\" (there are five).",
+      "scenario": "Maintainers trust the comments (e.g. that stopping waits for a save, or which thread a hotkey runs on) and introduce concurrency bugs.",
+      "fix": "No explicit fix in the report (implied: update or remove the stale comments).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-35",
+      "title": "German text mixed into an English codebase, including user-facing log lines",
+      "severity": "low",
+      "category": "quality",
+      "locations": [],
+      "claim": "German is mixed into an English codebase, including user-facing log lines: \"Overlay bleibt klickbar\", \"Unbekannter Tray-Eintrag\", \"Pegel:\", \"blieb liegen\", \"Taktgeber\", \"Mischer\".",
+      "scenario": "Users and contributors reading logs see untranslated German messages.",
+      "fix": "No explicit fix in the report (implied: translate to English).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-36",
+      "title": "Missing tests for fullscreen heuristic, games.json merge and AutoBuffer automation",
+      "severity": "low",
+      "category": "test-gap",
+      "locations": ["game.rs", "state.rs"],
+      "claim": "game.rs's naming tests are meaningful, but there are no tests for the fullscreen heuristic, the games.json merge, or `AutoBuffer::poll`, `poll_always` and the manual-action interplay, which is exactly where the retry-storm (ST-3), Stream Deck bypass (ST-5) and alt-tab suppression (ST-9) bugs sit. Only `poll_lock` and `assigned_game` are tested.",
+      "scenario": "Regressions in the buffer automation and game detection logic go unnoticed because the logic has no tests.",
+      "fix": "No explicit fix in the report (implied: add tests for these areas; make `track_game` pure to enable it).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-37",
+      "title": "SourceKind::Leftovers has no TypeScript counterpart",
+      "severity": "info",
+      "category": "quality",
+      "locations": ["model.rs", "src/lib/types.ts"],
+      "claim": "`SourceKind::Leftovers` in model.rs has no counterpart in src/lib/types.ts; it is only read and is migrated at load.",
+      "scenario": "None expected today (the variant is migrated at load); a note on type parity.",
+      "fix": "None proposed.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-38",
+      "title": "Banner.avatar and corner are always sent but optional in TS",
+      "severity": "info",
+      "category": "quality",
+      "locations": ["model.rs", "src/lib/types.ts"],
+      "claim": "`Banner.avatar` and `corner` are always sent by Rust but typed as optional in src/lib/types.ts.",
+      "scenario": "None expected; the TS type is looser than the data actually sent.",
+      "fix": "None proposed.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "ST-39",
+      "title": "UpdateProgress.finished exists only in TS",
+      "severity": "info",
+      "category": "quality",
+      "locations": ["src/lib/types.ts"],
+      "claim": "`UpdateProgress.finished` exists only in TS, and is handled with `Omit<…>`.",
+      "scenario": "None expected; handled via `Omit<…>`.",
+      "fix": "None proposed.",
+      "reported_confidence": "confirmed"
+    }
+  ],
+  "proposals": [
+    {
+      "id": "ST-P-1",
+      "title": "Event-driven foreground tracking for game detection",
+      "area": "game detection",
+      "value": "Instant game detection with no injection into the game, replacing 2 s foreground polling.",
+      "effort": "?",
+      "sketch": "`SetWinEventHook(EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT)` for game detection."
+    },
+    {
+      "id": "ST-P-2",
+      "title": "Wait on the game process handle for game exit",
+      "area": "game detection",
+      "value": "Reliable game-exit detection without polling, removing `still_running` and its PID-reuse checks.",
+      "effort": "?",
+      "sketch": "A process `SYNCHRONIZE` handle plus `RegisterWaitForSingleObject` for game exit, replacing `still_running` and its PID-reuse checks."
+    },
+    {
+      "id": "ST-P-3",
+      "title": "Session lock notifications instead of OpenInputDesktop polling",
+      "area": "status loop / lock detection",
+      "value": "Tells the lock screen from a UAC prompt, so the 10 s LOCK_POLLS grace becomes unnecessary.",
+      "effort": "?",
+      "sketch": "`WTSRegisterSessionNotification`, or polling `WTSQuerySessionInformation(WTSSessionInfoEx)` lock flags."
+    },
+    {
+      "id": "ST-P-4",
+      "title": "Monitor change notifications instead of QueryDisplayConfig polling",
+      "area": "status loop / monitors",
+      "value": "Removes twice-per-2s `QueryDisplayConfig` polling (a possible stutter source).",
+      "effort": "?",
+      "sketch": "`WM_DISPLAYCHANGE` or `RegisterDeviceNotification(GUID_DEVINTERFACE_MONITOR)` for monitors."
+    },
+    {
+      "id": "ST-P-5",
+      "title": "Audio device and session notifications instead of enumeration polling",
+      "area": "audio",
+      "value": "Removes per-2s endpoint/session enumeration and its stall risk on bad drivers.",
+      "effort": "?",
+      "sketch": "`IMMNotificationClient` and `IAudioSessionNotification` for audio devices and sessions."
+    },
+    {
+      "id": "ST-P-6",
+      "title": "Use the full executable path for game detection",
+      "area": "game detection",
+      "value": "Detects windowed games and gives stable names.",
+      "effort": "?",
+      "sketch": "Use the full path `QueryFullProcessImageNameW` already returns (game.rs throws it away): `steamapps\\common\\<Folder>`, Epic, XboxGames, GOG and Riot paths give windowed games and stable names."
+    },
+    {
+      "id": "ST-P-7",
+      "title": "Read the Xbox Game Bar's game list",
+      "area": "game detection",
+      "value": "Leverages Windows' own list of known games.",
+      "effort": "?",
+      "sketch": "Read `HKCU\\System\\GameConfigStore\\Children` (`MatchedExeFullPath`)."
+    },
+    {
+      "id": "ST-P-8",
+      "title": "Capture state machine with origins, idempotent commands and backoff",
+      "area": "capture lifecycle / automation",
+      "value": "Fixes the class of start/stop races, Stream Deck bypass and retry storms in one place.",
+      "effort": "?",
+      "sketch": "A capture state machine with `Origin::{User, Automation, StreamDeck, Lock}`, idempotent commands, and backoff."
+    },
+    {
+      "id": "ST-P-9",
+      "title": "Graceful quit and Windows logoff handling",
+      "area": "shutdown",
+      "value": "No lost clips on quit or logoff.",
+      "effort": "?",
+      "sketch": "Wait for in-flight saves, finalize, then exit. Handle Windows logoff."
+    },
+    {
+      "id": "ST-P-10",
+      "title": "One overlay/UI-effects worker thread fed by a channel",
+      "area": "overlay / concurrency",
+      "value": "Removes blocking main-thread round trips from worker threads and with them the class of bug in ST-1.",
+      "effort": "?",
+      "sketch": "Send banner/UI-effect requests through a channel to a single overlay worker thread."
+    },
+    {
+      "id": "ST-P-11",
+      "title": "Skip banners in exclusive fullscreen",
+      "area": "overlay",
+      "value": "Avoids banners over exclusive-fullscreen games.",
+      "effort": "?",
+      "sketch": "Skip banners when `exclusive_fullscreen()` is true."
+    },
+    {
+      "id": "ST-P-12",
+      "title": "Tray-only REC indicator option",
+      "area": "overlay",
+      "value": "A REC badge window over the game for the whole recording can force composition and lose independent flip, adding latency (speculative).",
+      "effort": "?",
+      "sketch": "Offer a tray-only REC indicator instead of the on-screen REC badge."
+    },
+    {
+      "id": "ST-P-13",
+      "title": "Pause overlay CSS animations while hidden",
+      "area": "overlay",
+      "value": "Saves CPU: occlusion detection and backgrounding are disabled, and rendering is CPU-only (`--disable-gpu`).",
+      "effort": "?",
+      "sketch": "Pause CSS animations while the overlay is hidden."
+    },
+    {
+      "id": "ST-P-14",
+      "title": "Reduce memory by destroying hidden webviews",
+      "area": "memory",
+      "value": "Lower memory footprint while the app sits in the tray.",
+      "effort": "?",
+      "sketch": "Destroy the main webview while hidden in the tray, and create the console lazily."
+    },
+    {
+      "id": "ST-P-15",
+      "title": "Tauri app-command ACL",
+      "area": "hardening",
+      "value": "Today the overlay and console windows can invoke every app command; an ACL limits each window to what it needs.",
+      "effort": "?",
+      "sketch": "A Tauri app-command ACL (`app_manifest` in build.rs)."
+    }
+  ],
+  "positives": [
+    "No cycle among AppState locks: observed lock orders are lifecycle (always outermost) -> {pipeline, shared->packets, status, recorder, current_game, buffering_game, active_recording, config}; status -> shared -> shared.encoder (state.rs:518-526); status -> recorder (state.rs:681); recorder -> shared (state.rs:711-713); shared -> packets or source; pipeline -> packets -> shared.recorder (pipeline.rs:955, 973); game_pid -> game_since. The only cycle runs through the main thread (ST-1).",
+    "game.rs:321 `text.truncate(text.len() - suffix.len())` after `to_lowercase()` is safe: every codepoint was enumerated; only U+212A (Kelvin) lowercases to ASCII, and the cut still lands on a char boundary.",
+    "Other panic sites in the reviewed files are guarded or test-only; `lib.rs:1367 expect` is startup-only.",
+    "`register_hotkeys` is currently called only from sync commands and `setup` (main thread), so the latent plugin `unregister_all`/`shortcuts` deadlock is not reachable today.",
+    "The overlay does not steal focus on show: `MARKER_DONT_FOCUS` persists, so tao uses SW_SHOWNOACTIVATE every time (checked in tao source).",
+    "The console window already works around cross-monitor DPI rescaling by placing itself twice.",
+    "game.rs is fine for anti-cheat: `PROCESS_QUERY_LIMITED_INFORMATION` only, no module enumeration, and it works for elevated games.",
+    "game.rs's naming tests are meaningful (they use real regression data).",
+    "model.rs vs src/lib/types.ts compared field by field (AppConfig 33/33, EngineStatus 14/14, Clip 18/18, Friends, Sounds, Overlay, Accent `color_2`->`color2`, SourceKind tagging, BannerKind, console `Layout`, overlay `Placement`, ShotEdit/Rect, `tools::Status`): no casing or optionality mismatches."
+  ]
+}

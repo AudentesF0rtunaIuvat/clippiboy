@@ -1,0 +1,655 @@
+{
+  "slice": "04-audio-edit",
+  "defects": [
+    {
+      "id": "AU-1",
+      "title": "A launcher's leftovers tap also records the game, so game audio is in the clip twice",
+      "severity": "high",
+      "category": "bug",
+      "locations": ["src-tauri/src/audio/mod.rs:201-207", "src-tauri/src/audio/mod.rs:289"],
+      "claim": "In `Leftovers::assign` (audio/mod.rs:201-207) the coverage check `let covered = spoken_for.contains(&root) || ancestors(root, tree).iter().any(|parent| spoken_for.contains(parent));` only asks whether a leftovers root sits *below* something already recorded, never whether it sits *above* it. In addition, `SourceKind::Game => taken.extend(game_pid),` (mod.rs:289) excludes only the game pid itself, not `app_root(game_pid)`. Launchers (Steam, Battle.net, Epic, Riot Client) start the game as their child, and the repo's own test fixture notes steam.exe \"holds sessions on every device\". So steam.exe becomes a leftovers root and is tapped with `INCLUDE_TARGET_PROCESS_TREE`, which includes its child, the game. Same class: if the game's parent runs the same exe (a launcher stub), the leftovers tap that parent and record the game again.",
+      "scenario": "User records a Steam game with a Game source plus an output device in leftovers mode. steam.exe is chosen as a leftovers root and its INCLUDE_TREE tap captures game.exe, so the game is on the game track and also in the device/main mix. Muting the game track afterwards no longer removes the game audio, which is exactly what the README promises cannot happen.",
+      "fix": "In `assign`, also skip any root that is an ancestor of a taken pid: `taken.iter().any(|t| ancestors(*t, tree).contains(&root))`. For such a root, tap its other session-holding descendants one by one instead (accept that the launcher's own sound is lost, or surface a warning). Use `app_root` for the game in both `taken` and the tap. Add a test with steam.exe as the parent of game.exe.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-2",
+      "title": "Clips with one audio track: gain compounds on every save, and mute permanently strips the audio",
+      "severity": "high",
+      "category": "data-loss",
+      "locations": ["src-tauri/src/edit.rs:590-646", "src-tauri/src/stems.rs:174-179", "src/components/ClipEditor.tsx:113-121", "src/components/ClipPlayer.tsx:535"],
+      "claim": "When a clip has no individual tracks (only one WAV at save time, e.g. \"desktop audio only\", or a legacy clip), `from_stems == false` and the audio comes from `format!(\"0:a:{}\", track.index)` of input 0. When nothing is cut at the front, input 0 is the current clip file (`VideoSource::Clip`), which already has the previous gain baked in. The editor (ClipEditor.tsx:113-121) still shows a gain/mute row for that single track and `apply_clip_edit` stores the mix, so every later save re-applies it on top and adds one more AAC generation. A front cut instead reads the original, so the level jumps back. Muting the track makes `mix_filter` return `None`, which yields `-an`; without an original the audio is gone for good, `clip_tracks` then returns 0 tracks, so `dirty` (ClipPlayer.tsx:535) can never become true and Save is disabled for that clip forever. With an original present, later saves fail because `0:a:0` no longer exists in the target.",
+      "scenario": "A desktop-audio-only clip: set the track to -6 dB and save; open again and save another edit -> audio is now -12 dB, and so on with an extra AAC generation each time. Or mute the track and save -> audio stripped permanently (no original) and Save is disabled for that clip forever; with an original, later saves fail on missing `0:a:0`.",
+      "fix": "For single-track clips, always take the audio from `edit::source_path(clip)`, seeked to `stems_start_ms`, so it stays one generation from the original and the gain is relative to it. Alternatively, write a stem (a copy of the original track) on the first edit. Or hide/disable gain and mute when `!separate`, and store neutral values after baking them in.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-3",
+      "title": "Endpoint loopback on 5.1/7.1 devices drops the centre and surround channels (game dialogue)",
+      "severity": "high",
+      "category": "bug",
+      "locations": ["src-tauri/src/audio/capture.rs:280-287"],
+      "claim": "The packet conversion in capture.rs:280-287 keeps only the first two channels: `if src_channels == 1 { left = sample; right = sample; } else if channel == 0 { left = sample; } else if channel == 1 { right = sample; }`. There is no downmix of centre/LFE/surround channels. Device mode (endpoint loopback) is what \"Quick setup\" creates (default output device + mic; AudioMixer.tsx:506-511).",
+      "scenario": "A gaming headset exposes a 7.1 endpoint (virtual surround). The game puts dialogue on the centre channel, which never reaches the clip; rear and side effects are lost too.",
+      "fix": "Either initialise the device client with `float_format()` and `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY` so Windows does the downmix and resampling, or implement an ITU downmix driven by `dwChannelMask`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-4",
+      "title": "Rolling back the first cut can delete the only copy of the recording",
+      "severity": "high",
+      "category": "data-loss",
+      "locations": ["src-tauri/src/edit.rs:559-568"],
+      "claim": "In the swap-in rollback (edit.rs:559-568): `if let Err(err) = replace_file(temp, target) { if first_cut { let _ = move_across(&archive, target); let _ = std::fs::remove_file(note_path(&clip.id)); let _ = std::fs::remove_dir_all(dir(&clip.id)); } let _ = std::fs::remove_file(temp);`. At this point the target has already been renamed into the originals store. The result of `move_across` is ignored, so if the move back fails, `remove_dir_all` deletes the archive and `temp` is deleted as well. This contradicts the doc comment \"the clip can never disappear entirely\".",
+      "scenario": "On a first cut, `replace_file` fails 10 times (e.g. an antivirus or indexer handle) and the move of the archive back to the target also fails; the code then deletes the originals folder (the archive) and the temp file, so the clip no longer exists anywhere.",
+      "fix": "Delete the note and folder only when `move_across` returned `Ok`. Otherwise leave note + archive in place so `repair` arm 1 (`(false, Some(_), true)`) restores it on the next start, and keep `temp` too.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-5",
+      "title": "First cut across drives: a crash during the copy makes `repair` mark the untouched clip as trimmed",
+      "severity": "high",
+      "category": "robustness",
+      "locations": ["src-tauri/src/edit.rs:497-511", "src-tauri/src/edit.rs:945-948", "src-tauri/src/edit.rs:550-556", "src-tauri/src/edit.rs:87-94"],
+      "claim": "`move_across` (edit.rs:497-511) uses `std::fs::copy(from, to)` straight onto `video.mp4` in the originals store. When clips are on D: and AppData on C: (the case the README describes), copying several GB takes seconds to minutes. If the app is killed during the copy, on restart target, note and a partial `video.mp4` all exist and the DB row has no `original`, which matches repair arm `(true, Some(note), true) if clip.original.is_none()` (\"swapped, but the database never got its turn\", edit.rs:945-948), so `set_original(note)` runs; `settle` returns early because the clip's size is unchanged. Related: if the copy fails partway, swap_in (edit.rs:550-556) removes temp and note but leaves the partial `video.mp4`, and `source_path` (edit.rs:87-94) checks only that `video.mp4` exists, so it hands the partial file to later `clip_tracks` and edits until the next restart.",
+      "scenario": "User makes a first front cut on a clip stored on D:, app is killed during the multi-GB copy to C:. On restart the DB says \"trimmed at start_ms\" while the file is the full recording, so the individual tracks play `start_ms` off the picture, and \"Undo trim\" works from a truncated archive with no moov (muxer does not use faststart) and fails.",
+      "fix": "Copy to `video.mp4.part`, fsync, then rename within AppData; delete `.part` files in `repair`. In arm 3, check that the clip really is trimmed (probed length < `note.duration_ms` - tolerance) before trusting the note. Better: keep the originals store on the same volume as the clip (e.g. a hidden `.clippiboy/originals` folder) so the move is always an atomic rename, which also removes copying GBs to C: without checking free space.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-6",
+      "title": "An application picked by a child pid (Discord) records only that child; the other session is recorded nowhere",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["src-tauri/src/audio/mod.rs:292-298", "src-tauri/src/audio/mod.rs:336-345", "src/routes/AudioMixer.tsx:787-795"],
+      "claim": "In `audio::resolve`, `taken` excludes `app_root(live_pid)` (the whole Discord process tree) from the leftovers (mod.rs:292-298), but the application stream taps `pid: now`, the live pid itself (mod.rs:336-345). `list_processes` returns *session* pids, and for Discord those are its utility children (the repo's own `discord()` fixture); the UI stores one of them (AudioMixer.tsx:787-795).",
+      "scenario": "User adds \"Discord\" by clicking one of its entries in the picker (a utility child pid). The sibling Discord session (voice or notifications/stream, depending on which entry was clicked) ends up neither on the Discord track nor in the leftovers, so it is not recorded at all.",
+      "fix": "Tap `app_root(live_pid)` in `resolve`, consistent with `taken`. Also deduplicate the process picker by root.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-7",
+      "title": "A capture-start timeout leaves a zombie capture thread and WASAPI client running forever",
+      "severity": "medium",
+      "category": "robustness",
+      "locations": ["src-tauri/src/audio/capture.rs:127-136"],
+      "claim": "On the start timeout (capture.rs:127-136) the code returns `Err(_) => Err(\"timed out starting the audio source\".into()),` without setting `stop`, and the JoinHandle is dropped. If the device's `Activate`/`Initialize` answers after 5 s, the thread sends into a dead channel and then pumps into an unreferenced ring forever, holding the WASAPI client. `retry_failed` runs every 10 s and can pile these threads up.",
+      "scenario": "A flaky/slow USB or Bluetooth device takes more than 5 s to initialise; each 10 s `retry_failed` attempt times out and leaves another capture thread and client running indefinitely.",
+      "fix": "Call `stop.store(true, Relaxed)` before returning the timeout error; the thread checks it after init and exits.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-8",
+      "title": "Solo counts disabled sources and is persisted: a disabled soloed source silences every track",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["src-tauri/src/audio/mod.rs:448-451"],
+      "claim": "The audibility rule in audio/mod.rs:448-451 is `let any_solo = sources.iter().any(|s| s.solo); source.enabled && !source.muted && (!any_solo || source.solo)`. `any_solo` also counts disabled sources, and solo is stored in the config, so the state survives restarts. Solo is destructive (affects what is recorded, not just monitoring).",
+      "scenario": "User solos a source, then disables it: every remaining track records silence, and this persists across restarts because solo is saved in the config.",
+      "fix": "Use `sources.iter().any(|s| s.enabled && s.solo)`. Clear solo on disable and/or on startup. Add a configuration warning \"solo active — N tracks record silence\".",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-9",
+      "title": "Level meters ignore solo and keep moving while the buffer records zeros",
+      "severity": "medium",
+      "category": "ux",
+      "locations": ["src-tauri/src/audio/engine.rs:242"],
+      "claim": "`levels()` (audio/engine.rs:242) checks only `muted`, not `audible()`, so a source silenced by another source's solo still shows live meter levels.",
+      "scenario": "A solo is active on another (possibly disabled) source; the meters of the non-soloed sources keep moving while their tracks record silence, so the user does not notice.",
+      "fix": "Make the meters follow `audible()`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-10",
+      "title": "UI `audible` treats soloed+muted as audible, unlike the core",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["src/lib/useClipMix.ts:19-21"],
+      "claim": "The UI's `audible` in useClipMix.ts:19-21 is `anySolo ? state.solo : !state.muted`, which treats a soloed and muted track as audible, unlike the core rule (`enabled && !muted && (!any_solo || solo)`). The comment claims the two are the same.",
+      "scenario": "A track is both soloed and muted: the preview plays it while the core/render treats it as silent, so preview and result differ.",
+      "fix": "No separate fix given in the report; implied: make the UI's `audible` match the core rule (muted always wins).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-11",
+      "title": "In device mode (Quick-setup default), ClippiBoy's own sounds and the editor preview are recorded into the buffer",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["src-tauri/src/sounds.rs:55-58", "src-tauri/src/audio/capture.rs:334-336"],
+      "claim": "Excluding ClippiBoy's own pid only happens in leftovers mode; plain endpoint loopback (capture.rs:334-336) records everything rendered on the device, including sounds played by sounds.rs:55-58.",
+      "scenario": "With Quick setup (default output device + mic), the \"clip saved\" chime (on by default, volume 0.5), \"recording started\" (lands in the recording itself), friend chimes, and any clip played in the editor while the buffer runs all end up in the replay buffer/clips.",
+      "fix": "One of: when there is a single output source, use process loopback in `EXCLUDE_TARGET_PROCESS_TREE` mode on ClippiBoy's own pid; or at least warn about it in device mode; or play the chimes on another endpoint (`eCommunications`).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-12",
+      "title": "Export-to-size truncates the duration to whole seconds and overshoots the target",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["src-tauri/src/export.rs:79"],
+      "claim": "`export::recipe` computes `let seconds = (target.duration_ms / 1000).max(1);` (export.rs:79), which truncates the duration, so the bitrate budget is computed for a shorter clip than the real one.",
+      "scenario": "A 15.8 s clip with a 10 MiB target is budgeted for 15 s and comes out at about 10.71 MB (+2.2%) before any encoder error; a 1.9 s clip is budgeted for 1 s and comes out nearly 2x over.",
+      "fix": "Compute in ms: `video_bits * 1000 / duration_ms / 1000`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-13",
+      "title": "Export resolution loop always downscales sources taller than 1080p (and 900p to 720p) even with ample budget",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["src-tauri/src/export.rs:83-93"],
+      "claim": "The resolution step-down loop in export.rs:83-93 sets `height = step` *before* checking the budget, so any source taller than 1080 (1440p, 4K, 1200p) is always scaled to <=1080p, and 900p to 720p. This contradicts the comment \"anything taller than the first is left where it is\", and no test covers 1440p.",
+      "scenario": "Exporting a 1440p clip with a large size budget still produces a 1080p file.",
+      "fix": "First check whether the source height itself fits the budget before stepping down; add a test for 1440p.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-14",
+      "title": "Export starvation check assumes 30 fps",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["src-tauri/src/export.rs:89"],
+      "claim": "The starvation check uses `bitrate_for(.., 30)` (export.rs:89), assuming 30 fps regardless of the clip's real frame rate, so the check is 2x too optimistic for 60 fps clips.",
+      "scenario": "A 60 fps clip is judged to have enough bitrate at a resolution where it is actually starved, producing a visibly poor export.",
+      "fix": "Use the real fps; consider stepping to 30 fps before dropping resolution.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-15",
+      "title": "One-pass ABR/CBR export leaves only a 3% size margin",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["src-tauri/src/export.rs"],
+      "claim": "Export-to-size uses one-pass ABR/CBR with only a 3% margin, and the result is not verified against the target size.",
+      "scenario": "Encoder rate-control error exceeds 3%, so the exported file is over the target size (e.g. over Discord's limit).",
+      "fix": "Use x264 two-pass, or verify the result and re-encode with `bitrate × target/written × 0.97` when it is over.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-16",
+      "title": "`export_for_discord` reuses stale or half-written files and never fixes an oversize one",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["src-tauri/src/commands.rs:871-888"],
+      "claim": "`export_for_discord` (commands.rs:871-888) decides reuse with `let ready = std::fs::metadata(&output).map(|meta| meta.len() > 0 && meta.len() <= target_bytes)`: there is no freshness check against the source clip. `shrink` writes straight to the final file name, so a crash/kill leaves a truncated MP4 without moov that counts as \"ready\" from then on. Two quick presses run two ffmpeg processes with `-y` on the same file. An over-limit result is put on the clipboard regardless, and the next press re-encodes the same recipe and gets the same overshoot.",
+      "scenario": "User exports for Discord, then trims or remixes the clip and exports again: the old export is copied to the clipboard. Or the app is killed mid-export: the truncated file is reused forever. Or the result is over the limit: it is put on the clipboard anyway and retrying reproduces the same size.",
+      "fix": "Check `stems::is_newer(&output, &source)`; write to `*.part`, then rename; allow one export per clip at a time; retry at a lower bitrate when the file is over the limit.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-17",
+      "title": "No cancel, timeout or kill for ffmpeg, and it runs at normal priority next to the game",
+      "severity": "medium",
+      "category": "robustness",
+      "locations": ["src-tauri/src/edit.rs:749-796", "src-tauri/src/muxer.rs"],
+      "claim": "The ffmpeg runner in edit.rs:749-796 (and the muxer's `run`) has no Job Object, `kill`, `try_wait` or timeout anywhere in the crate (grep-confirmed). A hung hardware encoder holds `edit::WORKING` forever; on app exit ffmpeg children are orphaned (Windows does not kill children); x264 `-preset medium` exports started from the in-game console compete with the game at normal priority.",
+      "scenario": "A hardware encoder hangs during a trim: `edit::WORKING` stays held and every later trim/remix/\"Clear all trims\" blocks. Closing the app leaves ffmpeg running. Exporting during gameplay steals CPU from the game.",
+      "fix": "Put children in a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; use `BELOW_NORMAL_PRIORITY_CLASS`; add a cancel token that kills the child and a stall watchdog when `out_time` stops advancing; consider `-hwaccel d3d11va` for decoding.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-18",
+      "title": "The resampler is stateless and per packet, with no anti-aliasing",
+      "severity": "medium",
+      "category": "quality",
+      "locations": ["src-tauri/src/audio/capture.rs:298-312"],
+      "claim": "The linear resampler in capture.rs:298-312 restarts the phase at 0 on each packet, and `next` is clamped inside the packet, so the last samples are held instead of interpolated into the next packet. `target_frames = (frames as f64 * ratio) as usize` truncates, dropping up to one frame per packet, which the ring's slew then has to absorb. There is no anti-aliasing filter.",
+      "scenario": "96/192 kHz endpoints (common \"studio quality\" settings) are decimated by picking samples, which aliases; 16/8 kHz Bluetooth HFP mics produce imaging; packet boundaries introduce small discontinuities and dropped frames.",
+      "fix": "Use the AUTOCONVERTPCM + SRC_DEFAULT_QUALITY flags (as for the multichannel downmix issue), or a stateful resampler (`rubato`) kept per stream.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-19",
+      "title": "`delete_clip(\"\")` wipes every individual track and every original",
+      "severity": "medium",
+      "category": "security",
+      "locations": ["src-tauri/src/commands.rs:680-681", "src-tauri/src/stems.rs:45-47", "src-tauri/src/edit.rs:61-63"],
+      "claim": "`delete_clip` (commands.rs:680-681) removes the clip's stem and original directories before the clip is looked up in the database. `stems::dir`/`edit::dir` (stems.rs:45-47, edit.rs:61-63) use `root().join(sanitize(id))`; `sanitize(\"\")` is `\"\"`, so `root().join(\"\")` is the root itself and `remove_dir_all` removes `<data>/tracks` and `<data>/originals` entirely.",
+      "scenario": "An empty id from a frontend bug, or a compromised webview calling `delete_clip(\"\")`, destroys every clip's individual tracks and every untrimmed original.",
+      "fix": "Reject ids that are empty or not UUIDs inside `stems::dir`/`edit::dir`, and resolve the clip from the database before deleting anything.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-20",
+      "title": "A single bad timestamp inserts silence and then shifts the source late for tens of seconds",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["src-tauri/src/audio/ring.rs:151-163", "src-tauri/src/audio/capture.rs:631-657"],
+      "claim": "In `SampleRing` (ring.rs:151-163) any block whose stamp is over 50 ms late is treated as a real gap and immediately filled with zeros; the correctly stamped blocks that follow show negative drift, which may only slew at 2000 ppm (50 ms takes about 25 s). Negative drift between -50 ms and -1 s is never treated as a discontinuity. In capture.rs:631-657, `AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR` (0x4) is ignored (only SILENT 0x2 is handled), and for devices on the fallback clock the read-time `now` is used as the stamp.",
+      "scenario": "After a capture thread stall on a fallback-clock device, the first packet of the burst looks \"late\" and the rest \"early\": spurious silence is inserted even though WASAPI kept the data, and the source then plays ~50 ms late for ~25 s. Same with a single packet flagged TIMESTAMP_ERROR.",
+      "fix": "Detect real gaps with `pu64DevicePosition` (pass it instead of `None`), which jumps by exactly the missing frames; ignore stamps flagged 0x4; with the fallback clock use `now − (GetCurrentPadding + frames)/rate`; require two agreeing blocks before filling a gap and re-anchor on a sustained negative drift; add tests for these cases.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-21",
+      "title": "No MMCSS, and the 80 ms mixer lag discards late packets",
+      "severity": "medium",
+      "category": "perf",
+      "locations": ["src-tauri/src/pipeline.rs:42", "src-tauri/src/audio/capture.rs:470-499"],
+      "claim": "Capture threads (capture.rs:470-499) and the mixer thread run at normal priority with no `AvSetMmThreadCharacteristicsW` (MMCSS). The mixer reads with an 80 ms lag (`AUDIO_LAG`, pipeline.rs:42); a packet that lands in the ring after the mixer has already pushed zeros for that window is lost from the clip.",
+      "scenario": "Under game load a capture thread is delayed more than about 70 ms; its packet arrives after the mixer has written silence for that window, so audio that WASAPI kept is missing from the clip.",
+      "fix": "Register the threads with MMCSS (\"Audio\"/\"Capture\"); raise `AUDIO_LAG` to about 200-250 ms (a replay buffer does not need low latency; the save can wait for the mixer to pass the last frame's QPC).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-22",
+      "title": "`snapshot()` hands over live TrackRings with only 2 s slack; front of clip audio may scroll out before being read",
+      "severity": "medium",
+      "category": "robustness",
+      "locations": ["src-tauri/src/pipeline.rs"],
+      "claim": "`snapshot()` hands over the *live* `TrackRing`s, which keep only 2 s of slack, and the WAVs are only written after the whole h264 file has been written. The audio windows are not copied inside `snapshot()`.",
+      "scenario": "A slow disk plus aligning the clip start to a keyframe delays the WAV writing long enough that the front of the clip's audio scrolls out of the live ring before it is read.",
+      "fix": "Copy the windows inside `snapshot()`.",
+      "reported_confidence": "speculative"
+    },
+    {
+      "id": "AU-23",
+      "title": "Sources set to \"the default device\" do not follow default-device changes",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["src-tauri/src/audio/capture.rs:320-327"],
+      "claim": "There is no `IMMNotificationClient` (grep-confirmed). An empty `device_id` (capture.rs:320-327) binds to whatever was the default at stream start and stays there until that device becomes invalid. The fingerprint `out:` never changes, so the stream is never restarted. The configuration warning even claims the source \"follows the Windows default device\".",
+      "scenario": "User switches the Windows default output from speakers to a headset while recording; the default-device source keeps recording the speakers endpoint.",
+      "fix": "Register `OnDefaultDeviceChanged` and restart the affected stream.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "AU-24",
+      "title": "Leftovers catch-all rule never matches a source configured as the default device (\"\")",
+      "severity": "medium",
+      "category": "bug",
+      "locations": ["src-tauri/src/audio/mod.rs:235"],
+      "claim": "In `Leftovers::assign` (mod.rs:235) the catch-all rule compares `*device == self.default_device`; for a source configured as \"the default device\" `device` is `\"\"` while `default_device` is the real endpoint id, so the catch-all never matches such a source.",
+      "scenario": "An output source set to the default device in leftovers mode: applications \"playing nowhere in particular\" are not assigned to it via the catch-all rule.",
+      "fix": "Normalise `\"\"` to the resolved default device id before assigning.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-25",
+      "title": "Drawing the waveform holds the whole decoded audio in RAM; no per-clip lock; muted clips re-run ffmpeg",
+      "severity": "medium",
+      "category": "perf",
+      "locations": ["src-tauri/src/preview.rs:49-53"],
+      "claim": "The waveform uses ffmpeg's `showwavespic` (preview.rs:49-53), which queues every input frame until EOF (s16 mono), about 345 MB per hour of recording. There is no lock, so StrictMode/double opens write the same PNG concurrently; a long waveform job also keeps the clip open. Fully muted clips (no audio stream) re-run ffmpeg and error on every open.",
+      "scenario": "Opening a 1-hour clip uses ~345 MB for the waveform; a save during a long waveform job fails with \"is it open somewhere\"; a double open writes the PNG concurrently; a muted clip errors on every open.",
+      "fix": "Put `aresample=8000`/`asetnsamples` before `showwavespic`, or compute min/max peaks in Rust from `-ac 1 -ar 4000 -f s16le pipe:1`; add a per-clip lock.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-26",
+      "title": "Applications running elevated are stored as \"PID n\" and can never be found again",
+      "severity": "low",
+      "category": "bug",
+      "locations": ["src-tauri/src/audio/devices.rs:91-96"],
+      "claim": "The process name lookup in devices.rs:91-96 uses `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)` plus `GetModuleBaseNameW`, which fails for elevated processes. The UI then stores `exe: \"PID 1234\"`.",
+      "scenario": "User adds an elevated application as a source; after a restart `live_pid` cannot find \"PID 1234\" and the source silently drops out.",
+      "fix": "Take the name from the `process_tree()` snapshot, or use `QueryFullProcessImageNameW`, which needs only limited query rights.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-27",
+      "title": "The activation completion handler can signal a closed event handle after a timeout",
+      "severity": "low",
+      "category": "robustness",
+      "locations": ["src-tauri/src/audio/capture.rs:177-192", "src-tauri/src/audio/capture.rs:389-393"],
+      "claim": "On a 5 s activation timeout (capture.rs:177-192) `CloseHandle(event)` runs while the async operation still holds the completion handler (capture.rs:389-393), which holds the raw HANDLE; a late `ActivateCompleted` then calls `SetEvent` on a closed handle, which may since have been reused for another event (unsafe). Also, `Error::from_win32()` after `WAIT_TIMEOUT` reports GetLastError = 0 (\"The operation completed successfully\").",
+      "scenario": "Process-loopback activation completes after the 5 s timeout: `SetEvent` hits a closed or reused handle, signalling an unrelated event; the timeout error is logged as \"The operation completed successfully\".",
+      "fix": "Let the handler own the event (close it in `Drop`) and return an explicit timeout HRESULT.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-28",
+      "title": "Log spam: `live_pid` logs every 2 s, twice per pass",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["src-tauri/src/audio/mod.rs:139-141"],
+      "claim": "`live_pid` (mod.rs:139-141) logs \"'{exe}' is {now} now\" whenever the live pid differs from the stored one, but the stored pid is never updated, so once an application has restarted every `resolve` (every 2 s, twice per pass) logs it again.",
+      "scenario": "After an application restarts, the log gains about 86k lines a day.",
+      "fix": "Log only when the value changes, or write the new pid back to the config.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-29",
+      "title": "No limiter on the summed mix",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["src-tauri/src/pipeline.rs:225-234", "src-tauri/src/stems.rs:349-352"],
+      "claim": "The main-mix WAV is summed with i16 `saturating_add` (pipeline.rs:225-234) and the edit re-mix uses `amix … normalize=0` (stems.rs:349-352), with no limiter on either.",
+      "scenario": "Game, Discord and mic at 0 dB clip hard twice, and the AAC encoder receives float samples above 1.0.",
+      "fix": "Add an `alimiter`/true-peak limiter (-1 dBTP) on `[aout]`, and optionally a soft clipper in `write_mix_wav`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-30",
+      "title": "`convert` allocates a stereo Vec on every capture packet",
+      "severity": "low",
+      "category": "perf",
+      "locations": ["src-tauri/src/audio/capture.rs:251"],
+      "claim": "`convert` allocates a `stereo` Vec on every packet in the realtime capture path (capture.rs:251).",
+      "scenario": "Per-packet heap allocation on the realtime capture thread adds avoidable cost/jitter.",
+      "fix": "No explicit fix given; implied: reuse a per-stream buffer.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-31",
+      "title": "`mix_window` allocates `scratch` on every 10 ms tick despite its doc comment",
+      "severity": "low",
+      "category": "perf",
+      "locations": ["src-tauri/src/audio/engine.rs:355"],
+      "claim": "`mix_window` allocates `scratch` on every 10 ms tick (engine.rs:355), despite the doc comment \"rather than allocating\".",
+      "scenario": "The mixer thread allocates 100 times a second in the realtime path, contradicting its documentation.",
+      "fix": "No explicit fix given; implied: keep and reuse the scratch buffer.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-32",
+      "title": "Mixer `next_100ns` truncation accumulates timing drift",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["src-tauri/src/pipeline.rs:818"],
+      "claim": "The mixer advances its window with `next_100ns = from + frames*1e7/48000` (pipeline.rs:818), which truncates each step and accumulates about 3.5 ppm of drift.",
+      "scenario": "Over long sessions the mixer timeline drifts slowly relative to QPC.",
+      "fix": "Derive it from a total frame count instead.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-33",
+      "title": "Meter peak uses load-then-store instead of `fetch_max`",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["src-tauri/src/audio/ring.rs:130-133"],
+      "claim": "The meter peak update in ring.rs:130-133 uses an atomic load followed by a store instead of `fetch_max`, so concurrent updates can lose a higher peak.",
+      "scenario": "A peak written between the load and the store is overwritten by a lower value, under-reporting the meter.",
+      "fix": "Use `fetch_max`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-34",
+      "title": "Leftovers mode spawns a thread and loopback client for every idle application holding a session",
+      "severity": "low",
+      "category": "perf",
+      "locations": ["src-tauri/src/audio/mod.rs"],
+      "claim": "In leftovers mode, every idle application that holds an audio session gets its own capture thread and process-loopback client.",
+      "scenario": "Many background apps with idle sessions each cost a thread and a WASAPI client continuously.",
+      "fix": "No explicit fix given in the report.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-35",
+      "title": "`default_output_id` and `list_devices` enumerate every endpoint and its property store every 2 s",
+      "severity": "low",
+      "category": "perf",
+      "locations": ["src-tauri/src/audio/devices.rs"],
+      "claim": "`default_output_id` and `list_devices` enumerate every audio endpoint and open its property store on every 2 s pass.",
+      "scenario": "Constant COM endpoint enumeration every 2 s adds avoidable background cost.",
+      "fix": "No explicit fix given; related: follow device changes via `IMMNotificationClient` instead of polling.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-36",
+      "title": "`list_audio_devices`/`list_audio_processes` are synchronous Tauri commands doing COM work on the main thread",
+      "severity": "low",
+      "category": "perf",
+      "locations": ["src-tauri/src/commands.rs"],
+      "claim": "`list_audio_devices` and `list_audio_processes` are synchronous Tauri commands, so their COM work runs on the main thread.",
+      "scenario": "Slow device/process enumeration blocks the main (UI event) thread.",
+      "fix": "No explicit fix given; implied: make them async commands.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-37",
+      "title": "`AppState::new` applies audio config synchronously on the main thread at startup",
+      "severity": "low",
+      "category": "perf",
+      "locations": ["src-tauri/src/state.rs:308"],
+      "claim": "At startup, `AppState::new` calls `apply` synchronously on the main thread (state.rs:308), which can block up to 5 s per slow stream.",
+      "scenario": "With one or more slow audio devices, app startup stalls for 5 s per slow stream.",
+      "fix": "No explicit fix given; implied: apply the audio configuration off the main thread.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-38",
+      "title": "Preview sync tolerates up to 120 ms offset and corrects with audible hard seeks",
+      "severity": "low",
+      "category": "bug",
+      "locations": ["src/lib/useClipMix.ts:317", "src/lib/useClipMix.ts:353"],
+      "claim": "In `useClipMix.ts`, tracks are only corrected when off by more than 120 ms (line 317), with a hard seek once a second (line 353). An A/V offset of up to 120 ms persists, and each correction is an audible skip.",
+      "scenario": "During preview, track audio drifts up to 120 ms from the video without correction, then jumps audibly when re-seeked.",
+      "fix": "Use a threshold of about 30-40 ms and nudge `playbackRate` by ±1-3% for small corrections, seeking only above about 150 ms. Or decode the tracks into AudioBuffers and schedule them against `ctx.currentTime`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-39",
+      "title": "Preview elements recreated after the fallback route never get the current `playbackRate`",
+      "severity": "low",
+      "category": "bug",
+      "locations": ["src/lib/useClipMix.ts"],
+      "claim": "In `useClipMix.ts`, `<audio>` elements recreated after falling back to the old route never receive the current `playbackRate` until the next `ratechange` event.",
+      "scenario": "User plays the preview at a non-1x speed, the hook falls back and recreates elements; the tracks play at 1x while the video plays at the chosen speed, drifting apart.",
+      "fix": "No explicit fix given; implied: apply the current `playbackRate` when creating the elements.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-40",
+      "title": "Preview silence watchdog trips on genuine silence or buffering and permanently switches route",
+      "severity": "low",
+      "category": "bug",
+      "locations": ["src/lib/useClipMix.ts:238-252"],
+      "claim": "The silence watchdog in useClipMix.ts:238-252 trips on two seconds of genuine digital silence (AAC of zeros decodes to exact zeros) or on elements still buffering, and then permanently switches to the attenuate-only route.",
+      "scenario": "A clip starting with 2 s of silence (or slow buffering) makes the preview permanently fall back to the attenuate-only route, losing the WebAudio gain graph.",
+      "fix": "Switch only if no sample was non-zero since the graph was built.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-41",
+      "title": "Autoplay-blocked AudioContext leaves preview silent and the error is swallowed",
+      "severity": "low",
+      "category": "bug",
+      "locations": ["src/lib/useClipMix.ts"],
+      "claim": "In `useClipMix.ts`, `ctx.state !== \"running\"` returns early, so an AudioContext blocked by autoplay stays silent while the video is muted, and `play().catch(() => undefined)` hides that failure.",
+      "scenario": "The webview blocks the AudioContext from starting; the preview plays with no sound at all and nothing is reported.",
+      "fix": "No explicit fix given in the report.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-42",
+      "title": "AudioContext leaks if `createMediaElementSource` throws",
+      "severity": "low",
+      "category": "bug",
+      "locations": ["src/lib/useClipMix.ts"],
+      "claim": "In `useClipMix.ts`, an AudioContext created inside the `try` block is not closed if `createMediaElementSource` throws.",
+      "scenario": "Repeated failures leak AudioContexts (browsers limit how many can exist).",
+      "fix": "No explicit fix given; implied: close the context in the error path.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-43",
+      "title": "Temp files litter the user's clip folder after a crash",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["src-tauri/src/edit.rs:422"],
+      "claim": "Edit temp files `*.{pid}.neu.mp4` (edit.rs:422) and export files `\"{stem} (N MB).mp4\"` are written into the user's clip folder and are never cleaned up after a crash.",
+      "scenario": "The app crashes during an edit or export; the partial temp file stays in the user's clip folder indefinitely.",
+      "fix": "No explicit fix given; implied: clean up stale temp files (e.g. in `repair`).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-44",
+      "title": "`plan` can produce a 200 ms excerpt starting at the very end of the file",
+      "severity": "low",
+      "category": "bug",
+      "locations": ["src-tauri/src/edit.rs"],
+      "claim": "For very short trims, `edit::plan` can produce a 200 ms excerpt starting at the very end of the file, because the end is clamped past the duration.",
+      "scenario": "User trims to a tiny range near the end; the render starts at/after EOF and yields an empty or broken excerpt.",
+      "fix": "No explicit fix given in the report.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-45",
+      "title": "No free-space check before copying the original on a first cut",
+      "severity": "low",
+      "category": "robustness",
+      "locations": ["src-tauri/src/edit.rs"],
+      "claim": "On a first cut, the original is copied into the originals store without checking free space first.",
+      "scenario": "The originals volume (C:) lacks space for a multi-GB original; the copy fails partway (see the cross-drive copy issue).",
+      "fix": "No explicit fix given; related: keep the originals store on the same volume as the clips.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-46",
+      "title": "Colour metadata (VUI) is not carried over on re-encode",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["src-tauri/src/edit.rs"],
+      "claim": "When a first cut re-encodes, `-colorspace`/`-color_primaries`/`-color_trc` are not set, so the colour metadata (VUI) of the source is not carried over.",
+      "scenario": "A trimmed clip may display with different colours than the original in players that rely on VUI.",
+      "fix": "No explicit fix given; implied: pass the source's colour metadata via `-colorspace/-color_primaries/-color_trc`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "AU-47",
+      "title": "Export target computed in MiB while Discord may enforce decimal MB",
+      "severity": "low",
+      "category": "bug",
+      "locations": ["src-tauri/src/export.rs"],
+      "claim": "The export target size is computed in MiB. If Discord enforces decimal MB, \"10 MB\" exports land 4.9% over the limit.",
+      "scenario": "A \"10 MB\" Discord export is 10 MiB = 10.49 MB and is rejected by Discord's upload limit.",
+      "fix": "No explicit fix given; implied: compute the target in decimal MB.",
+      "reported_confidence": "speculative"
+    },
+    {
+      "id": "AU-48",
+      "title": "Leftover German strings in log and test messages",
+      "severity": "low",
+      "category": "quality",
+      "locations": ["src-tauri/src/commands.rs", "src-tauri/src/edit.rs", "src-tauri/src/lib.rs"],
+      "claim": "Some log and test messages are still in German, e.g. \"blieb liegen\", \"Pegel\", \"bildgenau…\".",
+      "scenario": "English-speaking users/maintainers see German log lines and test assertions.",
+      "fix": "No explicit fix given; implied: translate the strings to English.",
+      "reported_confidence": "likely"
+    }
+  ],
+  "proposals": [
+    {
+      "id": "AU-P-1",
+      "title": "Proper multichannel downmix and high-quality resampling",
+      "area": "Recording",
+      "value": "Keeps centre/surround content (dialogue) in clips from 5.1/7.1 endpoints and avoids aliasing/imaging from the naive linear resampler.",
+      "effort": "?",
+      "sketch": "Initialise capture clients with `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY`, or an ITU downmix driven by `dwChannelMask` plus a stateful per-stream resampler (`rubato`) in audio/capture.rs."
+    },
+    {
+      "id": "AU-P-2",
+      "title": "Follow the Windows default device",
+      "area": "Recording",
+      "value": "Sources set to \"default device\" keep recording the right endpoint when the user switches outputs.",
+      "effort": "?",
+      "sketch": "Register an `IMMNotificationClient` and restart the affected stream on `OnDefaultDeviceChanged`."
+    },
+    {
+      "id": "AU-P-3",
+      "title": "MMCSS thread priority for capture and mixer threads",
+      "area": "Recording",
+      "value": "Prevents packet loss under game load.",
+      "effort": "?",
+      "sketch": "Call `AvSetMmThreadCharacteristicsW` (\"Audio\"/\"Capture\") on capture and mixer threads."
+    },
+    {
+      "id": "AU-P-4",
+      "title": "Per-source sync offset",
+      "area": "Recording",
+      "value": "Compensates Bluetooth/USB latency so sources line up with the picture.",
+      "effort": "?",
+      "sketch": "A per-source offset setting applied when sources are mixed (no further detail in the report)."
+    },
+    {
+      "id": "AU-P-5",
+      "title": "Source monitoring and a non-destructive solo",
+      "area": "Recording",
+      "value": "Lets the user listen to a single source without silencing what gets recorded.",
+      "effort": "?",
+      "sketch": "Monitoring a source and a solo that does not destroy the recording (no further detail in the report)."
+    },
+    {
+      "id": "AU-P-6",
+      "title": "Microphone processing",
+      "area": "Microphone processing",
+      "value": "Cleaner voice in clips.",
+      "effort": "?",
+      "sketch": "Noise suppression (RNNoise/DeepFilterNet), noise gate, compressor and push-to-talk/ducking."
+    },
+    {
+      "id": "AU-P-7",
+      "title": "Loudness normalisation and true-peak limiting",
+      "area": "Loudness and limiting",
+      "value": "Avoids clipping of the summed mix and delivers consistent loudness for social/broadcast targets.",
+      "effort": "?",
+      "sketch": "A true-peak limiter on the mix; EBU R128 normalisation (`loudnorm`, two-pass) on save and export (-14 LUFS for social, -23 for broadcast)."
+    },
+    {
+      "id": "AU-P-8",
+      "title": "Export individual tracks",
+      "area": "Multi-track delivery",
+      "value": "Enables editing in Premiere or DaVinci Resolve with separate tracks.",
+      "effort": "?",
+      "sketch": "Export individual tracks as WAV/FLAC, or as multi-track MKV/MOV."
+    },
+    {
+      "id": "AU-P-9",
+      "title": "Opus/WebM for sharing",
+      "area": "Multi-track delivery",
+      "value": "Smaller, widely supported files for sharing.",
+      "effort": "?",
+      "sketch": "Add an Opus/WebM export option (no further detail in the report)."
+    },
+    {
+      "id": "AU-P-10",
+      "title": "A waveform per track in the editor",
+      "area": "Multi-track delivery",
+      "value": "Users can see each source's activity while editing.",
+      "effort": "?",
+      "sketch": "Render a waveform per individual track in the clip editor (see the cheaper peak computation suggested for preview.rs)."
+    },
+    {
+      "id": "AU-P-11",
+      "title": "Export improvements: cancel, two-pass/verify-and-retry, frame-rate step, HEVC/AV1, background priority",
+      "area": "Export",
+      "value": "Exports hit the size target reliably, can be aborted, keep higher quality at a given size and do not disturb the game.",
+      "effort": "?",
+      "sketch": "A cancel button; two-pass or verify-and-retry; a frame-rate step (60->30) before resolution; HEVC/AV1 at the same size; background priority for ffmpeg."
+    },
+    {
+      "id": "AU-P-12",
+      "title": "Smart render for front cuts",
+      "area": "Trimming",
+      "value": "Front cuts become fast and nearly lossless.",
+      "effort": "?",
+      "sketch": "Re-encode only up to the next keyframe and stream-copy the rest."
+    },
+    {
+      "id": "AU-P-13",
+      "title": "\"Snap to keyframe, lossless\" trim option",
+      "area": "Trimming",
+      "value": "Instant lossless trims when frame accuracy is not needed.",
+      "effort": "?",
+      "sketch": "Offer an option that snaps cut points to keyframes and stream-copies."
+    },
+    {
+      "id": "AU-P-14",
+      "title": "Keep the originals store on the same volume as the clips",
+      "area": "Storage",
+      "value": "The first-cut move becomes an atomic rename, avoiding crash windows and copying GBs to C: without a free-space check.",
+      "effort": "?",
+      "sketch": "Store originals in e.g. a hidden `.clippiboy/originals` folder next to the clips instead of `<data>/originals/<id>/`."
+    }
+  ],
+  "positives": [
+    "Lock order: `running` is always taken before a ring lock, so there is no deadlock.",
+    "Buffer pairing: WASAPI `GetBuffer`/`ReleaseBuffer` are paired correctly.",
+    "Pipes: ffmpeg stderr is drained on its own thread and stdout progress is read in parallel, so ffmpeg cannot stall on a full pipe.",
+    "Command construction: all ffmpeg arguments are passed as an argv Vec with no shell, and filter strings contain only numeric stream specifiers; command injection is not possible.",
+    "Seeking: each input gets its own `-ss`, and trims compose correctly in original coordinates.",
+    "Panics: no reachable panic in the audio/edit/export modules; the `clamp` bounds are ordered, `expect(\"checked\")` is guarded, and indexing uses `get`."
+  ]
+}

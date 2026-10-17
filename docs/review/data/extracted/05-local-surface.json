@@ -1,0 +1,772 @@
+{
+  "slice": "05-local-surface",
+  "defects": [
+    {
+      "id": "LS-1",
+      "title": "Local process can crash ClippiBoy or hang its UI through the control port without the token (tiny_http body drain)",
+      "severity": "medium",
+      "category": "security",
+      "locations": [
+        "src-tauri/src/control.rs:156-158",
+        "src-tauri/src/control.rs:325-336",
+        "src-tauri/src/control.rs:94-106",
+        "src-tauri/src/commands.rs:154-158",
+        "src-tauri/src/commands.rs:1384"
+      ],
+      "claim": "The control port (control.rs, tiny_http 0.12.0, bound to 127.0.0.1:47653, on by default) answers requests that fail the token/header check with a 403 on its single serving thread: control.rs:156-158 `if !allowed { return respond(request, 403, …) }`, with `respond` at control.rs:325-336. In tiny_http 0.12.0, request.rs:191-216 wraps any body larger than 1024 bytes in `EqualReader`, and `util/equal_reader.rs` has a `Drop` that does `let mut buf = vec![0; remaining_to_read];` and then blocks reading the rest of the body from the socket. No socket timeouts are set anywhere, and `util/task_pool.rs` creates one thread per connection with `thread::spawn` with no upper limit. So dropping the request allocates and reads whatever body size the client *declared* (Content-Length), before and regardless of the token check. `control::stop()` (control.rs:94-106) waits on `thread.join()` forever; it is called from `set_config` (commands.rs:154-158) when the port or on/off changes and from `regenerate_control_token` (commands.rs:1384), both sync commands on the main thread.",
+      "scenario": "Any local process (including another Windows user's) sends a request declaring a huge body: the allocation fails, and allocation failure / capacity overflow aborts the process (so does a thread-spawn failure under `panic = \"abort\"`); the in-memory replay buffer is lost and a running recording is cut off. A client that declares a body and then sends nothing stalls the serving thread forever, so Stream Deck keys stop working; a later `set_config` port/on-off change or `regenerate_control_token` then blocks forever in `stop()`'s `thread.join()` on the main thread and the UI freezes permanently. Browsers cannot set Content-Length, so this is local-only.",
+      "fix": "Replace tiny_http with a small server you control (std `TcpListener`, or tokio which is already a dependency) with a read timeout of about 2 s, at most 8 KB of headers, rejection of `Content-Length` above 4 KB before building the request, closing the socket rather than draining it, and a cap of about 8 connections; or patch tiny_http. Separately make `stop()` not block forever: join with a timeout, or detach.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "LS-2",
+      "title": "Capabilities give false least privilege: every window can call all 79 app commands (no app ACL manifest)",
+      "severity": "medium",
+      "category": "security",
+      "locations": [
+        "src-tauri/build.rs",
+        "src-tauri/gen/schemas/acl-manifests.json",
+        "src-tauri/capabilities/overlay.json"
+      ],
+      "claim": "build.rs is plain `tauri_build::build()`: there is no `AppManifest`, and gen/schemas/acl-manifests.json has no `__app__` entry. Tauri 2.11.5 webview/mod.rs:1823 checks the ACL only `if (plugin_command.is_some() || has_app_acl_manifest || !is_local)`, so capabilities gate only plugin commands and every window (main, overlay, console) can call all 79 app commands. overlay.json describes itself as \"only listens, controls nothing\", yet the overlay can call `delete_clip`, `set_config`, `clipboard_read_text`, `export_clip`, `friends_delete_account` and so on.",
+      "scenario": "An XSS in any window, the overlay included, gets the full app command set. React escaping and the absence of `dangerouslySetInnerHTML` make that unlikely today; this is defense in depth.",
+      "fix": "Use `tauri_build::Attributes::new().app_manifest(AppManifest::new().commands(&[...]))` and grant commands per window. The overlay needs roughly nothing; the console needs only its clip and friends subset.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "LS-3",
+      "title": "`export_clip` writes to any renderer-supplied output path (overwrite, UNC NTLM leak, ffmpeg http upload)",
+      "severity": "medium",
+      "category": "security",
+      "locations": [
+        "src-tauri/src/commands.rs:1155-1169",
+        "src-tauri/src/commands.rs:1094-1097",
+        "src-tauri/src/export.rs:124"
+      ],
+      "claim": "`export_clip` (commands.rs:1155-1169) takes `output: String` straight from the UI. `shrink` (commands.rs:1094-1097) only refuses `output == source`. ffmpeg then runs with `-y` (export.rs:124) and the output as its last argument, with no restriction to local file paths or protocols. Part of the finding that a compromised renderer gets user-level read and write on the whole filesystem (defense in depth).",
+      "scenario": "A compromised renderer calls `export_clip` with: any writable file path (it is overwritten); a UNC path (Windows sends NTLM credentials to a remote host); or an `http://…/x.mp4` output, which ffmpeg treats as an upload target, sidestepping the CSP.",
+      "fix": "Show the save dialog from Rust and keep the chosen path server-side, or at least require an absolute local drive path: no `\\\\`, no `scheme:`, an allowed extension. Add `-protocol_whitelist file` to export, trim and thumbnail ffmpeg calls.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "LS-4",
+      "title": "`set_clip_dir` / `set_config` accept any clip folder and grant it recursively to the asset protocol",
+      "severity": "medium",
+      "category": "security",
+      "locations": [
+        "src-tauri/src/commands.rs:266-290",
+        "src-tauri/src/commands.rs:54-98",
+        "src-tauri/src/lib.rs:1095"
+      ],
+      "claim": "`set_clip_dir` (commands.rs:266-290) and `set_config` (commands.rs:54-98) accept any directory, and `allow_clip_dir` grants it *recursively* to the asset protocol (lib.rs:1095). `set_config` does not validate `clip_dir` at all. Speculative: with an empty `clip_dir`, Tauri builds the pattern `\\**` (scope/fs.rs:489-498), which may match every canonicalized path.",
+      "scenario": "A compromised renderer sets the clip folder to `C:\\Users\\X`, which makes browser profiles and `%APPDATA%\\ClippiBoy\\friends.json` (the session token) readable through the asset protocol. With an empty `clip_dir` the asset scope may match every path (speculative).",
+      "fix": "Show the folder dialog from Rust and keep the chosen path server-side; canonicalize and validate `clip_dir` in `set_config`; refuse empty, system or profile-root folders.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "LS-5",
+      "title": "`reveal_path` accepts any path, UNC included",
+      "severity": "medium",
+      "category": "security",
+      "locations": [
+        "src-tauri/src/commands.rs:1347"
+      ],
+      "claim": "`reveal_path(path)` (commands.rs:1347) accepts any path from the renderer, UNC paths included, with no check that it lies inside the app's known folders. Part of the finding that a compromised renderer gets user-level filesystem access (defense in depth).",
+      "scenario": "A compromised renderer calls `reveal_path` with an arbitrary local or UNC path (e.g. `\\\\host\\share\\x`), making the app open/reveal locations outside its own folders, including remote hosts.",
+      "fix": "Make `reveal_path` accept only paths inside the known folders.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "LS-6",
+      "title": "`delete_clip` with an empty or colliding id wipes every clip's audio tracks and untouched originals",
+      "severity": "medium",
+      "category": "data-loss",
+      "locations": [
+        "src-tauri/src/commands.rs:680-683",
+        "src-tauri/src/muxer.rs:470",
+        "src-tauri/src/stems.rs:44-46",
+        "src-tauri/src/stems.rs:146-148",
+        "src-tauri/src/edit.rs:61-63",
+        "src-tauri/src/edit.rs:114-118"
+      ],
+      "claim": "commands.rs:680-683 runs `stems::remove(&id); edit::remove(&id); crate::thumbs::remove(&id);` *before* checking the clip exists. `muxer::sanitize` (muxer.rs:470) maps \"\" to \"\", so `stems::dir(\"\")` is `tracks\\` and `remove_dir_all` deletes the whole store (stems.rs:44-46, :146-148). `edit::remove(\"\")` does `remove_dir_all(originals\\)` (edit.rs:61-63, :114-118), which holds every trimmed clip's only untouched copy and every screenshot original. The library delete is then a no-op and the call returns `Ok`. Because `sanitize` maps `-` to `_`, passing another clip's UUID with underscores destroys that clip's stores. The side-file deletion also happens before the database commit, so a failed `lib.delete` still loses the side files.",
+      "scenario": "The renderer calls `delete_clip(\"\")`: the entire tracks store and originals store are deleted and the command returns Ok. Or it passes a clip UUID with `_` instead of `-`: another clip's tracks/original/thumbs are destroyed while its row stays. Or `lib.delete` fails after the side files are already gone.",
+      "fix": "Look up the clip first and return `Err` if it is missing. Take the store paths from `clip.id` as stored. Make `sanitize` return an error for empty or non-UUID input. Commit the row delete before removing files.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "LS-7",
+      "title": "`set_config` runs heavy work on the main thread, including MFTEnumEx on every change",
+      "severity": "medium",
+      "category": "perf",
+      "locations": [
+        "src-tauri/src/state.rs:367",
+        "src-tauri/src/commands.rs:117-121"
+      ],
+      "claim": "Sync `#[tauri::command]` functions run on the event-loop thread; while one runs the UI does not paint, and `window_awake` in the UI-update thread waits on the main thread, stalling the 2 s tick too. `set_config` is sync: `replace_config` calls `encode::resolve`, then `list_encoders`, then `mft::available_encoders()`, which runs MFTEnumEx on *every* change, including slider drags (state.rs:367). It also writes the config, refreshes audio and reads the registry for autostart. On a capture-source change it calls `stop_pipeline` plus `start_buffer_and_notify` (commands.rs:117-121); stopping waits for a save in progress, which takes seconds. `control::restart` waits on the server thread (see LS-1).",
+      "scenario": "Dragging a settings slider triggers MFT enumeration, a config write, audio refresh and a registry read per change on the UI thread, so the UI stalls; changing the capture source during a save freezes the UI for seconds.",
+      "fix": "Mark the command `#[tauri::command(async)]` or use `spawn_blocking`; cache the encoder list.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "LS-8",
+      "title": "`file_clip` sleeps in rename retries on the main thread while holding the library lock",
+      "severity": "medium",
+      "category": "perf",
+      "locations": [
+        "src-tauri/src/filing.rs:269-285",
+        "src-tauri/src/commands.rs:747"
+      ],
+      "claim": "`file_clip` (a sync command, main thread) calls `filing::move_file`, which retries `rename` with sleeps of 40 to 200 ms, about 0.6 s in total (filing.rs:269-285). It does this *while holding the library lock* (commands.rs:747), and the retries happen exactly when the player holds the file.",
+      "scenario": "Filing a clip that is open in the player freezes the UI for ~0.6 s and blocks every other command that needs the library lock meanwhile.",
+      "fix": "Mark the command `#[tauri::command(async)]` or use `spawn_blocking`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "LS-9",
+      "title": "Other sync commands do blocking IO, COM/MFT enumeration and retry sleeps on the main thread",
+      "severity": "medium",
+      "category": "perf",
+      "locations": [
+        "src-tauri/src/clipboard.rs:42-47",
+        "src-tauri/src/commands.rs"
+      ],
+      "claim": "These sync commands block the event-loop thread: `set_clip_dir` (create and write on what may be a network path); `list_audio_devices`, `list_audio_processes`, `list_capture_targets` and `list_encoders` (COM and MFT enumeration); `copy_clip_file` and `clipboard_*` (up to about 0.5 s of retry sleeps, clipboard.rs:42-47); `open_clip` (ShellExecute); `delete_clip` (`remove_dir_all` plus full library scans); `regenerate_control_token`.",
+      "scenario": "Invoking any of these commands stops the UI from painting and stalls the 2 s UI-update tick (which waits on the main thread via `window_awake`) for the duration of the IO/enumeration/sleeps.",
+      "fix": "Mark these commands `#[tauri::command(async)]` or use `spawn_blocking`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "LS-10",
+      "title": "Toggle-buffer hotkey starts/stops the pipeline inline on the UI thread; misleading comment",
+      "severity": "medium",
+      "category": "perf",
+      "locations": [
+        "src-tauri/src/lib.rs:811-816",
+        "src-tauri/src/lib.rs:416",
+        "src-tauri/src/tray.rs:113",
+        "src-tauri/src/lib.rs:786"
+      ],
+      "claim": "The toggle-buffer hotkey handler at lib.rs:811-816 calls `toggle_buffer_and_notify` inline. The tauri-plugin-global-shortcut 2.3.2 handler runs in the hidden window's wndproc on the main thread (lib.rs:416), so the pipeline starts and stops on the UI thread. The tray spawns a thread for the same action (tray.rs:113). The comment at lib.rs:786 (\"hotkey arrives on one of its own\") is wrong.",
+      "scenario": "Pressing the toggle-buffer hotkey blocks the UI thread while the capture pipeline starts or stops (stopping can wait for an in-progress save).",
+      "fix": "Spawn a thread in the toggle hotkey handler (as the tray does) and correct the comment.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "LS-11",
+      "title": "Startup tidying in `setup()` runs on the main thread before the window paints",
+      "severity": "medium",
+      "category": "perf",
+      "locations": [
+        "src-tauri/src/lib.rs:1189-1230"
+      ],
+      "claim": "`setup()` (lib.rs:1189-1230) runs `edit::repair`, `thumbs::migrate`, `normalize_games`, `filing::tidy` (renames with sleeps) and `discard_leftovers` on the main thread before the window paints. The code comments themselves mention about 3 s.",
+      "scenario": "On startup the window stays unpainted for around 3 s (longer on large libraries) while tidying runs; this also widens the window in which the UI runs on the mock config (see LS-13).",
+      "fix": "Do the setup tidying on a background thread.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "LS-12",
+      "title": "`Library::get` reads the whole library (and does filesystem checks per clip) to find one clip",
+      "severity": "medium",
+      "category": "perf",
+      "locations": [
+        "src-tauri/src/clips.rs:186-188",
+        "src-tauri/src/clips.rs:145",
+        "src-tauri/src/edit.rs:73-79",
+        "src-tauri/src/edit.rs:97"
+      ],
+      "claim": "clips.rs:186-188 is `Ok(self.list()?.into_iter().find(|c| c.id == id))`. `list()` reads every row and every tag, and for each clip calls `edit::has_original`, which costs 2-3 `is_file` checks (clips.rs:145, edit.rs:73-79, :97). Almost every command calls `get` one to three times, under the library mutex, mostly on the main thread.",
+      "scenario": "With 2,000 clips a single click costs about 6,000 filesystem checks under the library lock on the main thread; Windows Defender makes it worse.",
+      "fix": "Query with `WHERE id = ?1` plus the tags for that one id, and compute `original_available` only for the clip being returned.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-13",
+      "title": "UI starts from the mock config and `set_config` saves whatever whole config it is sent",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "src/store.ts:164",
+        "src/store.ts:362-368",
+        "src-tauri/src/commands.rs:54-68",
+        "src/lib/mock.ts:86",
+        "src/lib/mock.ts:121"
+      ],
+      "claim": "store.ts:164 has `config: mock.mockConfig`, and the main UI is not gated on `ready`. `patchConfig` (store.ts:362-368) sends `{...get().config, ...patch}`. `set_config` (commands.rs:54-68) keeps the real token only when the incoming one is empty. The mock has `token: \"mock-token\"` and `clipDir: \"C:\\\\Users\\\\user\\\\…\"` (mock.ts:86, :121).",
+      "scenario": "A settings change made before init's `Promise.all` finishes (startup is slow, see LS-11) saves the mock values: clip folder, audio sources and hotkeys are replaced, and after a restart the control token becomes `mock-token`, a string published in the repo. More generally, a stale settings page overwrites values the backend changed meanwhile (screen repair, a regenerated token).",
+      "fix": "Start the UI config as `null` and gate the UI on it. Better, make `set_config` accept a typed patch, or reject a config that does not match the current revision. Never accept `control.token` from the UI.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-14",
+      "title": "Stream Deck \"start\"/\"stop\" on `/v1/buffer` is undone by the in-game automation",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src-tauri/src/control.rs:225-226",
+        "src-tauri/src/lib.rs:333-342",
+        "src-tauri/src/state.rs:184-191"
+      ],
+      "claim": "control.rs:225-226 calls `start_buffer_and_notify` and `stop_buffer_and_notify` directly; only the toggle path calls `state.auto.manual_stop()` and `manual_start()` (lib.rs:333-342). The shipped plugin sends only \"toggle\", but \"start\"/\"stop\" are part of the API.",
+      "scenario": "With \"only in game\" on, a `/v1/buffer` stop request stops the buffer, then `poll()` (state.rs:184-191) sees `!suppressed` and restarts the buffer within 2 s (and likewise a manual start is not registered).",
+      "fix": "Call `manual_*` on the start and stop branches too.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "LS-15",
+      "title": "config.json writes can race and corrupt the file; a corrupt file silently resets to defaults",
+      "severity": "medium",
+      "category": "data-loss",
+      "locations": [
+        "src-tauri/src/state.rs:368-402",
+        "src-tauri/src/control.rs:124",
+        "src-tauri/src/control.rs:364",
+        "src-tauri/src/lib.rs:505",
+        "src-tauri/src/lib.rs:1139",
+        "src-tauri/src/config.rs:181-183",
+        "src-tauri/src/config.rs:167-170",
+        "src-tauri/src/config.rs:244-248"
+      ],
+      "claim": "`replace_config` writes to disk *outside* the config lock (state.rs:368-402), while `control::ensure_token` and `regenerate_token`, `repair_screens` and `hide_to_tray` write *inside* it (control.rs:124, :364; lib.rs:505, :1139). Both paths write the same `config.json.tmp` (config.rs:181-183), with no fsync. On a parse failure `load()` quietly falls back to defaults (config.rs:167-170). The comment at config.rs:244-248 itself calls this \"the most expensive bug this file can have\".",
+      "scenario": "Interleaved writes to the shared temp file, or a power loss without fsync, leave invalid JSON in config.json; on next start `load()` returns defaults, the next save overwrites the user's settings and a new control token is generated.",
+      "fix": "One write lock around snapshot-and-write, a unique temp file name, `sync_all()` before rename, and keep `config.json.bad` plus a last-known-good copy on a parse failure.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-16",
+      "title": "No recovery when the clip database cannot be opened; new clips are never indexed",
+      "severity": "low",
+      "category": "robustness",
+      "locations": [
+        "src-tauri/src/state.rs:274-280",
+        "src-tauri/src/lib.rs:123-127"
+      ],
+      "claim": "If `Library::open` fails (state.rs:274-280), the library stays `None`. Saves still write files but are never indexed (lib.rs:123-127), and there is no rescan.",
+      "scenario": "A corrupt or unopenable clips.db makes every subsequently saved clip invisible in the app for good.",
+      "fix": "Run an integrity check, rename the corrupt file aside, and rebuild by scanning the clip folder.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-17",
+      "title": "`Library::delete` reports success while the file stays on disk",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src-tauri/src/clips.rs:315-330"
+      ],
+      "claim": "`Library::delete` ignores a `remove_file` error, then deletes the row anyway (clips.rs:315-330).",
+      "scenario": "A clip file held open by an external player fails to delete, but its row is removed; the file becomes an untracked orphan while the UI says \"deleted\".",
+      "fix": "Fail or retry the file removal before deleting the row.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-18",
+      "title": "`path UNIQUE` with `INSERT OR REPLACE` silently deletes another clip's row and tags",
+      "severity": "low",
+      "category": "data-loss",
+      "locations": [
+        "src-tauri/src/clips.rs:38",
+        "src-tauri/src/clips.rs:100"
+      ],
+      "claim": "The clips table declares `path UNIQUE` (clips.rs:38) and inserts use `INSERT OR REPLACE` (clips.rs:100). Latent row loss.",
+      "scenario": "Whenever a new clip is inserted with the same path as an existing clip, SQLite deletes the *other* clip's row and its tags silently.",
+      "fix": "Not stated in the report (implied: avoid INSERT OR REPLACE deleting other clips' rows on a path conflict).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-19",
+      "title": "`free_name` can overwrite an existing file (check-then-rename, 999-collision fallback, parallel receives)",
+      "severity": "low",
+      "category": "data-loss",
+      "locations": [
+        "src-tauri/src/filing.rs:247-265",
+        "src-tauri/src/filing.rs:272",
+        "src-tauri/src/share.rs:643"
+      ],
+      "claim": "`free_name` (filing.rs:247-265) checks `exists()` and then the caller renames. After 999 collisions it returns the existing `target`. `std::fs::rename` on Windows *replaces* the destination (filing.rs:272). share.rs:643 picks a free name *before* a long download.",
+      "scenario": "After 999 collisions, or when the name is taken between the check and the rename, an existing file is replaced. Two parallel receives of the same file name share both the `.part` file and the final target.",
+      "fix": "Create the target with `create_new(true)`, or use a rename that does not replace.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-20",
+      "title": "Game folder name sanitizer misses some Windows reserved device names",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src-tauri/src/filing.rs:41-72"
+      ],
+      "claim": "The reserved-name list in the game folder-name sanitizer (filing.rs:41-72) misses `CONIN$`, `CONOUT$`, `COM¹-³`/`LPT¹-³`, and a name like `NUL .x` with a space before the dot.",
+      "scenario": "A game whose window title sanitizes to one of these names makes folder creation fail, so the clip simply stays where it is instead of being filed.",
+      "fix": "Not stated in the report (implied: extend the reserved-name handling to these names/patterns).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-21",
+      "title": "No Unicode normalization of game folder names",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src-tauri/src/filing.rs:41-72"
+      ],
+      "claim": "Game folder names (filing.rs:41-72) are not Unicode-normalized.",
+      "scenario": "NFC and NFD spellings of the same game name become two separate folders.",
+      "fix": "Not stated in the report (implied: Unicode-normalize game names before deriving folder names).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-22",
+      "title": "Case-sensitive path comparisons in filing cause spurious `x (2).mp4` renames",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src-tauri/src/filing.rs:101",
+        "src-tauri/src/filing.rs:121"
+      ],
+      "claim": "Path comparisons in filing are case-sensitive (filing.rs:101, :121), although Windows paths are case-insensitive.",
+      "scenario": "If a game is renamed with only a case change, `place` renames the file in place to `x (2).mp4`.",
+      "fix": "Not stated in the report (implied: compare paths case-insensitively on Windows).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-23",
+      "title": "`clipboard::read_text` can read past the end of the clipboard block",
+      "severity": "low",
+      "category": "security",
+      "locations": [
+        "src-tauri/src/clipboard.rs:163-175"
+      ],
+      "claim": "clipboard.rs:163-175 reads up to 4,000,000 UTF-16 units from the `CF_UNICODETEXT` global block until it finds a null terminator, without checking `GlobalSize`.",
+      "scenario": "A local app puts unterminated `CF_UNICODETEXT` on the clipboard; reading it causes an out-of-bounds read, an access violation and a crash of ClippiBoy.",
+      "fix": "Bound the read with `GlobalSize(block) / 2`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-24",
+      "title": "ffmpeg automatically parses friend-supplied media without protocol whitelist or fixed demuxer",
+      "severity": "low",
+      "category": "security",
+      "locations": [
+        "src-tauri/src/thumbs.rs:28-62",
+        "src-tauri/src/share.rs:838-841"
+      ],
+      "claim": "`thumbs::make` / `make_still` (thumbs.rs:28-62) run ffmpeg with no `-protocol_whitelist` and no fixed `-f` over files received from friends, right after they arrive (share.rs:838-841).",
+      "scenario": "A friend (or attacker sending via the share path) delivers a crafted media file that is automatically parsed by ffmpeg's demuxers, the largest parser attack surface reachable from the network. Exploitability is speculative.",
+      "fix": "Add `-protocol_whitelist file` and `-f mov`/`image2` matched to the expected kind, and keep the bundled ffmpeg current.",
+      "reported_confidence": "speculative"
+    },
+    {
+      "id": "LS-25",
+      "title": "Control port is on by default and lets any web page detect ClippiBoy",
+      "severity": "low",
+      "category": "security",
+      "locations": [
+        "src-tauri/src/control.rs"
+      ],
+      "claim": "The control port is enabled by default on every install, even without a Stream Deck, on a fixed port (127.0.0.1:47653).",
+      "scenario": "Any web page can detect that ClippiBoy is running by probing the fixed port; any local process of any Windows user can connect.",
+      "fix": "Keep the control port off until the Stream Deck plugin is detected.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-26",
+      "title": "Control port does not check the Host header; Origin/Referer/Sec-Fetch-Site heuristic has DNS-rebinding gaps",
+      "severity": "low",
+      "category": "security",
+      "locations": [
+        "src-tauri/src/control.rs"
+      ],
+      "claim": "The control server does not check the Host header. Its browser defense relies on refusing requests carrying Origin, Referer or Sec-Fetch-Site, which has gaps: a same-origin GET sent with `no-referrer` carries none of them. Today the token is the real protection.",
+      "scenario": "A DNS-rebinding page issues a same-origin GET with `no-referrer` to the control port; only the token stops it.",
+      "fix": "Require `Host: 127.0.0.1:<port>` or `localhost:<port>`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-27",
+      "title": "Control token never rotates; another local user can squat the port and harvest it",
+      "severity": "low",
+      "category": "security",
+      "locations": [
+        "src-tauri/src/control.rs"
+      ],
+      "claim": "The control token never changes across runs.",
+      "scenario": "Another local Windows user binds port 47653 while ClippiBoy is down, collects the token from the Stream Deck plugin's polling, and later uses it to trigger recordings or screenshots of the victim's session.",
+      "fix": "Rotate the token each run.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-28",
+      "title": "Configured port 0 makes the handoff file name port 0 instead of the bound port",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src-tauri/src/control.rs"
+      ],
+      "claim": "Port 0 can be configured for the control server; the handoff file (`%APPDATA%\\ClippiBoy\\streamdeck.json`) then names port 0 instead of the actually bound port.",
+      "scenario": "A user sets the port to 0; the OS picks a random port, but the Stream Deck plugin reads port 0 from the handoff file and cannot connect.",
+      "fix": "Write the actual bound port to the handoff file.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-29",
+      "title": "Log file has no size limit within a run",
+      "severity": "low",
+      "category": "robustness",
+      "locations": [
+        "src-tauri/src/logging.rs:59-63"
+      ],
+      "claim": "logging.rs:59-63 rotates the log only at start; there is no size limit within a run.",
+      "scenario": "The 5 s health line plus networking warnings grow the log for weeks while the app sits in the tray.",
+      "fix": "Add a size cap or daily rotation.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-30",
+      "title": "Unparseable friends-server messages are logged in full (presence data, friend IDs)",
+      "severity": "low",
+      "category": "privacy",
+      "locations": [
+        "src-tauri/src/friends.rs:521"
+      ],
+      "claim": "friends.rs:521 logs the *entire* server message when parsing fails, which can include presence data and friend IDs.",
+      "scenario": "Testers are asked to send logs back; those logs contain other users' presence data and friend IDs.",
+      "fix": "Truncate or redact unknown messages before logging.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-31",
+      "title": "Debug-formatted iroh errors in logs can leak peer IP addresses",
+      "severity": "low",
+      "category": "privacy",
+      "locations": [
+        "src-tauri/src/share.rs:694",
+        "src-tauri/src/share.rs:747"
+      ],
+      "claim": "share.rs:694 and :747 log Debug-formatted (`{:?}`) iroh errors, which can include peer IP addresses.",
+      "scenario": "Testers are asked to send these logs back, disclosing friends' IP addresses.",
+      "fix": "Keep Debug detail out of info-level logs.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-32",
+      "title": "Uninstall leaves session token, control token, database, large caches and autostart entry behind",
+      "severity": "low",
+      "category": "security",
+      "locations": [
+        "src-tauri/windows/hooks.nsh"
+      ],
+      "claim": "There is no uninstall hook in hooks.nsh. Tauri's \"delete app data\" removes `%APPDATA%\\gg.clippiboy.app` and `%LOCALAPPDATA%\\gg.clippiboy.app`, but the real data is in `%APPDATA%\\ClippiBoy` and survives: friends.json (session bearer token), the control token, clips.db, gigabytes of originals and tracks, logs. The HKCU Run autostart value also stays. All of this is in the *Roaming* profile.",
+      "scenario": "A user uninstalls with \"delete app data\" checked; the bearer session token, control token, clip database, gigabytes of caches and the autostart Run entry remain (and roam with the profile).",
+      "fix": "Add `NSIS_HOOK_POSTUNINSTALL` behind the same checkbox, remove the autostart entry, and move the large stores to LocalAppData.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-33",
+      "title": "Dead asset-protocol scope entry `$APPDATA/ClippiBoy/**`",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "src-tauri/tauri.conf.json"
+      ],
+      "claim": "The asset scope entry `$APPDATA/ClippiBoy/**` in tauri.conf.json resolves to `%APPDATA%\\gg.clippiboy.app\\ClippiBoy`, which does not exist (tauri path/desktop.rs:247), so the entry is dead. Do not \"fix\" it to `$DATA`, which would expose config.json and friends.json.",
+      "scenario": "The entry grants nothing today; a well-meant fix to `$DATA/ClippiBoy/**` would expose config.json and friends.json (session token) to the asset protocol.",
+      "fix": "Not stated explicitly (implied: remove the dead entry); do not change it to `$DATA`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-34",
+      "title": "Asset scope `$VIDEO/**` exposes the whole Videos folder",
+      "severity": "low",
+      "category": "security",
+      "locations": [
+        "src-tauri/tauri.conf.json"
+      ],
+      "claim": "The asset protocol scope in tauri.conf.json includes `$VIDEO/**`, exposing the entire Videos folder, while `$VIDEO/ClippiBoy/**` is enough.",
+      "scenario": "A compromised renderer can read any file under the user's Videos folder through the asset protocol.",
+      "fix": "Narrow the scope to `$VIDEO/ClippiBoy/**`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-35",
+      "title": "Unused opener and global-shortcut plugin permissions granted",
+      "severity": "low",
+      "category": "security",
+      "locations": [
+        "src-tauri/capabilities/default.json"
+      ],
+      "claim": "The capabilities grant `opener:default`, `opener:allow-reveal-item-in-dir` and `global-shortcut:default`, but the frontend imports no opener or global-shortcut module and does not use them.",
+      "scenario": "Unneeded plugin permissions widen what a compromised renderer can do.",
+      "fix": "Remove these permissions.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-36",
+      "title": "CSP lacks `base-uri`, `form-action` and `object-src` restrictions",
+      "severity": "low",
+      "category": "security",
+      "locations": [
+        "src-tauri/tauri.conf.json"
+      ],
+      "claim": "The CSP in tauri.conf.json does not set `base-uri`, `form-action` or `object-src` (script-src falls back to 'self', and `style-src 'unsafe-inline'` is acceptable).",
+      "scenario": "Missing directives leave base-tag injection, form submission and plugin/object embedding unrestricted as defense-in-depth gaps.",
+      "fix": "Add `base-uri 'none'; form-action 'none'; object-src 'none'`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-37",
+      "title": "`msSmartScreenProtection` disabled in WebView2 browser args",
+      "severity": "info",
+      "category": "security",
+      "locations": [
+        "src-tauri/tauri.conf.json"
+      ],
+      "claim": "`additionalBrowserArgs` in tauri.conf.json disables `msSmartScreenProtection`. Informational, because only local content is loaded.",
+      "scenario": "No concrete scenario; SmartScreen would only matter if remote content were loaded.",
+      "fix": "None required (informational).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-38",
+      "title": "Deep-link match is loose: `clippiboy://authX` is accepted",
+      "severity": "low",
+      "category": "security",
+      "locations": [
+        "src-tauri/src/friends.rs:147"
+      ],
+      "claim": "The deep-link handler matches with `strip_prefix(\"clippiboy://auth\")`, which also matches `clippiboy://authX` and similar.",
+      "scenario": "A web page can trigger `clippiboy://authX...` links (after the browser's \"open app?\" prompt) and have them treated as auth callbacks.",
+      "fix": "Parse with `url::Url` and require host `auth`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-39",
+      "title": "Any deep link consumes the pending PKCE verifier before the exchange, letting a web page cancel sign-in",
+      "severity": "low",
+      "category": "security",
+      "locations": [
+        "src-tauri/src/friends.rs:289"
+      ],
+      "claim": "Any auth deep link `take()`s the pending verifier *before* the code exchange (friends.rs:289), and each link raises an error toast.",
+      "scenario": "A web page fires a bogus `clippiboy://auth?code=` link during a user's sign-in; the verifier is consumed and the real sign-in is cancelled. Repeated links spam error toasts.",
+      "fix": "Consume the verifier only after a successful exchange, and rate-limit the toasts.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-40",
+      "title": "`export_for_discord` size computation `megabytes * 1024 * 1024` is unchecked",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src-tauri/src/commands.rs:872"
+      ],
+      "claim": "`export_for_discord` computes `megabytes * 1024 * 1024` unchecked (commands.rs:872).",
+      "scenario": "A large `megabytes` value wraps in release builds (wrong target size) and panics in debug builds.",
+      "fix": "Use `checked_mul` and clamp.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-41",
+      "title": "`save_clip(Some(seconds))` bypasses the normal save flow",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src-tauri/src/commands.rs:375-382"
+      ],
+      "claim": "`save_clip(Some(seconds))` (commands.rs:375-382) skips `begin_save`, tagging, the `clip-saved` event and the banner. The UI never sends `Some`.",
+      "scenario": "A caller passing `Some(seconds)` saves a clip without save bookkeeping, tags, the `clip-saved` event or the banner.",
+      "fix": "Remove the `Some` path or route it through `save_clip_and_notify`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-42",
+      "title": "Startup failure `.expect(\"could not start ClippiBoy\")` aborts without telling the user",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src-tauri/src/lib.rs:1367"
+      ],
+      "claim": "lib.rs:1367 uses `.expect(\"could not start ClippiBoy\")`, which aborts without any user-visible message.",
+      "scenario": "When WebView2 is missing (for example), the app silently exits and the user gets no explanation.",
+      "fix": "Show a native message box before exiting.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-43",
+      "title": "Stringly-typed command errors: repeated `.map_err(|e| e.to_string())` and \"clip not found\"",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "src-tauri/src/commands.rs"
+      ],
+      "claim": "commands.rs uses `type Result<T> = Result<T, String>`, with 39 `.map_err(|e| e.to_string())` and 21 `\"clip not found\"` occurrences. `thiserror` is already a dependency.",
+      "scenario": "Error handling is repetitive and untyped; the frontend cannot distinguish error kinds.",
+      "fix": "Introduce a serializable `CmdError` enum using `thiserror`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-44",
+      "title": "Repeated clip lookup logic in commands.rs; no `clip_by_id` helper",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "src-tauri/src/commands.rs"
+      ],
+      "claim": "Commands repeat the same look-up-clip-or-\"clip not found\" pattern instead of using a shared helper.",
+      "scenario": "Duplicated lookup code across many commands; inconsistent handling is easy to introduce.",
+      "fix": "Add a `clip_by_id(&state, &id)` helper.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-45",
+      "title": "Three `*_and_notify` functions duplicate the same post-save sequence",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "src-tauri/src/lib.rs:105-271"
+      ],
+      "claim": "The three `*_and_notify` functions in lib.rs:105-271 repeat the same index, tag, emit, notify, sound, telemetry and banner sequence.",
+      "scenario": "Changes to the post-save flow must be made in three places and can drift apart.",
+      "fix": "Extract an `announce_saved` function.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-46",
+      "title": "`spawn_ui_updates` is a 160-line loop driven by magic `tick %` values",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "src-tauri/src/lib.rs:928-1089"
+      ],
+      "claim": "`spawn_ui_updates` (lib.rs:928-1089) is a 160-line loop whose jobs are scheduled by magic `tick %` values.",
+      "scenario": "Hard to read and change cadence of individual jobs.",
+      "fix": "Use per-cadence scheduled jobs.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-47",
+      "title": "Mixed German and English in comments, logs and capability descriptions",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "src-tauri/src/lib.rs:853-857",
+        "src-tauri/src/lib.rs:931-958",
+        "src-tauri/src/commands.rs:762",
+        "src-tauri/capabilities/default.json"
+      ],
+      "claim": "Comments, logs and capability descriptions mix German and English: lib.rs:853-857, :931-958, commands.rs:762 \"blieb liegen\", `.clippiboy-schreibtest`, and default.json \"Rechte des Hauptfensters\".",
+      "scenario": "Inconsistent language hampers maintenance and log reading for non-German contributors.",
+      "fix": "Not stated in the report (implied: use one language consistently).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "LS-48",
+      "title": "Missing tests for delete_clip(\"\"), mock-config saves, folder-name edge cases and oversized control-port requests",
+      "severity": "low",
+      "category": "test-gap",
+      "locations": [
+        "src-tauri/src/commands.rs",
+        "src/store.ts",
+        "src-tauri/src/filing.rs",
+        "src-tauri/src/control.rs"
+      ],
+      "claim": "There are no tests for: `delete_clip(\"\")`; a mock config reaching `set_config`; reserved names and case handling in `folder_name`; and the control port's handling of oversized requests.",
+      "scenario": "The defects LS-6, LS-13, LS-20/LS-22 and LS-1 could regress or go unnoticed without tests.",
+      "fix": "Add tests for these four cases.",
+      "reported_confidence": "likely"
+    }
+  ],
+  "proposals": [
+    {
+      "id": "LS-P-1",
+      "title": "Define an app ACL manifest and per-window command grants",
+      "area": "security / Tauri IPC",
+      "value": "Restores least privilege so an XSS in the overlay or console cannot call destructive commands.",
+      "effort": "?",
+      "sketch": "build.rs: `tauri_build::Attributes::new().app_manifest(AppManifest::new().commands(&[...]))`; capabilities/*.json grant each window only the commands it uses (overlay roughly none, console its clip and friends subset)."
+    },
+    {
+      "id": "LS-P-2",
+      "title": "Treat every IPC path argument as untrusted",
+      "area": "security / commands",
+      "value": "Prevents a compromised renderer from reading or writing arbitrary files.",
+      "effort": "?",
+      "sketch": "Paths come from Rust-side dialogs or are derived from clip ids; never send raw paths from JS (export_clip, set_clip_dir/set_config clip_dir, reveal_path)."
+    },
+    {
+      "id": "LS-P-3",
+      "title": "Rebuild the control port with limits, Host check and per-run tokens, enabled only when the plugin exists",
+      "area": "security / control port",
+      "value": "Removes the local DoS, fingerprinting, DNS-rebinding gaps and token harvesting.",
+      "effort": "?",
+      "sketch": "control.rs: timeouts, size and connection limits, Host check, per-run tokens; turn the port on only when the Stream Deck plugin is detected."
+    },
+    {
+      "id": "LS-P-4",
+      "title": "Harden every ffmpeg invocation",
+      "area": "security / media",
+      "value": "Shrinks the parser and protocol attack surface reachable from friend-supplied files and renderer arguments.",
+      "effort": "?",
+      "sketch": "Add `-protocol_whitelist file` and an explicit `-f` to every ffmpeg call (export, trim, thumbs), and drop the PATH fallback for `ffmpeg` in `muxer::tool`."
+    },
+    {
+      "id": "LS-P-5",
+      "title": "Move sync commands off the main thread by default",
+      "area": "perf / commands",
+      "value": "Keeps the UI responsive; main thread reserved for window operations.",
+      "effort": "?",
+      "sketch": "Make commands `#[tauri::command(async)]` or use `spawn_blocking` by default; keep main-thread work for window operations."
+    },
+    {
+      "id": "LS-P-6",
+      "title": "Crash-safe writes for all persisted JSON files",
+      "area": "robustness / persistence",
+      "value": "Prevents silent settings and token loss on races or power loss.",
+      "effort": "?",
+      "sketch": "config, handoff (streamdeck.json), friends.json and links.json each get a unique temp file, fsync and rename, plus a backup on parse failure."
+    },
+    {
+      "id": "LS-P-7",
+      "title": "Validate the clip folder",
+      "area": "security / config",
+      "value": "Stops the asset protocol from being granted over sensitive directories.",
+      "effort": "?",
+      "sketch": "Canonicalize the clip folder and refuse an empty path, a drive root, the profile root, the data folder itself, `\\\\` UNC paths and `\\\\?\\` device paths."
+    },
+    {
+      "id": "LS-P-8",
+      "title": "Move large caches to LocalAppData and protect secrets with DPAPI",
+      "area": "storage / privacy",
+      "value": "Keeps gigabytes of caches out of the roaming profile and protects the session and control tokens at rest.",
+      "effort": "?",
+      "sketch": "Move originals, tracks, thumbs, preview and logs to LocalAppData; consider DPAPI for friends.json and the control token."
+    },
+    {
+      "id": "LS-P-9",
+      "title": "Split lib.rs and commands.rs into focused modules",
+      "area": "code structure",
+      "value": "Makes the two largest files easier to navigate and change.",
+      "effort": "?",
+      "sketch": "lib.rs: `actions.rs` (save/shot/record/buffer flows), `hotkeys.rs`, `ticker.rs`, `watchers.rs`, `app.rs` (builder). commands.rs: `commands/{config, clips, editor, screenshot, export, system}.rs`."
+    }
+  ],
+  "positives": [
+    "No remote code execution was found.",
+    "No SQL injection: every query uses bound parameters.",
+    "No path traversal through game names or names of files received from friends.",
+    "Remote origins are blocked from Tauri IPC by Tauri 2.11 (webview/mod.rs:1823); IPC is reachable only from local content in the main, overlay and console windows.",
+    "Control port refuses (403) requests without a matching `x-clippiboy-token` (UUIDv4) or carrying Origin, Referer or Sec-Fetch-Site, and sends no CORS headers; the token is the real protection today.",
+    "The handoff file `%APPDATA%\\ClippiBoy\\streamdeck.json` and the token in config.json are readable by the same user only.",
+    "Single-instance arguments: only `--autostart` is examined; deep links are forwarded by the plugin; second-instance arguments only bring the window up.",
+    "Installer post-install writes the installer file name to install-source.txt, which telemetry.rs:173 parses strictly.",
+    "hooks.nsh is benign: it takes no user input, deletes nothing and runs no commands; pre-install waits for the exe to be released.",
+    "React escaping and the absence of `dangerouslySetInnerHTML` make XSS unlikely today.",
+    "Game folder names: `/ \\ :` and control characters are replaced and trailing dots and spaces trimmed (filing.rs:41-72), so no traversal is possible.",
+    "`prune` removes only empty directories and does not follow junctions; it is safe.",
+    "No tokens or OAuth codes are logged.",
+    "CSP: `script-src` falls back to 'self' (good); `style-src 'unsafe-inline'` is acceptable.",
+    "Deep-link PKCE is sound: the server checks sha256(verifier) against the stored challenge (server/src/index.ts:222), so login CSRF is not possible.",
+    "Lock poisoning is a non-issue: parking_lot does not poison, and its `!Send` guards make holding a lock across `.await` a compile error; no mutex is held across IO except the library lock in `file_clip` and `with_library`.",
+    "Browsers cannot set Content-Length, so the control-port body-drain crash is local-only."
+  ]
+}

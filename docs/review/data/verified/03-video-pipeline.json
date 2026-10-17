@@ -1,0 +1,1180 @@
+[
+ {
+  "id": "VP-1",
+  "title": "Pacer never skips ticks and muxer discards PTS: encoder deficit or dropped frames become ever-growing A/V desync and eventually silent clips",
+  "severity": "high",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/convert.rs:705-733",
+   "src-tauri/src/mft.rs:1184",
+   "src-tauri/src/pipeline.rs:535-537",
+   "src-tauri/src/muxer.rs:263",
+   "src-tauri/src/pipeline.rs:1002-1003"
+  ],
+  "claim": "The frame pacer pace() in convert.rs:705-733 never skips ticks: `let due = start + period * index as u32; … if due > now { sleep } else if index > 0 { latest.overruns.fetch_add(1, …) } … index += 1; … let pts = (index as i64 - 1) * 10_000_000 / fps as i64;`. pts is derived purely from the tick index, so when the loop falls behind (encoder submit can block up to 500 ms via `send_timeout(job, SUBMIT_WAIT)` at mft.rs:1184) pts keep advancing 1/fps per frame regardless of wall-clock time. The muxer then throws packet PTS away and muxes the raw ES as CFR with `-f h264 -r fps` (muxer.rs:263), while audio is mapped via `qpc_of = base + pts_us*10` (pipeline.rs:535-537) and the snapshot sets `audio_frames = packets.len()*SR/fps` (pipeline.rs:1002-1003). A sustained encoder deficit or dropped frames therefore become ever-growing A/V desync and eventually silent clips. Overruns are only logged; nothing appears in the UI.",
+  "scenario": "Encoder sustains 50 fps for a 60 fps config (OBS holding NVENC as in the README's own example, 1440p165, or an iGPU under game load). The loop runs at 50 Hz but pts advance 1/60 s per frame; after 10 minutes the video timeline is about 100 s behind the wall clock. qpc_of() maps packets ~100 s too early, so the audio cut at start_100ns is from long before the picture. Once the lag exceeds the TrackRing (buffer + 2 s), window() returns zeros and the clip is silent; the 'last 30 s' also spans more than 30 s of real time. Every 500 ms submit timeout (a lost frame) shifts everything after it by one frame because the raw ES is muxed at -r fps; audio_frames only fixes the total length. Recordings accumulate both effects over hours.",
+  "fix": "When now − due > period, set index = elapsed/period (skip ticks) so pts stay true to the wall clock. Mux with real timestamps: a VFR container fed with packet PTS (a minimal NUT/MKV/TS writer piped to ffmpeg), or cut audio per packet at qpc_of(pts). Surface the overrun and drop rate in the UI.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "high",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "high",
+    "evidence": "convert.rs:705-711 `let due = start + period * index as u32; ... if due > now { sleep } else if index > 0 { latest.overruns.fetch_add(1) }` - no tick skipping; convert.rs:714 `index += 1`; convert.rs:729 `let pts = (index as i64 - 1) * 10_000_000 / fps as i64;` - pts purely from tick count. convert.rs:733 `sink.on_frame(...)` -> pipeline.rs:610 `self.encoder.submit(texture, pts_100ns)` -> mft.rs:1171-1184 `try_send` then `send_timeout(job, SUBMIT_WAIT)` (500 ms, mft.rs:134) on a `bounded::<Job>(depth)` channel (mft.rs:1101): the pacer thread blocks at the encoder's pace, so a sustained deficit makes the loop run at encoder rate while pts advance 1/fps per iteration. mft.rs:970 `SetSampleTime(job.pts_100ns)` / mft.rs:1032,1053 packet `pts_us` = that pts. pipeline.rs:596-602 anchors base once: `base_100ns.store(qpc - pts_100ns)`; pipeline.rs:535-537 `qpc_of = base + pts_us*10` - assumes pts == wall clock. pipeline.rs:1021 `start_100ns: qpc_of(first_pts)`, pipeline.rs:1002-1003 `audio_frames = packets.len()*SAMPLE_RATE/fps`. muxer.rs:263 `-f h264 -r fps` - packet PTS discarded. buffer.rs:182 snapshot window chosen by pts (`newest_pts - seconds*1e6`), so 30 s of pts = 36 s of real time at 50/60. TrackRing capacity is buffer+2 s (pipeline.rs:46-48) and window() fills out-of-range with zeros (pipeline.rs:174-199) -> silent once lag > buffer+2 s. Recordings: recorder.rs:256-275 audio starts at qpc_of(first pts) and is streamed in real time, then recorder.rs:546-556 align() truncates to frames*SR/fps while video is muxed CFR - picture plays fast vs. sound. mft.rs:126-133 comment shows the design only assumes transient stalls ('catches up by itself'). No watchdog: overruns only reach health_line() (pipeline.rs:497-516, logged at lib.rs:1055-1063).",
+    "corrected_claim": "Mechanism and consequences are as stated. One minor detail: frames actually lost to the 500 ms timeout ARE surfaced in the UI (src/console/Trouble.tsx:104-108 'frames dropped in the last minute'), and the measured live fps (state.rs:576-585 via Shared::live_fps) would read about 50 for a 60 fps config. But the sustained-deficit case usually loses no frames (each submit waits ~1/encoder-rate, well under 500 ms), so no warning appears, and nothing anywhere signals the growing A/V offset or the clock overruns.",
+    "reachable_by": "Ordinary use, on the always-on replay buffer started at launch/game detection (pacer thread spawned in pipeline.rs:700-712) and on every clip save (hotkey/tray/UI/Stream Deck -> Pipeline::snapshot) and every recording. It needs an encoder that cannot keep up with the configured rate for a sustained stretch: the software X264/MFT encoder (EncoderId::X264; mft.rs:1358 software path), fps choices up to the monitor refresh (capture.rs:598-606: 144/165/240 Hz at 1440p+), an iGPU QSV under game load, or another app holding the encoder (the README itself describes OBS holding NVENC at 86%, README.md:660-665). Healthy hardware encoders at 1080p60 won't hit it; underpowered or high-refresh setups will. The lag accumulates from pipeline start (about lag = t*(1 - encoder_fps/fps)), so with a 30 s buffer at 50/60 clips are fully silent after roughly 3 minutes of buffering.",
+    "fix_assessment": "Both halves are needed. Skipping ticks alone keeps pts on the wall clock, but the CFR raw-ES mux (-r fps) and audio_frames = packets.len()*SR/fps would still make the video shorter than real time, so muxing with real packet PTS (a VFR container such as MKV/NUT, or ffmpeg fed timestamps) or cutting audio per packet at qpc_of(pts) is the real fix. Showing the overrun rate and A/V lag in the Trouble strip is a cheap extra."
+   },
+   {
+    "lens": "impact",
+    "verdict": "confirmed",
+    "severity_suggestion": "high",
+    "evidence": "convert.rs:705-711 `let due = start + period * index as u32; ... if due > now { sleep } else if index > 0 { overruns.fetch_add }` never re-bases index; convert.rs:727 `let pts = (index as i64 - 1) * 10_000_000 / fps`. The pacer is throttled by a bounded queue: mft.rs:1101 `crossbeam_channel::bounded::<Job>(depth)`, mft.rs:1184 `send_timeout(job, SUBMIT_WAIT)` (500 ms, mft.rs:134). base is anchored once: pipeline.rs:598-603 `base_100ns.store(qpc - pts_100ns)` only while !anchored; pipeline.rs:536 `base + pts_us * 10`. Audio rings are stamped on the wall clock: pipeline.rs:775 `let target = now_100ns() - AUDIO_LAG_100NS` -> pipeline.rs:808 `ring.push(&scratch, from)`; ring holds buffer+2 s (pipeline.rs:49) and window() (pipeline.rs:174-196) returns zeros for an offset outside it. Snapshot selects by pts span (buffer.rs:182 `want_from = newest_pts - seconds*1_000_000`) and sets audio length by packet count (pipeline.rs:1002). Muxer: muxer.rs:263 `-f h264 -r fps`. Long recordings do the same: recorder.rs:546 `audio_frames = frames * SAMPLE_RATE / fps`. So at 50 real fps for a 60 fps config, pts run at 5/6 of wall time and the lag grows by about 10 s a minute until the pipeline restarts. The code's own docs record real cases of encoders not keeping up (README:663-671: OBS holding the encoder made 647 ms frames, and an AMD encoder slowed down over time). One small detail is overstated: the UI is not completely blind. Console.tsx:831 shows the measured fresh-frame FPS and Trend.tsx tracks droppedFrames and a low-FPS floor. What it never says is that clips will be out of sync or silent.",
+    "corrected_claim": "",
+    "reachable_by": "Any user whose hardware encoder cannot keep up with the configured rate for a sustained stretch: 1440p/2160p at a high refresh rate (the UI offers up to the monitor's refresh rate, e.g. 165/240), OBS, ShadowPlay or a stream running on the same encoder, or an older AMD or Intel encoder under game load. A deficit of just 1 fps (59 of 60) already builds a 30 s lag in about 30 minutes, and then every replay-buffer clip is silent. Short deficits catch up, because the pacer runs ticks back to back until it is level again. A lost frame after a 500 ms stall shifts the rest of the clip by only one frame, which is a minor effect on its own.",
+    "fix_assessment": "Skipping ticks alone is not enough and makes things worse inside a clip. pts would stay on the wall clock, but the CFR `-r fps` mux and `audio_frames = packets*SR/fps` would make a 30 s window of 1500 frames play as 25 s of video against 25 s of audio, drifting up to 5 s by the end. It must ship together with timestamp-aware muxing: a VFR container fed with packet PTS, e.g. a small MKV/NUT writer, then ffmpeg with -c:v copy. A smaller interim fix: skip ticks so pts follow the wall clock, and at save time mux with `-r frames/real_span` (span taken from first and last pts) instead of the nominal fps. Picture and sound then line up on average inside each clip and the silent-clip failure goes away. The UI should also warn when sustained overruns or a measured FPS below target means clips will be out of sync."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "high",
+    "evidence": "convert.rs:705-711 `let due = start + period * index as u32; ... if due > now { sleep } else if index > 0 { latest.overruns.fetch_add(1, ..) }` - no tick is ever skipped; convert.rs:729 `let pts = (index as i64 - 1) * 10_000_000 / fps as i64;` - pts from the counter only. mft.rs:1184 `self.jobs.send_timeout(job, SUBMIT_WAIT)` with mft.rs:134 SUBMIT_WAIT = 500 ms; on timeout returns false and pipeline.rs:607-608 only bumps `dropped` while the index was already advanced (pts gap). mft.rs:1032/1053 packet pts_us = GetSampleTime()/10 = the counter pts. muxer.rs:131-140 concatenates packet.data into a raw .h264 (PTS discarded), muxer.rs:263 `-f h264 -r fps`. pipeline.rs:603-605 base_100ns = first frame qpc - pts (anchored once); pipeline.rs:535-536 `qpc_of = base + pts_us*10`; pipeline.rs:1002-1003 `audio_frames = packets.len()*SAMPLE_RATE/fps`; buffer.rs:181-200 snapshot selects by pts span. pipeline.rs:48-50 TrackRing holds (buffer+2) s; pipeline.rs:174-197 window(): offset negative -> dst=-offset, loop never runs when -offset >= wanted -> all zeros (silent). Recorder: recorder.rs:546 `audio_frames = frames*SR/fps` truncates real-time audio to frame count, so a recording drifts the same way. UI: overruns/submit-waits only reach health_line (pipeline.rs:497-516, logged lib.rs:1055-1062); state.rs:720 exposes dropped frames to the Console, and Console.tsx:602-604 labels a below-target FPS as 'picture stood still'. The code's own comment mft.rs:126-133 states the assumption 'the clock ... catches up by itself', which only holds when the encoder has headroom.",
+    "corrected_claim": "Accurate in mechanism and scope, with two clarifications: (1) a transient stall (submit blocking < 500 ms) does NOT cause lasting drift - the pacer runs without sleeping until index catches up with the wall clock, so only a sustained encoder throughput below the configured fps (no headroom to burst) produces the ever-growing time-lapse drift and eventually silent clips; each real drop (500 ms timeout) adds a permanent one-frame shift (picture ahead of sound) for everything after it in that clip/recording. (2) Dropped frames ARE shown in the UI (state.rs:720, Console 'Dropped' stat); what is not shown is the overrun/deficit, and the FPS stat actively mislabels it as 'picture stood still'. Recordings drift but do not go silent (their audio is streamed, then truncated to frames*SR/fps).",
+    "reachable_by": "Any machine whose hardware encoder cannot sustain the configured fps/resolution for minutes (iGPU under game load, high-res/high-fps configs, another app such as OBS sharing the encoder as the README itself reports); drops need a >500 ms encoder stall. No attacker involvement; environmental/hardware-triggered.",
+    "fix_assessment": "Both halves must land together: skipping ticks alone would create pts gaps that the CFR raw-ES mux (-r fps) collapses exactly like drops, so the muxer must honour packet PTS (timestamped container fed to ffmpeg) or the pipeline must detect a sustained deficit and restart at a lower rate; surfacing overruns/submit-waits in the UI (and fixing the 'picture stood still' label) is cheap and worthwhile regardless."
+   }
+  ]
+ },
+ {
+  "id": "VP-3",
+  "title": "Sleep/resume or a long thread stall makes the mixer allocate the whole gap in one window (OOM abort); pacer replays every missed tick",
+  "severity": "high",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/pipeline.rs:780-785",
+   "src-tauri/src/audio/engine.rs:346-350"
+  ],
+  "claim": "The mixer thread sizes each window from the full elapsed gap with no cap: `let frames = ((target - from) * SAMPLE_RATE as i64 / 10_000_000) as usize; … shared.audio.mix_window(&sources, from, frames, &mut buffers);` (pipeline.rs:780-785), and AudioEngine::mix_window does `track.resize(sample_count, 0.0)` per source plus a scratch buffer of the same size (audio/engine.rs:346-350). After sleep/resume or any long thread stall the whole gap is allocated at once, which is an OOM abort. The pacer likewise replays every missed tick back-to-back. There is no WM_POWERBROADCAST handling anywhere.",
+  "scenario": "The PC sleeps for an hour with the buffer on; QPC/Instant keep counting across suspend. The first mixer tick after resume (before the 10 s lock-screen stop) asks for ~173M frames, about 1.4 GB of f32 per source plus scratch plus an i16 copy. Allocation fails, the process aborts, the buffer is lost and an in-progress recording loses its BufWriter tail. The pacer replays ~216k missed ticks: encoder at 100% and the ring fills with the pre-sleep still frame under wrong timestamps.",
+  "fix": "If target − from exceeds about 1 s, account the gap as ring silence and jump from. In the pacer, resync index when more than about 250 ms behind. Stop and restart the pipeline on PBT_APMSUSPEND / resume.",
+  "reported_confidence": "likely",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "high",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "high",
+    "evidence": "pipeline.rs:775-785: `let target = now_100ns() - AUDIO_LAG_100NS; let from = *next_100ns.get_or_insert(target); ... let frames = ((target - from) * SAMPLE_RATE as i64 / 10_000_000) as usize; ... shared.audio.mix_window(&sources, from, frames, &mut buffers);` with no upper bound; next_100ns is only advanced by frames (pipeline.rs:820). audio/engine.rs:346-350: `let sample_count = frames * CHANNELS; ... track.clear(); track.resize(sample_count, 0.0);` per recorded source; engine.rs:383-384 add_streams: `scratch.resize(target.len(), 0.0)` (only when some source is audible). pipeline.rs:803-806: i16 `scratch.extend(...)` / `scratch.resize(frames * CHANNELS, 0)` per ring; recorder.rs:294 `self.send(Job::Audio(index, block.to_vec()))` adds another copy per track while recording. now_100ns is raw QPC (audio/capture.rs:23-44); SAMPLE_RATE=48000, CHANNELS=2 (capture.rs:46-47): 1 h = 172.8M frames = 345.6M samples = 1.38 GB f32 per source. Pacer (convert.rs:694-735): `let due = start + period * index as u32; if due > now { sleep } else if index > 0 { overruns += 1 }` then `index += 1` and emits a frame every iteration; nothing resyncs index, so every missed tick is replayed, throttled only by encoder.submit's try_send/send_timeout (mft.rs:1171-1184). pts = (index-1)*1e7/fps, so frames sent during catch-up carry sleep-period pts but whatever slot is latest (stale still or post-resume frames). grep finds no POWERBROADCAST/PBT_/suspend handling in src-tauri/src. The lock-screen stop needs LOCK_POLLS=5 polls at 2 s (state.rs:178, lib.rs:640) and cannot preempt the mixer's 10 ms tick (pipeline.rs:45,766).",
+    "corrected_claim": "Mechanism is accurate. Nuances: the abort is not certain for a 1 h sleep on a large-RAM machine (about 6 GB transient for 3 sources: 3x1.38 GB tracks + 1.38 GB f32 scratch + 0.69 GB i16 scratch, more while recording). It becomes near certain for overnight sleeps (about 11 GB per source for 8 h); Rust's default alloc-error handler then aborts. If the allocation succeeds, `buffers` keeps that capacity (clear+resize) until the pipeline stops. The f32 scratch is only allocated when a source is audible. Pacer catch-up is limited by encoder throughput. Its pts follow the wall timeline, so the defect is stale or post-resume frames stamped into the sleep interval (A/V desync until it catches up), and the bounded packet ring overwrites the pre-sleep history with them. Long stalls other than sleep/hibernate/Modern Standby suspension are not realistic triggers.",
+    "reachable_by": "Any user who lets the PC sleep or hibernate while the replay buffer (or a recording) is running, e.g. with buffer auto_start in always-on mode. Rests on platform behaviour not checkable here: Windows QueryPerformanceCounter keeps counting across suspend/hibernate (widely documented; the windows crate source is not cached).",
+    "fix_assessment": "Sound. Cap the per-window gap (about 1 s; account the rest as ring silence by advancing next_100ns, or reset next_100ns to target) and resync the pacer's index/start when it falls more than a few ticks behind. Stopping/restarting the pipeline on PBT_APMSUSPEND/PBT_APMRESUMEAUTOMATIC is a good complement, but the caps alone remove the OOM."
+   },
+   {
+    "lens": "impact",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "high",
+    "evidence": "pipeline.rs:776-785 `let target = now_100ns() - AUDIO_LAG_100NS; let from = *next_100ns.get_or_insert(target); ... let frames = ((target - from) * SAMPLE_RATE as i64 / 10_000_000) as usize; ... shared.audio.mix_window(&sources, from, frames, &mut buffers);` with no cap. engine.rs:344-357 `let sample_count = frames * CHANNELS; ... track.clear(); track.resize(sample_count, 0.0);` per recorded source plus `let mut scratch: Vec<f32>` resized to the same length in add_streams (engine.rs:386-389). pipeline.rs:800-803 then builds an i16 copy of the same length per ring (`scratch.extend(...)`), and recorder.rs:293-294 `self.send(Job::Audio(index, block.to_vec()))` makes one more copy per track while recording. capture.rs:23-41 now_100ns is raw QueryPerformanceCounter (Windows documents that QPC keeps counting through standby/hibernate). Pacer convert.rs:700-709 `let due = start + period * index as u32; if due > now { sleep } else if index > 0 { overruns += 1 }` then `index += 1`, so every missed tick is replayed back to back; mft.rs:1184 waits up to SUBMIT_WAIT=500 ms per full-queue frame and logs a warning per drop. The only stop is the lock-screen poll, state.rs:178 `LOCK_POLLS: u32 = 5` (10 s), which runs after the mixer has already woken. No PBT_APMSUSPEND/WM_POWERBROADCAST handling anywhere (grep).",
+    "corrected_claim": "The unbounded window and the replay of missed ticks are real. But not every long stall ends in an OOM abort: a stall of a few seconds costs a few MB. What happens depends on how long the gap is and on the commit limit. Per hour of gap, each recorded source needs about 1.38 GB of f32 (out buffer), plus a 1.38 GB f32 scratch, a 0.69 GB i16 copy, and while recording a further 0.69 GB to_vec per track. All of it is zero-filled, so every page gets touched. A 1 h sleep on a typical 16-32 GB gaming PC will probably not abort. It gives a multi-GB spike and heavy paging, and `buffers` keeps that capacity for the rest of the pipeline's life. An overnight sleep (8 h: about 11 GB per source buffer, more than 30 GB for two sources) will very likely make an allocation fail, and that aborts the process. Until then the system pages heavily. The pacer burst is bounded by the 10 s lock-screen stop only when Windows shows the lock screen on wake. Otherwise it runs at encoder speed for minutes, and live frames get stale pts until it catches up.",
+    "reachable_by": "Any user who puts the PC to sleep or hibernates it, or a laptop that goes into Modern Standby, while the replay buffer is running (started by hand, or auto start in always-on mode). The 10 s lock-screen stop does not prevent it, because the mixer computes the gap on its first 10 ms tick after resume. No attacker is involved.",
+    "fix_assessment": "The direction is right, but 'jump from' alone would break sync. TrackRing timelines are sample-counted (pipeline.rs:150-156), so skipping without counting would pull later audio forward. Minimal fix: when target-from is more than about 1 s, call a new non-allocating TrackRing::skip(samples) on every ring. It does `silence += n` with the existing reset once silence >= capacity. Feed an active recorder Job::Silence (which already exists), advance its timeline, and set next_100ns = target. In the pacer, when due lags now by more than about 250 ms, set index = elapsed/period + 1 and do not replay; pts stays on the QPC axis, so A/V alignment holds. Power notifications (PowerRegisterSuspendResumeNotification needs no window) are a good addition but cannot replace the gap guard, because frozen desktop apps on Modern Standby may not see suspend in time."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "high",
+    "evidence": "pipeline.rs:766 `std::thread::sleep(MIX_INTERVAL);` then :775 `let target = now_100ns() - AUDIO_LAG_100NS;` :776 `let from = *next_100ns.get_or_insert(target);` :780 `let frames = ((target - from) * SAMPLE_RATE as i64 / 10_000_000) as usize;` :785 `shared.audio.mix_window(&sources, from, frames, &mut buffers);` with no upper bound anywhere. audio/engine.rs:344 `let sample_count = frames * CHANNELS;` :349 `track.resize(sample_count, 0.0);` (one per enabled source, recorded() = enabled, audio/mod.rs:439) and :389 `scratch.resize(target.len(), 0.0);`. Further gap-sized copies: pipeline.rs:801-805 i16 `scratch` filled to frames*CHANNELS, :159 `inner.samples.extend(block.iter().copied())` grows the VecDeque by the whole block before draining to capacity (taken whenever the block is not all-zero, e.g. the ~80 ms of pre-suspend audio at `from`), recorder.rs:294 `block.to_vec()` while recording. now_100ns() is raw QueryPerformanceCounter (audio/capture.rs:23-40). Pacer convert.rs:705 `let due = start + period * index as u32;` :707 `if due > now { sleep }` else no sleep, :715 `index += 1` - no resync, so every missed tick is replayed; each replay is a submit that waits up to SUBMIT_WAIT=500 ms (mft.rs:134, :1184). No suspend/resume or WM_POWERBROADCAST handling exists (grep for suspend/resume/PBT_/powerbroadcast in src-tauri/src finds only hotkey suspend). The only upstream stop is the lock-screen poll: state.rs:180 LOCK_POLLS=5 at a 2 s cadence (lib.rs:639-640), i.e. ~10 s on the secure desktop, but after resume the mixer wakes within ~10 ms, so its first tick computes the whole gap before that stop can happen; a pre-sleep lock only helps if the user sat on the lock screen >=10 s before suspending.",
+    "corrected_claim": "Mechanism is as described. Two precisions: (1) the abort is conditional, not certain - peak memory is roughly (enabled sources + 1) x 1.38 GB of f32 per hour of gap, plus 0.69 GB i16 scratch, plus VecDeque growth and a to_vec copy per ring while recording; Windows commits against RAM+pagefile, so a 1 h sleep may survive with heavy paging on a 32 GB machine but an overnight sleep (~11 GB per f32 buffer) fails on essentially any consumer PC and Rust's handle_alloc_error aborts the process (no destructors, so BufWriter tails are lost). Even when it survives, the tick does seconds of CPU work while holding shared.tracks. (2) The pacer replay runs at encoder speed because submit blocks up to 500 ms when the queue is full; pts stay on the index timeline (they correspond to the slept interval), so the real defect is that post-resume frames are stamped with older pts until catch-up finishes, and the packet ring is overwritten with duplicated still frames. On the default lock-on-wake setup the lock-screen stop ends the pacer replay after ~10 s, but it cannot save the mixer. That QPC keeps counting across S3/S0ix is Windows behaviour (QPC follows biased interrupt time) and cannot be shown from source; the finding depends on it.",
+    "reachable_by": "Ordinary use by the user: the replay buffer is running (started by hotkey/tray/UI, or by the auto-start automation, which keeps it on outside games when only_buffer_in_game is off) and the PC sleeps or hibernates without first sitting >=10 s on the lock screen - closing a laptop lid, Start > Sleep, the power button, or an idle-timer sleep. On resume the first mixer tick (within ~10 ms) requests the whole gap. Likely in practice for always-on buffers left on overnight; no attacker involvement.",
+    "fix_assessment": "Capping the gap is the right fix: when target - from is more than about 1 s, count it as ring silence (or reset the rings) and jump `from` to target; likewise reset the pacer's start/index when it is more than a few periods behind. Stopping and restarting the pipeline on PBT_APMSUSPEND / PBT_APMRESUMEAUTOMATIC (RegisterSuspendResumeNotification) is a good complement but should not be the only guard, since debugger pauses and Modern Standby throttling produce the same gap."
+   }
+  ]
+ },
+ {
+  "id": "VP-2",
+  "title": "NV12 slot reuse is guarded by job count but slots rotate once per conversion, so frames queued for or held by the encoder get overwritten",
+  "severity": "high",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/convert.rs:337-338",
+   "src-tauri/src/convert.rs:643-650",
+   "src-tauri/src/convert.rs:660-681",
+   "src-tauri/src/wgc.rs:205-208"
+  ],
+  "claim": "Latest::submit picks one of SLOTS = 22 NV12 textures round-robin on every WGC conversion: `let slot = self.next_slot; self.next_slot = (self.next_slot + 1) % self.slots.len();` (convert.rs:337-338). The reuse guard counts jobs rather than slots: `*depth as u64 + stats.in_flight.load(..) >= SLOTS as u64` (convert.rs:646, within 643-650; pacer submit path convert.rs:660-681). Because WGC converts on its own thread pool thread independently of the pacer, textures referenced by queued jobs (bounded(4) channel) or held in flight by the encoder can be overwritten with newer pictures, or written while NVENC/AMF reads them. MinUpdateInterval is set best-effort with `let _ = session.SetMinUpdateInterval(interval);` (wgc.rs:208) and the code itself notes it is missing before Windows 11. Off-by-one: the job the pacer holds inside send_timeout is never counted.",
+  "scenario": "(a) Encoder stall: the pacer blocks up to 500 ms in send_timeout while WGC keeps converting (~30 conversions at 60 Hz); the 22-slot ring laps and the 4 queued jobs and in-flight frames now point at textures holding newer pictures or being written, giving out-of-order or torn frames with every counter clean; the guard only trips at in_flight ≥ 18. (b) High-refresh monitor on Windows 10 (supported per README): WGC delivers 144-240 Hz while the pacer runs at 60, so a job's slot is overwritten about 22/(refresh/fps) ticks later; any encoder holding ~5 or more frames is hit (NVENC lookahead, or AMD with CLIPPIBOY_LOW_LATENCY=0).",
+  "fix": "Carry the slot index in Job; keep a per-slot refcount; release a slot when the MFT drops the sample (MFCreateTrackedSample + IMFTrackedSample::SetAllocator callback); the converter takes a free slot or skips the frame. Simpler alternative: in the WGC callback only CopyResource into one 'latest BGRA' texture and convert to NV12 in the pacer at tick time, giving one conversion per job and cutting VideoProcessor and watermark GPU work 2-4× at high refresh.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "convert.rs:337-338 `let slot = self.next_slot; self.next_slot = (self.next_slot + 1) % self.slots.len();` advances once per Converter::convert, called from Latest::submit (convert.rs:676) on every WGC FrameArrived (pipeline.rs:684-690 `latest.submit(frame.texture, ...)`, no rate limit in wgc.rs:213-250). The only guard is convert.rs:646 `*depth as u64 + stats.in_flight.load(Ordering::Relaxed) >= SLOTS as u64`, where depth is the channel CAPACITY (mft.rs:1100-1101, set via watch_encoder at pipeline.rs:665), not its occupancy, and in_flight is frames fed minus packets out (mft.rs:1247, 1341). SLOTS = 4+16+2 = 22 (convert.rs:75, mft.rs:37,46), so the guard trips only at in_flight >= 18 and knows nothing about how many conversions happened since a queued/in-flight job took its texture. The pacer hands out a clone of the texture COM pointer, not a slot reservation (convert.rs:730-733), and Job carries only the texture (mft.rs:1166-1169); MFCreateDXGISurfaceBuffer wraps it with no copy (mft.rs:950-955). During a stall the pacer sits in `self.jobs.send_timeout(job, SUBMIT_WAIT)` (mft.rs:1184, SUBMIT_WAIT=500ms at mft.rs:134) while the WGC thread keeps converting. MinUpdateInterval is best-effort: wgc.rs:202-208 `// Both only exist from Windows 11 on ... let _ = session.SetMinUpdateInterval(interval);`. README:8,53 lists Windows 10 as supported. low_latency_default (mft.rs:433-437) is false for NVENC, true for AMF/QSV.",
+    "corrected_claim": "Mechanism is as described. Precision on scope: in steady state with WGC delivering <= the pacer rate, residence (queue occupancy + held job + in_flight) must reach ~22 before a lap, so the guard is only off by one or two there (held job in send_timeout and the job the encoder thread has just pulled are uncounted). The real hole is conversions outpacing ticks: (a) any pacer stall longer than 22 WGC intervals with moving content (about 367 ms at 60 Hz, 153 ms at 144 Hz; stalls up to 500 ms are within design) laps the ring over every queued job, giving frames with newer content or backward jumps, with all counters clean; (b) when MinUpdateInterval is not honored (Windows 10, and per platform docs likely Windows 11 before the build that added it), a refresh/fps ratio r means a slot is rewritten about 22/r ticks after conversion (9 ticks at 144 Hz, 5.5 at 240 Hz), which AMD with CLIPPIBOY_LOW_LATENCY=0 (16 frames measured) definitely exceeds; under defaults AMF/QSV run low-latency and stay below it, and NVENC's default depth cannot be read from source. Overwriting queued, not-yet-fed jobs is certain to give the wrong picture. Tearing while the encoder reads in-flight frames depends on how the driver orders GPU work and cannot be checked here.",
+    "reachable_by": "Ordinary use by the local user, no adversary: replay-buffer recording (pipeline::start) with moving content plus either an encoder stall of more than 22 WGC intervals (GPU contention in a game), or a high-refresh monitor on Windows 10 (or a Windows 11 build without MinUpdateInterval) with an encoder holding enough frames. Certain with AMD and CLIPPIBOY_LOW_LATENCY=0 at 144 Hz or more; borderline for NVENC defaults at 240 Hz; unlikely for AMF/QSV defaults outside stalls.",
+    "fix_assessment": "Both fixes close the hole. Option 1 (per-slot refcount released via IMFTrackedSample, converter skips when no slot is free) fixes the root invariant but takes more work. Option 2 (only CopyResource into one 'latest BGRA' texture in the WGC callback, convert in the pacer at tick time) makes rotation advance once per job, so the existing count-based guard becomes correct, and it is the simpler change. It needs the BGRA copy and the read to be serialized under the same device lock."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "convert.rs:337-338 `let slot = self.next_slot; self.next_slot = (self.next_slot + 1) % self.slots.len();` runs inside Converter::convert, which Latest::submit (convert.rs:660-680) calls on every WGC FrameArrived (pipeline.rs wgc::start closure -> latest.submit). The only guard is convert.rs:643-646 `*depth as u64 + stats.in_flight.load(Ordering::Relaxed) >= SLOTS as u64`: depth is the channel capacity (mft.rs:1100, constant 4) and in_flight is sent.len() (mft.rs:1341 / took). SLOTS = QUEUE_DEPTH + ENCODER_HOLD_MAX + 2 = 22 (convert.rs:76), so it trips only at in_flight >= 18. The pacer drops the converter lock before handing off (convert.rs:732-733 `drop(converter); sink.on_frame(...)`), and EncoderSink::on_frame calls VideoEncoder::submit, which can block in `self.jobs.send_timeout(job, SUBMIT_WAIT)` (mft.rs:1184, SUBMIT_WAIT = 500 ms at mft.rs:134). That job holds a SendPtr clone of a slot texture and is in neither the channel nor in_flight, so the off-by-one is real. Nothing ties a slot to its jobs: Job has only {texture, pts_100ns} (mft.rs:854-857), and Transform::feed wraps the texture with MFCreateDXGISurfaceBuffer without copying (mft.rs:950-976). wgc.rs:202-208 sets MinUpdateInterval best effort (`let _ = session.SetMinUpdateInterval(interval);`, with the comment 'Both only exist from Windows 11 on'), and README.md says Windows 10 is supported and fps can be below the refresh rate.",
+    "corrected_claim": "The mechanism is right: the guard bounds the number of outstanding jobs, but slots are used once per conversion. Whenever conversions run ahead of pacer ticks (the pacer blocked in send_timeout, or WGC delivering faster than fps when MinUpdateInterval is missing), the ring laps live references. One part needs no driver knowledge: a job still waiting in the channel is fed later, so once its slot is rewritten the encoder must encode the newer picture. With 4 queued plus 1 in send_timeout, the oldest queued slot is rewritten after about 18 conversions into a stall (about 300 ms at 60 Hz, 75 ms at 240 Hz), well inside the 500 ms timeout. In-flight frames are rewritten sooner, after only 2 conversions when in_flight=16 (the measured AMD hold); the guard trips only at 18. Whether a rewritten in-flight frame becomes a 'torn' frame, or simply a wrong or newer one, depends on whether the MFT reads the input in place later or copies it at ProcessInput. That is driver behaviour and cannot be checked here (no windows/driver sources). Same-device D3D11 ordering makes a true mid-read tear less likely than a wrong-content frame. Scenario (b): the overwrite comes about 22*fps/refresh ticks after conversion (about 9 ticks at 144 Hz, about 5.5 at 240 Hz), so total residency (queue wait plus hold) has to reach that. Whether Windows 10, or Windows 11 builds before MinUpdateInterval existed, really delivers at refresh rate is platform behaviour.",
+    "reachable_by": "Normal recording, no attacker needed: (a) any encoder stall that blocks the pacer in send_timeout for more than about 18 WGC conversions (sooner for in-flight frames when the encoder holds many, e.g. AMD with CLIPPIBOY_LOW_LATENCY=0, or NVENC under GPU contention); (b) Windows 10 (or Windows 11 without MinUpdateInterval) on a high-refresh monitor with recording fps below refresh, in a game that redraws every vsync, with an encoder whose queue plus hold reaches about 5-9 frames.",
+    "fix_assessment": "Both proposed fixes address the root cause. Per-slot refcounts released through IMFTrackedSample/SetAllocator make the invariant exact. Doing a single CopyResource into one 'latest' BGRA texture in the callback and converting in the pacer gives exactly one conversion per job, which makes the existing job-count guard correct (it still needs +1 for the job held in send_timeout) and cuts GPU work. The second fix is simpler and lower risk."
+   },
+   {
+    "lens": "impact",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "Rotation happens once per conversion, inside Converter::convert (not Latest::submit itself): convert.rs:337-338 `let slot = self.next_slot; self.next_slot = (self.next_slot + 1) % self.slots.len();`. Every WGC frame is converted: pipeline.rs:678 calls `latest.submit(frame.texture, ...)` for each FrameArrived with no throttle, and wgc.rs:205-208 sets the only rate limit best-effort, ignoring failure: `let _ = session.SetMinUpdateInterval(interval);`. The guard counts frames, not slots: convert.rs:646 `*depth as u64 + stats.in_flight.load(Ordering::Relaxed) >= SLOTS as u64`. Here `depth` is the channel capacity (mft.rs:1100-1101 bounded(depth), default QUEUE_DEPTH=4) and SLOTS = 4+16+2 = 22 (convert.rs:73), so the guard trips only when in_flight >= 18. Jobs hold the slot texture by reference (mft.rs:1166 `texture: SendPtr(texture.clone())`; feed wraps it without a copy, mft.rs:950 MFCreateDXGISurfaceBuffer). The pacer can block up to SUBMIT_WAIT = 500 ms (mft.rs:134, 1184 send_timeout) while the WGC callback keeps converting, and the pacer holds the converter lock only to clone a texture (convert.rs:730-732). The SLOTS sizing (convert.rs:56-73) assumes one conversion per job, which is true only when WGC delivers at most fps frames per second.",
+    "corrected_claim": "The mechanism is real. Slots are used up once per WGC conversion, but the reuse guard assumes one conversion per encoder job. Whenever conversions outrun ticks, the ring can lap frames still queued or held by the encoder. The reach is narrower than claimed. (a) A stall laps the ring only after 22 conversions (about 367 ms at 60 Hz, about 150 ms at 144 Hz). That is a section that already stutters and is close to losing frames at 500 ms, and the extra damage is a few frames showing newer or out-of-order pictures. (b) In normal running, a job's slot is overwritten about 22/(refresh/fps) ticks after conversion: about 9 ticks at 144 Hz/60 fps, 5.5 at 240 Hz/60, 4.6 at 144 Hz/30. Only setups where queue plus encoder hold reaches that many frames are hit, and only on Windows builds without MinUpdateInterval (Windows 10 and older Windows 11). The defaults keep the hold shallow: AMF and QSV run low-latency, and the code says NVENC stays shallow. So the common setup is probably safe, and a 240+ Hz NVENC user or a CLIPPIBOY_LOW_LATENCY=0 AMD user is the realistic victim. 'Torn' frames are speculative. The blit and the encoder read go through the same D3D11 device, so whole-frame substitution (temporal jumps or backward steps) is the likely symptom. The off-by-one (the job the pacer holds in send_timeout and the 'latest' slot are not counted) is real, but it only matters past the measured hold maximum of 16.",
+    "reachable_by": "Ordinary use. It needs a high-refresh monitor (game rendering at or above refresh) on Windows 10 or a Windows 11 build without GraphicsCaptureSession.MinUpdateInterval, plus an encoder holding several frames (NVENC, or AMD/Intel with CLIPPIBOY_LOW_LATENCY=0). Separately, any encoder stall longer than about 22 capture frames. No attacker involvement and no crash. The result is visual corruption in saved clips while counters report a clean run.",
+    "fix_assessment": "The refcount and IMFTrackedSample fix is correct but heavy: it must also count jobs in the channel and the one the pacer holds, not just MFT samples. The 'latest BGRA, convert at tick' alternative works and saves GPU work, at the cost of one CopyResource per WGC frame. A smaller sufficient fix is to advance next_slot only after the pacer has taken the current slot. Keep a 'taken generation' atomic set in pace(), and while it lags, convert into the same slot again (no job references it yet). That caps rotation at one slot per tick, which makes the existing job-count guard valid in both scenarios. Also count the pacer-held job and the latest slot in the guard (depth + in_flight + 2 > SLOTS)."
+   }
+  ]
+ },
+ {
+  "id": "VP-4",
+  "title": "Clip save copies the whole clip (and each WAV) into one Vec, doubling RAM and risking OOM abort with large buffers",
+  "severity": "high",
+  "category": "perf",
+  "locations": [
+   "src-tauri/src/muxer.rs:131-141",
+   "src-tauri/src/pipeline.rs:238-256",
+   "src-tauri/src/config.rs:100-108"
+  ],
+  "claim": "muxer::build concatenates the entire clip into one in-memory buffer before writing the temp .h264: `let mut stream: Vec<u8> = Vec::with_capacity(snapshot.packets.iter().map(|p| p.data.len()).sum::<usize>() + …); … std::fs::write(&video_path, &stream)` (muxer.rs:131-141). write_wav (pipeline.rs:238-256) likewise builds the whole WAV in a Vec after window() has already allocated the samples. With the default ring budget of 1.5 × bitrate × seconds (config.rs:100-108) and a buffer slider up to 600 s, a full-length save doubles RAM use.",
+  "scenario": "At 600 s the ring is ≈3.7 GB at 1440p60 and ≈8.4 GB at 4K60. A full-length save allocates that much again plus ~350 MB transient per audio track at 10 min while a game is running, resulting in an abort or paging that stalls the game.",
+  "fix": "Stream the header and packets through a BufWriter, or pipe straight into ffmpeg (-f h264 -i pipe:0; stdout/stderr draining already exists). Write WAV samples incrementally (VecDeque::as_slices). Size the budget against GlobalMemoryStatusEx.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "impact",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "buffer.rs:22 `pub data: Arc<[u8]>` (the snapshot shares the ring's packet memory, so the copy below really is extra). muxer.rs:131-141 `let mut stream: Vec<u8> = Vec::with_capacity(snapshot.packets.iter().map(|p| p.data.len()).sum::<usize>() + ...); ... for packet in &snapshot.packets { stream.extend_from_slice(&packet.data); } std::fs::write(&video_path, &stream)`. `stream` is never dropped before muxer.rs:204 `let outcome = encode(` / :217 `outcome`, so the copy stays allocated through all the WAV writes and the whole ffmpeg run. pipeline.rs:176 `let mut data = vec![0i16; wanted];` (window copy), pipeline.rs:228 `let mut sum = vec![0i16; frames * CHANNELS];` (mix), pipeline.rs:240 `let mut out = Vec::with_capacity(byte_len as usize + 44);` (another full copy). config.rs:100-108 sets the budget to 1.5 x bitrate x seconds; Recording.tsx:396-397 offers buffer max={600}; HEIGHTS includes 1440/2160; encode.rs bitrate_for gives 0.15 bpp, so about 33 Mbit/s at 1440p60 and 75 Mbit/s at 4K60. Defaults are config.rs:34 1080p60 (19 Mbit/s) and config.rs:41 seconds: 120. The UI (Recording.tsx:458-483) calls the budget 'What the buffer may occupy in RAM' and 'the hard ceiling'.",
+    "corrected_claim": "Confirmed: muxer::build copies the whole clip into one Vec, and write_wav copies each PCM window a second time. Three details are wrong or missing. (1) The extra video RAM equals the clip's real byte size, which is at most the ring's contents, not the 1.5x budget. A 600 s full save adds about 2.5 GB at 1440p60 and about 5.6 GB at 4K60 nominal bitrate, on top of a ring of the same size; the 3.7 GB and 8.4 GB figures are budget ceilings. (2) It is worse than claimed in one way: `stream` stays alive until build() returns, so it overlaps the WAV writes and the whole ffmpeg encode, not just the file write. (3) The audio cost is overstated. A 600 s stereo 48 kHz window is about 115 MB, so a separate track peaks at about 230 MB and the main mix at about 345 MB. Tracks are processed one after another, so these do not add up. In the default setup (1080p60, 120 s) the extra copy is only about 285 MB. The problem only matters for users who choose long buffers at high resolution, and that same choice already puts several GB in the ring. An abort needs the Windows commit limit to be exhausted, which means a fixed or small pagefile; with a system-managed pagefile the realistic result is paging and game stutter at save time. Severity is medium, not high.",
+    "reachable_by": "Any user who sets a long buffer (up to 600 s) with clip length = whole buffer at 1440p/4K and presses the save hotkey while a memory-hungry game runs. It is also reachable through Stream Deck/remote save requests with a long length (state.rs:808-812 caps the length at buffer.seconds). Concurrent saves each hold their own copy.",
+    "fix_assessment": "Streaming the header and packets through a BufWriter<File> is the correct, minimal and sufficient fix for the video. It removes the copy entirely without changing encode(). Piping into ffmpeg stdin also works but is more invasive, because encode() is path-based and shared with the recorder. For WAV, write the 44-byte header and then the samples through a BufWriter, which drops the `out` copy. Keep the window() copy rather than streaming from VecDeque::as_slices: as_slices would mean holding the TrackRing lock during disk I/O, which stalls the audio mixer thread. Sizing against GlobalMemoryStatusEx is a separate, optional hardening step."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "Entry: hotkey lib.rs:755-757 `std::thread::spawn(move || { let _ = save_clip_and_notify(&app, None); })`, tray.rs:118, control.rs:184, commands.rs:376 -> lib.rs:105-112 (begin_save debounce, one save at a time) -> state.rs:805-812 `seconds ... unwrap_or_else(|| config::effective_clip_seconds(&config.buffer))` (default clip_seconds 0 = whole buffer, config.rs:42,87-91) -> state.rs:852 `crate::muxer::build(...)`. Snapshot shares packets (buffer.rs:22 `pub data: Arc<[u8]>`, buffer.rs snapshot `.cloned().collect()`), so the only full copy is muxer.rs:131-141 `let mut stream: Vec<u8> = Vec::with_capacity(snapshot.packets.iter().map(|p| p.data.len()).sum::<usize>() + ...); ... std::fs::write(&video_path, &stream)`. `stream` is never dropped early: it lives until build() returns, i.e. through write_mix_wav/write_wav_window and the whole ffmpeg encode (muxer.rs:203-218). Audio: pipeline.rs:174-176 `let mut data = vec![0i16; wanted];` then pipeline.rs:238-240 `let mut out = Vec::with_capacity(byte_len as usize + 44);`; mix adds pipeline.rs:228 `let mut sum = vec![0i16; frames * CHANNELS];`. Sizing: Recording.tsx:396-397 `min={15} max={600}`; encode.rs:70,78-83 BITS_PER_PIXEL 0.15, clamp(2_000, 100_000) kbps; config.rs:104-107 budget `(plain * 3 / 2)`; Cargo.toml:107 `panic = \"abort\"` and std's alloc-error handler aborts on a failed HeapAlloc.",
+    "corrected_claim": "Mechanism is exactly as claimed (one extra full copy of the clip's video held for the entire save, plus per-track WAV transients). Detail corrections: the 3.7 GB (1440p60) / 8.4 GB (4K60) figures at 600 s are the 1.5x memory-budget ceiling, not typical ring size; nominal is ~2.5 GB / ~5.6 GB, though in Quality rate control a busy scene can push the ring to the ceiling, and high-refresh capture (e.g. 4K144, clamped to 100 Mbit/s) goes higher (7.5 GB nominal / 11.25 GB budget). Audio transient is ~345 MB for the main mix at 600 s but ~230 MB for a separate track, and tracks are processed sequentially, not cumulatively. At the defaults (1080p60, 120 s) the extra copy is ~285 MB and harmless. Whether the extra allocation aborts or merely pages depends on the Windows commit limit (RAM + pagefile), which cannot be checked from source.",
+    "reachable_by": "The local user during ordinary use: the save hotkey, tray entry, Save button or a Stream Deck key, but only after raising the buffer slider toward 600 s and choosing a high resolution/frame rate (both offered in Settings > Recording). Nobody remote can trigger it. The begin_save guard prevents concurrent saves on these routes, so the cost is one copy, not one per save. Likely enough for users who pick long buffers at 1440p/4K on 16 GB machines while a game is running.",
+    "fix_assessment": "Streaming the SPS/PPS and packets through a BufWriter<File> (or into ffmpeg's stdin) removes the copy entirely and is trivial. Writing WAV headers and then samples incrementally (or reading straight from the ring via VecDeque::as_slices) removes the audio double. Sizing the budget against GlobalMemoryStatusEx is a sensible extra safeguard but separate."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "muxer.rs:131-141: `let mut stream: Vec<u8> = Vec::with_capacity(snapshot.packets.iter().map(|p| p.data.len()).sum::<usize>() + snapshot.sequence_header.len()); ... for packet in &snapshot.packets { stream.extend_from_slice(&packet.data); } std::fs::write(&video_path, &stream)`. The snapshot itself is cheap (buffer.rs:22 `pub data: Arc<[u8]>`, buffer.rs:181-199 `.cloned().collect()` clones Arcs), so this Vec is the first and only full copy of the clip, made while the live ring keeps its own copy and keeps recording. Clip length defaults to the whole buffer (config.rs:41-42 `seconds: 120, clip_seconds: 0`; config.rs:87-92 effective_clip_seconds returns buffer.seconds for 0). Recording.tsx:394-397 slider `min={15} max={600}`. Budget config.rs:100-108 `(plain * 3 / 2).max(64 MiB)` with no cap when memory_mb == 0 (the default, config.rs:43); bitrate_for (encode.rs:70,78-83) uses 0.15 bpp, so 1440p60 = 33 Mbit/s and 4K60 = 75 Mbit/s, which gives 600 s budgets of about 3.7 GB and 8.4 GB. Audio: pipeline.rs:174-176 window() allocates `vec![0i16; frames*CHANNELS]` (48 kHz stereo, 600 s = 115 MB), then write_wav (pipeline.rs:238-256) builds a second `Vec::with_capacity(byte_len + 44)` of the same size before std::fs::write. write_mix_wav (pipeline.rs:222-235) holds `sum` plus one window at a time. Nothing anywhere checks system memory (grep for GlobalMemoryStatus/sysinfo finds nothing). In Rust std, a failed Vec::with_capacity goes to handle_alloc_error, which aborts the process.",
+    "corrected_claim": "Mechanism and locations are right. Some numbers are overstated: 3.7 GB and 8.4 GB are the ring's budget ceiling (1.5 x nominal). At the nominal bitrate a 600 s ring holds about 2.5 GB (1440p60) or 5.6 GB (4K60), and the extra copy is that size (up to the ceiling during VBR peaks). Audio transients come to about 230 MB per 10-minute track (window Vec plus WAV Vec, roughly 115 MB each), not about 350 MB. They are made one track after another and freed after each, so the audio peak is about 230 MB in total, not per track added up. With default settings (120 s, 1080p60 at 19 Mbit/s) the extra copy is only about 285 MB. The real exposure needs a long buffer and a high resolution.",
+    "reachable_by": "Any user who raises the buffer slider toward 600 s at 1440p or 4K with the default derived memory budget (or a budget near the 4096 MB slider maximum), then saves a full-length clip (the default clip_seconds=0) while a game holds much of the RAM. Triggered by hotkey, tray, UI button or Stream Deck save.",
+    "fix_assessment": "Streaming the SPS/PPS header and packets through a BufWriter<File> (or piping into ffmpeg stdin) removes the clip-sized copy with almost no code. Writing the WAV header and then the samples straight from the VecDeque slices (or chunked) through a BufWriter removes the audio duplicates. Capping the derived budget against physical memory is a sensible extra step but separate."
+   }
+  ]
+ },
+ {
+  "id": "VP-5",
+  "title": "Clip-save temp files are written to the system drive (%APPDATA%) even when clips go to another volume",
+  "severity": "high",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/state.rs:856"
+  ],
+  "claim": "The save temp directory is `temp_dir: config::data_dir().join(\"temp\")` (state.rs:856), so the temp .h264 and WAVs always go to %APPDATA% on C:, regardless of the clip output folder.",
+  "scenario": "Clips go to D: but C: is full: saves that would fit on D: fail. GBs are written and read back twice.",
+  "fix": "Put temp files on the output volume (or stream saves into ffmpeg without temp files).",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "impact",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "state.rs:856 `temp_dir: config::data_dir().join(\"temp\")`; config.rs:10-12 data_dir = dirs::data_dir()/ClippiBoy (%APPDATA%, normally C:). muxer.rs:120 create_dir_all(temp_dir); muxer.rs:130/141 `clip_{stem}.h264` written there with std::fs::write; muxer.rs:151-155 WAVs `track_{stem}_*.wav` there too; muxer.rs:201-204 both removed after ffmpeg. Only the .part.mp4 goes beside the output (muxer.rs:316-324). Free-space tracking reads only the clip drive: lib.rs:859-860 `disk::free_bytes(Path::new(&dir))` with dir = clip_dir. By contrast recordings keep their working files on the clip drive (recorder.rs:9-11, 139 `clip_dir.join(WORK_DIR)`). Size at defaults: bitrate_for(1920,1080,60) at 0.15 bpp (encode.rs:70,78-84) is about 19 Mbit/s, buffer 120 s (config.rs:41), so about 285 MB of H.264 plus about 23 MB per 48 kHz stereo WAV.",
+    "corrected_claim": "Correct: a replay-buffer clip save puts its intermediate .h264 and per-track WAVs under %APPDATA%\\ClippiBoy\\temp, whatever drive clip_dir is on, and the free-space check only looks at the clip drive. Wrong in detail: the data is written once to temp and read once by ffmpeg, not 'written and read back twice'. At default settings it is about 300 MB per save, not GBs; GBs only with a high bitrate and a long buffer. The failure is not a crash: std::fs::write returns an OS 'disk full' error that propagates as Err and the save is reported as failed. It only happens when C: has less free space than one buffer's worth, and the UI's free-space number (clip drive) gives no warning. Stems (data_dir/tracks) and thumbnails also land on C:, but they are small AAC/JPEG files.",
+    "reachable_by": "Any user whose clip folder is on a second drive while the system drive has less free space than the buffered video (roughly 300 MB at defaults, several GB at 100 Mbit/s and long buffers). The moment is lost because the ring buffer moves on before the user can free space and retry.",
+    "fix_assessment": "Writing the temp files beside the output (e.g. output.parent()/.clippiboy-temp, as recordings already do with .recording) is correct and minimal; discard_leftovers (lib.rs:677-688) would then also need to clear that folder, or the files should be named so the existing .part cleanup catches them. A better fix needs no temp video at all: the H.264 stream is already one Vec<u8> in memory (muxer.rs:131-140), so it can be piped to ffmpeg's stdin (-f h264 -i pipe:0), which removes most of the bytes. The small WAVs can stay as they are or move with it."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "state.rs:856 `temp_dir: config::data_dir().join(\"temp\")`; config.rs:10-12 `data_dir()` = `dirs::data_dir()` (Roaming %APPDATA%) `.join(\"ClippiBoy\")`; muxer.rs:130/141 `video_path = request.temp_dir.join(format!(\"clip_{stem}.h264\"))` ... `std::fs::write(&video_path, &stream).map_err(...)?` (whole video stream); muxer.rs:151-154 WAVs `request.temp_dir.join(format!(\"track_{stem}_{}.wav\"...))`; only the .part.mp4 goes beside the output (muxer.rs:316-324, whose own comment says 'the clip folder may sit on another drive'). Contrast recorder.rs:139 `clip_dir.join(WORK_DIR).join(&meta.id)` puts recording scratch on the clip drive. The only free-space probe is lib.rs:858-860 `disk::free_bytes(clip_dir)` and it gates only recordings (state.rs:983), so nothing checks or warns about the system drive before a save. On a WAV write error muxer.rs:177/193 only `log::warn!` and continue.",
+    "corrected_claim": "Accurate as to mechanism. Two refinements: (1) size is 'GBs' only with long buffers or high bitrates (slider max 600 s, Recording.tsx; bitrate clamp up to 100 Mbit/s, encode.rs:83). At the 120 s default at 1080p60 it is a few hundred MB. The data is written once to temp and read once by ffmpeg, not 'twice'. That extra copy happens even when everything sits on one volume. (2) An extra failure mode: when C: has room for the .h264 but not for the WAVs, the WAV writes fail with only a log warning, and the clip is saved with tracks missing or silent rather than refused. Also, the low-space banner and checks watch only the clip drive, so the user gets no hint that C: is the problem.",
+    "reachable_by": "Ordinary use by the user. Any clip save goes through AppState::save_clip -> muxer::build: hotkey, tray, UI button (commands.rs:370), Stream Deck and save_clip_and_notify (lib.rs:105). It triggers whenever the system drive holding %APPDATA% lacks room for the buffer's video plus WAVs. Fairly common for gamers with a small OS SSD and a large games/clips drive, but it needs a nearly full C:.",
+    "fix_assessment": "Putting temp_dir under the clip folder (e.g. clip_dir/.recording-style hidden dir, as recorder.rs already does) fixes the volume problem cheaply. Piping the H.264 stream into ffmpeg's stdin (WAVs could stay as files on the output volume) also removes the extra copy. Separately, a failed WAV write should probably fail the save rather than log and continue."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "state.rs:852-857 `crate::muxer::build(ClipRequest { snapshot, clip_id, output, temp_dir: config::data_dir().join(\"temp\") })`; config.rs:10-12 `dirs::data_dir()...join(\"ClippiBoy\")`, and dirs-5/6 win.rs:10 `data_dir() -> known_folder_roaming_app_data()` (%APPDATA%). muxer.rs:130/141 writes the whole video ring to `temp_dir.join(\"clip_{stem}.h264\")` via `std::fs::write(...)?`, and muxer.rs:150-154 writes WAVs to `temp_dir.join(\"track_{stem}_..wav\")`. Only the final .part.mp4 goes beside the output (muxer.rs:316-317 comment: \"the clip folder may sit on another drive\"). The recorder, by contrast, keeps its working files in `clip_dir.join(WORK_DIR)` (recorder.rs:38,139). Free space is only watched for clip_dir (lib.rs:858-860 `disk::free_bytes(&config.clip_dir)`), so nothing warns about the temp drive. If WAV writing fails it is only logged (muxer.rs:176,193 `Err(err) => log::warn!`), so the clip is saved without that audio track. If the h264 write fails, `?` returns early and the partial file stays in temp until `discard_leftovers` runs at the next start (lib.rs:677-686).",
+    "corrected_claim": "The location claim is correct. The I/O point is overstated: the temp video is written once and read once by ffmpeg wherever the temp folder is. Moving temp to the output drive changes which drive fills up, not how many bytes are moved. Two side effects the finding misses: a failed WAV write is only logged, so the clip is saved without that audio track (or silent); and a partly written .h264 stays on the full C: until the next app start.",
+    "reachable_by": "A user who has moved the clip folder off the system drive (the default is Videos\\ClippiBoy, usually also on C:), when %APPDATA%'s drive has less free space than the snapshot (buffer seconds x bitrate, plus about 11.5 MB/min per WAV track). It happens on any hotkey, button or Stream Deck clip save.",
+    "fix_assessment": "Putting the temp files in a hidden folder under clip_dir (the same approach as recorder's .recording WORK_DIR) is simple. The existing clip_dir free-space guard would then cover them, but discard_leftovers would have to clear that folder as well. Streaming to ffmpeg over stdin removes the .h264 temp file, but several audio inputs would need named pipes on Windows, which is a bigger change."
+   }
+  ]
+ },
+ {
+  "id": "VP-6",
+  "title": "COM reference to the video-processor input view leaks on every frame",
+  "severity": "high",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/convert.rs:336-347"
+  ],
+  "claim": "In convert.rs:336-347, `let input = self.input_view(...)?;` returns a `view.clone()` (an extra COM reference), which is passed as `pInputSurface: std::mem::ManuallyDrop::new(Some(input)),` into the VideoProcessor stream and is never recovered with ManuallyDrop::into_inner / dropped after VideoProcessorBlt. One reference leaks per frame.",
+  "scenario": "Once a cache entry goes away, the view never dies and keeps its texture and through it the whole ID3D11Device alive. Entries go away on pool Recreate (window or resolution change), watermark toggle, more than 4 entries, or the Converter drop at every pipeline restart. Restarts are frequent (per-game buffer automation, lock screen, screen drift, config changes); each leaks 1-2 frame-sized BGRA textures (8 MB at 1080p, 33 MB at 4K) plus a D3D device. Dragging a window edge during window capture leaks two textures per size step; a long-running tray app grows VRAM steadily.",
+  "fix": "Keep stream in a local and call ManuallyDrop::into_inner(stream.pInputSurface) after the Blt, or don't clone (transmute_copy a borrowed pointer).",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "high",
+    "evidence": "convert.rs:251-253 the cache hit returns an extra reference: `if let Some((_, view)) = self.input_views.iter().find(|(k, _)| *k == key) { return Ok(view.clone()); }` (the miss path at 280-281 also returns an owned clone next to the cached copy). convert.rs:336 `let input = self.input_view(stamped.as_ref().unwrap_or(source))?;` then convert.rs:347 `pInputSurface: std::mem::ManuallyDrop::new(Some(input)),` and convert.rs:354-361 `VideoProcessorBlt(&self.processor, &self.slots[slot].output_view, 0, &[stream])` followed by `result.map_err(...)?; Ok(slot)`. Nothing calls ManuallyDrop::into_inner/take on stream.pInputSurface, and ManuallyDrop has no drop glue, so one AddRef leaks on every frame, on the success path and the error path alike. The same repo shows the correct pattern in mft.rs:1009-1010 (`ManuallyDrop::take(&mut data.pSample)`), and convert.rs is the only place that misses it. Reachability: wgc.rs FrameArrived handler -> pipeline.rs:678 `latest.submit(frame.texture, ...)` -> convert.rs:676 `self.converter.lock().convert(source, source_size)` runs for every captured frame (Latest::submit skips it only when slots are starved). The cache gets evicted at convert.rs:322-325 (source_size change after wgc.rs:233 `pool.Recreate` on a window or resolution change), at convert.rs:314-317 (watermark switched off), at convert.rs:278-280 (more than 4 entries), and when the Converter is dropped at each pipeline stop or restart (Pipeline::start creates a fresh GpuDevice and Converter per launch: pipeline.rs:625-626, state.rs:497).",
+    "corrected_claim": "",
+    "reachable_by": "Ordinary use, with no attacker needed. The leak of one reference per frame starts as soon as the replay buffer captures (often from startup). Real memory is only lost when a cache entry or the Converter is let go: each buffer stop/start (UI, tray, hotkey, Stream Deck, automation, updater), each resolution change, each watermark toggle, and each window resize in window-capture mode. Monitor capture is the default (config.rs:28), so for most users growth is per restart or resolution change: about 2x8 MB at 1080p without the watermark (both pool textures), or the one canvas texture with it. Each restart also pins the old D3D11 device, because D3D11 child objects hold an internal device reference (runtime behaviour, expected but not checkable here). Window capture with a drag-resize can leak a lot quickly.",
+    "fix_assessment": "The fix works. Bind the stream mutably and call `drop(ManuallyDrop::take(&mut stream.pInputSurface))` (or into_inner) after VideoProcessorBlt and before the `?`, so the error path is covered too. Another option is to pass a borrowed pointer with transmute_copy and no clone, so the cache stays the only owner."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "high",
+    "evidence": "convert.rs:260-261 cache hit `return Ok(view.clone());` and convert.rs:289-290 cache miss `self.input_views.push((key, view.clone())); Ok(view)` - either way the caller gets an owned reference beyond the cache's own. convert.rs:336 `let input = self.input_view(...)?;` moves it into convert.rs:347 `pInputSurface: std::mem::ManuallyDrop::new(Some(input)),`; convert.rs:354-360 `VideoProcessorBlt(&self.processor, &self.slots[slot].output_view, 0, &[stream])` borrows a temporary array that is dropped without ManuallyDrop::take/drop, and nothing after it (convert.rs:362-363) gets the reference back. ManuallyDrop never runs the inner Release, so each convert() leaks one AddRef on the current input view. The same codebase does it right elsewhere: mft.rs:1009-1010 `ManuallyDrop::take(&mut data.pSample)` / `ManuallyDrop::take(&mut data.pEvents)`. Eviction paths that make the leak real in memory: convert.rs:304-307 (source_size change), :325-327 (watermark off -> stamp.release()), :287-288 (>=4 entries), and Converter drop on each pipeline start (pipeline.rs:625-626 creates a fresh `GpuDevice::new` + `Converter::new` per start). WGC pool has 2 buffers (wgc.rs:189-193, Recreate at wgc.rs:233-238), so 1 canvas view (watermark on, convert.rs:529-541) or up to 2 pool-texture views (watermark off) are pinned per eviction.",
+    "corrected_claim": "",
+    "reachable_by": "Every captured frame in normal recording. The VRAM leak shows up whenever cached views are evicted: a window or resolution change (pool Recreate plus the source_size clear), switching the watermark off, the 4-entry cap, and every pipeline stop/restart (Converter dropped, GpuDevice recreated). No unusual input is needed.",
+    "fix_assessment": "Either fix works: bind the stream to a mutable local and call `ManuallyDrop::drop(&mut stream.pInputSurface)` (or `ManuallyDrop::into_inner`/`take`) after VideoProcessorBlt, including on the error path, or pass a borrowed pointer with `std::mem::transmute_copy(&input)` and no extra ref. The take-after-call form matches the existing pattern in mft.rs:1009."
+   },
+   {
+    "lens": "impact",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "convert.rs:279 `return Ok(view.clone());` (cache hit: AddRef) and convert.rs:308-309 `self.input_views.push((key, view.clone())); Ok(view)` (miss: the returned ref is an extra one too). convert.rs:336 `let input = self.input_view(...)?;` then convert.rs:346 `pInputSurface: std::mem::ManuallyDrop::new(Some(input)),` and convert.rs:352-357 `VideoProcessorBlt(..., &[stream])`. The stream is moved into the array temporary and never unwrapped; windows 0.58 (Cargo.toml:65) generates no Drop for D3D11_VIDEO_PROCESSOR_STREAM, which is why the field is ManuallyDrop. So one Release is missed per converted frame, on the success path and the error path alike. What gets pinned: the watermark is on by default (watermark.rs:34 `ENABLED: AtomicBool = AtomicBool::new(true)`), so the view is normally on the Stamp canvas (convert.rs:336 `stamped.as_ref().unwrap_or(source)`), one source-sized BGRA texture. With the watermark off, the views are on the 2 WGC pool buffers (wgc.rs:189-193, `2`). The cache drops entries on a size change (convert.rs:326-329), on a watermark toggle (convert.rs:345-347 region, `stamp.release()` then clear), and on Converter drop. Each pipeline start builds a fresh device (pipeline.rs:625 `GpuDevice::new`). Restarts come from game-start/stop automation (lib.rs:661-662), the lock screen, screen drift (lib.rs:587-588) and source changes (commands.rs:119-120). Pool Recreate on every content-size change: wgc.rs:226-240.",
+    "corrected_claim": "The leak itself is real. What leaks is not memory per frame: the refcount of the same few cached views keeps rising, and those view objects can never be freed. The memory lost is one set of textures per cache lifetime. With the default watermark on, that is about 1 canvas texture per pipeline restart, per settled resize, or per watermark-off toggle. With the watermark off, it is the 2 pool buffers. Each set also likely pins the old ID3D11Device through D3D11's child-to-device internal reference (runtime behaviour, not checkable here). The cache clear at more than 4 entries almost never happens in practice. Typical growth is about 8 MB at 1080p or 33 MB at 4K per restart, plus the device. It is larger only for window capture while a window is being resized repeatedly. Refcount overflow is not a practical concern (years at 60 fps).",
+    "reachable_by": "Every user, on the default path. It needs no attacker. Any pipeline stop/start (in-game automation, lock screen, screen drift or resolution change, source change, manual toggle) leaks one set of textures. Window capture of a window that keeps being resized leaks one set per settled size. Each watermark-off toggle leaks one canvas.",
+    "fix_assessment": "The proposed fix is correct and sufficient. The ref must be recovered on both the success and error paths, so do it before the `?`. Because `&[stream]` moves the struct, bind it first: `let streams = [stream]; let result = unsafe { ...VideoProcessorBlt(..., &streams) }; let [stream] = streams; drop(std::mem::ManuallyDrop::into_inner(stream.pInputSurface)); result.map_err(...)?;`. An equivalent fix is to keep `input` as an owned local and pass `ManuallyDrop::new(Some(unsafe { std::mem::transmute_copy(&input) }))`, so the normal drop of `input` balances the clone. Releasing right after Blt is safe because the D3D11 runtime tracks in-flight use itself. Once views can die, the existing size/toggle cache clears start freeing textures as their comments intend. Cached entries still hold strong refs, so the raw-pointer key cannot alias while it is in the table."
+   }
+  ]
+ },
+ {
+  "id": "VP-20",
+  "title": "Refresh-rate snapping produces 59 fps on 59.94 Hz panels",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/capture.rs:155-158",
+   "src-tauri/src/capture.rs:598-606"
+  ],
+  "claim": "The refresh rate comes from integer dmDisplayFrequency (capture.rs:155-158) and `choices.push(refresh)` adds it as an fps step (capture.rs:598-606), so fractional rates are truncated.",
+  "scenario": "A 59.94 Hz panel reports 59, so a 60 fps config snaps to 59 fps CFR; the pacer then misses about one WGC frame per second (judder). Same at 119/143/164 Hz.",
+  "fix": "Treat ±1 Hz around a standard step as that step, or read the rational refresh rate from QueryDisplayConfig.",
+  "reported_confidence": "likely",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "capture.rs:155-158 `match mode.dmDisplayFrequency { 0 | 1 => None, hz => Some(hz) }` (integer from EnumDisplaySettingsW, used as-is). capture.rs:598-605 fps_choices: `STEPS.into_iter().filter(|fps| *fps < refresh)` then `choices.push(refresh)`, so refresh=59 gives [30, 59]. capture.rs:610-619 snap_fps(60, [30,59]) finds the highest step <= 60, which is 59. capture.rs:641 `recording.fps = snap_fps(...)`, and state.rs:496 applies fit_to_target before Pipeline::start. convert.rs:694-733 pace() ticks at `1_000_000_000 / fps` ns and samples the latest WGC frame, so at 59 ticks/s against a 59.94 Hz source about 0.94 source frames per second are never sampled. The UI mirrors this (src/routes/Recording.tsx fpsChoices/fitFps). The input condition rests on Windows: legacy DEVMODE reports a 59.94 Hz (TV/NTSC-style) mode as 59, and 119.88 as 119. That is documented Windows behaviour but cannot be checked from source; for typical PC '60 Hz' panels Windows usually reports 60.",
+    "corrected_claim": "",
+    "reachable_by": "Any user whose capture screen runs a fractional mode that Windows reports truncated (59.94 -> 59, 119.88 -> 119): TVs, some laptop or HDMI modes. A saved 60/120 fps config is snapped down at every pipeline launch, and the UI offers only the truncated value.",
+    "fix_assessment": "Sound. Treating refresh within about 1 Hz below a standard step (59 -> 60, 119 -> 120, 143 -> 144) as that step, or reading the rational vSyncFreq from QueryDisplayConfig (which the code already calls for identities), fixes both fps_choices and the UI mirror. Recording.tsx must be changed in step."
+   }
+  ]
+ },
+ {
+  "id": "VP-22",
+  "title": "Encoder thread polls instead of blocking",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "src-tauri/src/mft.rs:1330",
+   "src-tauri/src/mft.rs:1354",
+   "src-tauri/src/mft.rs:1406-1411"
+  ],
+  "claim": "The encoder loop uses `jobs.recv_timeout(2ms)` (mft.rs:1330), `sleep(1ms)` (mft.rs:1354), and a busy-polling drain loop (mft.rs:1406-1411) around GetEvent(NO_WAIT).",
+  "scenario": "500-1000 wakeups per second. crossbeam's timed park may round up to the 15.6 ms system timer, so HaveOutput events can wait.",
+  "fix": "A helper thread doing a blocking GetEvent(0) and forwarding into a crossbeam channel, then select! over events and jobs (or BeginGetEvent).",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "mft.rs:1328-1330 `if pending_input > 0 { match jobs.recv_timeout(Duration::from_millis(2))`. mft.rs:1351-1354 `} else if !handled { std::thread::sleep(Duration::from_millis(1)); }`. mft.rs:1281 drains with `events.GetEvent(MF_EVENT_FLAG_NO_WAIT)`. crossbeam-channel-0.5.16/src/context.rs:153 `thread::park_timeout(end - now)` is the timed wait, and a send unparks it at once, but MF events do not. So the thread wakes every 1-2 ms (or at system-timer granularity) whenever the encoder is idle, and a HaveOutput event that arrives during a recv wait is seen only at the timeout or the next job (at most about one frame period). Nuance: the loop at mft.rs:1404-1411 is the stop-time drain only (bounded to 2 s) and sleeps 1 ms per empty poll, so it is not a steady-state busy spin. The 15.6 ms rounding of park_timeout rests on Windows timer resolution and std's WaitOnAddress timeout, which cannot be checked here (no std or windows sources locally).",
+    "corrected_claim": "",
+    "reachable_by": "Every running hardware-encoder pipeline (always async), continuously while buffering.",
+    "fix_assessment": "Reasonable. BeginGetEvent with an IMFAsyncCallback forwarding into a crossbeam channel, plus select! over events and jobs, removes the polling. A helper thread on blocking GetEvent(0) also works but needs a clean shutdown (MFShutdownObject / IMFShutdown) so it does not block forever at stop."
+   }
+  ]
+ },
+ {
+  "id": "VP-23",
+  "title": "Encoder thread never initialises COM",
+  "severity": "low",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/mft.rs:1115-1131"
+  ],
+  "claim": "On the clippiboy-encoder thread (mft.rs:1115-1131), MFStartup, MFTEnumEx and ActivateObject run without CoInitializeEx. This only works because other threads (audio ensure_com, windows-rs CoIncrementMTAUsage) keep the implicit MTA alive.",
+  "scenario": "If no other thread keeps the implicit MTA alive, MF/COM calls on the encoder thread run without COM initialised.",
+  "fix": "Call CoInitializeEx(MTA) at thread start.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "mft.rs:1112-1130: the clippiboy-encoder thread closure calls `build(&gpu, &settings)` and then `run(...)` directly. build (mft.rs:681-717) calls `startup()` (MFStartup, mft.rs:149-157, once per process), `enumerate()` (MFTEnumEx) and `candidates[pick].activate.ActivateObject()` (CoCreateInstance of the vendor MFT). A grep of src-tauri/src finds CoInitializeEx only in audio/capture.rs:471 and audio/devices.rs:33 (ensure_com), never on the encoder thread, and no CoUninitialize anywhere. So the encoder thread relies on the implicit MTA that other MTA threads in the process create (audio capture threads, ensure_com callers, possibly MF's own work-queue threads after MFStartup, or windows-rs's CO_E_NOTINITIALIZED -> CoIncrementMTAUsage fallback). The last two cannot be verified here because no windows-rs or MF sources are local.",
+    "corrected_claim": "",
+    "reachable_by": "Theoretical: a pipeline start where no other thread has created the process MTA yet. This is most plausible on the first start with no audio sources enabled, since encoder build runs before wgc::start (pipeline.rs:629-659 vs 666). Then ActivateObject or CoCreateInstance would fail with CO_E_NOTINITIALIZED.",
+    "fix_assessment": "Correct and cheap: CoInitializeEx(None, COINIT_MULTITHREADED) at the top of the encoder thread closure. Ideally pair it with CoUninitialize after the Transform and the event generator are dropped at the end of run()."
+   }
+  ]
+ },
+ {
+  "id": "VP-25",
+  "title": "Mixer timeline truncates per window, so long recordings drift",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/pipeline.rs:818"
+  ],
+  "claim": "pipeline.rs:818 is `next_100ns = Some(from + frames as i64 * 10_000_000 / SAMPLE_RATE as i64);`, which floors away 1/3 to 2/3 of a 100 ns tick per window.",
+  "scenario": "The recorder's contiguous PCM drifts behind the video by about 12 ms per hour. The replay ring's trimming cancels the error, so clips are unaffected.",
+  "fix": "Keep an origin plus a u64 sample counter.",
+  "reported_confidence": "likely",
+  "slice": "03-video-pipeline",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "AU-32",
+    "slice": "04-audio-edit",
+    "title": "Mixer `next_100ns` truncation accumulates timing drift",
+    "claim": "The mixer advances its window with `next_100ns = from + frames*1e7/48000` (pipeline.rs:818), which truncates each step and accumulates about 3.5 ppm of drift.",
+    "locations": [
+     "src-tauri/src/pipeline.rs:818"
+    ],
+    "fix": "Derive it from a total frame count instead."
+   }
+  ],
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "pipeline.rs:818 `next_100ns = Some(from + frames as i64 * 10_000_000 / SAMPLE_RATE as i64);` -> frames*625/3 integer division drops (frames mod 3)/3 of a tick per window (avg ~1/3 tick = 33 ns). pipeline.rs:780 `frames = ((target - from) * SAMPLE_RATE as i64 / 10_000_000)` makes the next window catch up to the clock, so the sample count grows faster than QPC time. MIX_INTERVAL = 10 ms (pipeline.rs:44), so ~100 windows/s -> ~12 ms/h (~3.3 ppm). Sources are read by QPC each window (engine.rs:392 `run.ring.read_window(from_100ns, scratch)`), so the overlap shows up as repeated samples. The recorder counts samples contiguously (recorder.rs:293 `track.frames += ...`, :301 `audio.timeline += frames`) and finalize only cuts the tail to the video length (recorder.rs:546 `audio_frames = frames * SAMPLE_RATE / fps`, align at :439), so audio lags the CFR video more and more. The comment at pipeline.rs:761-762 ('no error can build up') is wrong. Replay ring: the trim at pipeline.rs:165 `inner.start_100ns += frames * 10_000_000 / SAMPLE_RATE as i64` uses the same floor on the same per-window chunk once the ring is full, so the two errors cancel.",
+    "corrected_claim": "Small nuance on the side claim: the replay ring cancels the error only while windows are trimmed one by one. Silent or muted windows are counted but not stored (pipeline.rs:120-138). When sound returns they are trimmed together with the block as one chunk, so for sources with digital silence a small residual drift builds up in clips too, until silence longer than the ring resets it.",
+    "reachable_by": "Any long recording (Recorder path). After about an hour the offset is ~8-12 ms, depending on how often the mixer actually wakes. The replay ring is mostly unaffected.",
+    "fix_assessment": "An origin plus a cumulative frame counter (next = origin + total_frames*1e7/48000) fixes the mixer. The TrackRing trim at pipeline.rs:165 has the same truncation and today cancels the mixer error. Fixing only line 818 would move the drift into clips (ring start falls behind over buffer uptime, so audio comes out early), so the trim has to switch to a cumulative trimmed-frame counter too."
+   }
+  ]
+ },
+ {
+  "id": "VP-26",
+  "title": "Pipeline stop order contradicts its own comment (capture dropped after encoder)",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src-tauri/src/pipeline.rs:577-578",
+   "src-tauri/src/pipeline.rs:746-750"
+  ],
+  "claim": "The field comment (pipeline.rs:577-578) says the capture 'Has to drop before the encoder', but stop() (pipeline.rs:746-750) drops the encoder explicitly first and `_capture` only goes when the function returns.",
+  "scenario": "WGC keeps converting and watermarking into slots throughout the ≤2 s encoder drain.",
+  "fix": "Take and drop the capture first.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "pipeline.rs:577-578 `/// Has to drop before the encoder: no frame may arrive after that.` `_capture: Capture,`. In stop() (pipeline.rs:735-751): latest.stop(); pacer.join(); mixer.join(); `if let Some(encoder) = running.encoder.take() { drop(encoder); }`, and `running`, with `_capture`, only drops when the function returns. drop(encoder) is the last Arc (the sink's clone dropped with the pacer). VideoEncoder::drop joins the thread (mft.rs:1211-1216), and that thread drains for up to 2 s (mft.rs:1405 `Duration::from_secs(2)`). Meanwhile the WGC callback (pipeline.rs:676-684) keeps calling latest.submit, which does not check `running` (convert.rs:660-680) and converts into an NV12 slot, watermark included (convert.rs:317). Capture::drop (wgc.rs:66-72) removes the handler only afterwards.",
+    "corrected_claim": "",
+    "reachable_by": "Every pipeline stop (buffer off, app exit through Pipeline::drop). The only cost is wasted GPU conversion during the drain. Latest/Converter outlive the encoder and the slot guard (convert.rs:641-648) still applies, so there is no corruption.",
+    "fix_assessment": "Make `_capture` an Option and take()/drop it at the top of stop() (or right after the pacer join). That matches the comment and costs at most a few repeated tail frames from the pacer."
+   }
+  ]
+ },
+ {
+  "id": "VP-39",
+  "title": "release.yml never runs cargo test",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [
+   ".github/workflows/release.yml"
+  ],
+  "claim": "The release workflow release.yml never runs `cargo test`.",
+  "scenario": "Releases are built without running the Rust test suite.",
+  "fix": "Not given explicitly in the report (implied: add cargo test to the workflow).",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": ".github/workflows/release.yml steps: checkout, setup-node, dtolnay/rust-toolchain, rust-cache, `npm ci`, Stream Deck `npm run pack`, `tauri-apps/tauri-action@v0`, `gh release upload` - no `cargo test`. tauri-action only runs `tauri build`, whose hook is src-tauri/tauri.conf.json:9 `\"beforeBuildCommand\": \"npm run build\"` = package.json `tsc --noEmit && vite build`. The other workflows (ffmpeg.yml, pages.yml) don't touch Rust. Meanwhile src-tauri/src has ~271 `#[test]` functions across 30 files (disk, encode, mft, capture, pipeline, buffer, ...), none of which any workflow runs.",
+    "corrected_claim": "",
+    "reachable_by": "Any maintainer pushing a v* tag or running workflow_dispatch; a release with failing Rust tests ships and auto-updates every install (releaseDraft: false, includeUpdaterJson: true).",
+    "fix_assessment": "Add a `cargo test --manifest-path src-tauri/Cargo.toml` step (windows-latest, so the cfg(windows) mft/pipeline tests run too) before tauri-action; ideally also a PR/push CI workflow, since today no workflow runs tests at all."
+   }
+  ]
+ },
+ {
+  "id": "VP-43",
+  "title": "22 NV12 slots allocated up front waste VRAM (S4)",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "src-tauri/src/convert.rs"
+  ],
+  "claim": "All SLOTS = 22 NV12 textures are allocated up front: about 68 MB at 1080p, 122 MB at 1440p and 273 MB at 4K of VRAM, even with a near-zero queue.",
+  "scenario": "Hundreds of MB of VRAM held while gaming at 4K.",
+  "fix": "Not given explicitly here (see proposal: adaptive slot pool grown on demand using tracked samples).",
+  "reported_confidence": "speculative",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "convert.rs:75 `pub const SLOTS: usize = crate::mft::QUEUE_DEPTH + crate::mft::ENCODER_HOLD_MAX + 2;` with mft.rs:37 `QUEUE_DEPTH: usize = 4` and mft.rs:46 `ENCODER_HOLD_MAX: usize = 16` -> 22. convert.rs:170-178 `for _ in 0..SLOTS { slots.push(Self::make_slot(... width, height)?) }` allocates every slot in Converter::new (called once at pipeline.rs:626 with recording.width/height); make_slot convert.rs:213-226 creates a DXGI_FORMAT_NV12, D3D11_USAGE_DEFAULT texture. Rotation is strict round-robin (convert.rs:337-338 `self.next_slot = (self.next_slot + 1) % self.slots.len();`), so all 22 are touched and stay resident. Numbers check: w*h*1.5 x 22 = 68.4 MB (1080p), 121.7 MB (1440p), 273.7 MB (2160p), plus driver pitch alignment. 2160 is a UI choice (src/routes/Recording.tsx:14 `HEIGHTS = [720, 1080, 1440, 2160]`), height clamped to the source (capture.rs:646), width follows aspect, so ultrawide 5120x2160 is ~365 MB. The comment at convert.rs:70-73 itself concedes 'the headroom mostly goes unused' because low_latency_default (mft.rs:433-437) keeps AMD/Intel queues near zero.",
+    "corrected_claim": "",
+    "reachable_by": "Every buffer/recording session; cost scales with the configured output resolution (4K or ultrawide sources at native height are the expensive cases).",
+    "fix_assessment": "An on-demand pool is feasible because the in-flight count and real queue depth are already tracked (convert.rs:641-649), but growth must happen before the rotation laps the encoder or it reintroduces the torn-frame bug convert.rs:62-68 describes; a simpler middle ground is sizing from the effective low-latency/vendor setting or using a free list instead of strict round-robin. This is a deliberate, documented trade-off, so the priority is low."
+   }
+  ]
+ },
+ {
+  "id": "VP-28",
+  "title": "Screenshot path creates a new D3D device per screenshot",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "src-tauri/src/shot.rs:516"
+  ],
+  "claim": "shot.rs:516 creates a new D3D device for every screenshot grab().",
+  "scenario": "Each screenshot pays device creation cost.",
+  "fix": "Not given explicitly in the report (implied: reuse a device).",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "shot.rs:516 `let gpu = Arc::new(crate::gpu::GpuDevice::new(None)?);` inside grab(), called once per take_screenshot (state.rs:902). GpuDevice::new runs D3D11CreateDevice (gpu.rs:202-220), SetMultithreadProtected, and CreateDirect3D11DeviceFromDXGIDevice for the WinRT device (gpu.rs:237-243) every time. Nothing caches it.",
+    "corrected_claim": "",
+    "reachable_by": "Every screenshot hotkey or UI action. The cost is one device creation (typically tens of ms) on a user-triggered, infrequent action. That is small next to WGC session start-up and the 4K PNG encode.",
+    "fix_assessment": "A cached device would save the creation time, but it would need device-removed (TDR, driver update) recovery and would keep GPU objects alive while idle. Reusing the running pipeline's device when there is one is the cheaper option. The gain is marginal."
+   }
+  ]
+ },
+ {
+  "id": "VP-33",
+  "title": "mft::run is ~225 lines and duplicates event handling in the drain loop",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src-tauri/src/mft.rs"
+  ],
+  "claim": "mft::run is about 225 lines long and duplicates the MFT event handling in the drain loop.",
+  "scenario": "Fixes to event handling must be made twice and can diverge.",
+  "fix": "Not given explicitly in the report (implied: factor out shared event handling).",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/src/mft.rs:1221 `fn run<F, H>(` through the closing `}` at 1445 (after `ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0)` at 1443): exactly 225 lines. Main loop 1278-1320: `events.GetEvent(MF_EVENT_FLAG_NO_WAIT)` / `MF_E_NO_EVENTS_AVAILABLE => break` / `kind == METransformHaveOutput` -> `transform.take_output(duration)` -> `took(...)`, `on_packet(packet)`, `catch_up_on_header(...)` / `METransformDrainComplete` -> finished. Drain loop 1399-1431 repeats the same dispatch: `GetEvent(MF_EVENT_FLAG_NO_WAIT)` ... `if kind == METransformHaveOutput.0 as u32 { match transform.take_output(duration) { Ok(Some(packet)) => on_packet(packet), ... Err(err) => { log::warn!(\"{err}\"); break; } } } else if kind == METransformDrainComplete.0 as u32 { break; }`. The software branch (1368-1385) repeats the take_output -> took -> on_packet -> catch_up_on_header sequence a third time.",
+    "corrected_claim": "Accurate. The drain-loop copy is a cut-down version and already differs from the main loop: it skips `took` (so drained frames never reach the encoder stats), skips `catch_up_on_header`, stops on a take_output error where the main loop logs and carries on, and sleeps instead of breaking when no events are waiting. Some of that is deliberate, and it shows the two copies are already drifting apart.",
+    "reachable_by": "Maintainers only; no runtime trigger. A future fix to the async event dispatch has to be applied to both the main loop and the drain loop.",
+    "fix_assessment": "Factoring out a `handle_event(kind) -> Flow` helper (or a closure shared by both loops) that covers HaveOutput and DrainComplete would remove the duplication. The drain-specific differences (sleep on no events, 2 s deadline) stay at the call site. Low value, low risk."
+   }
+  ]
+ },
+ {
+  "id": "VP-34",
+  "title": "muxer::run and run_reporting duplicate error formatting",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src-tauri/src/muxer.rs"
+  ],
+  "claim": "muxer::run and muxer::run_reporting duplicate the ffmpeg error formatting.",
+  "scenario": "Duplicate code paths that can diverge.",
+  "fix": "Not given explicitly in the report (implied: share one formatter).",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/src/muxer.rs:67-68 `.map_err(|err| format!(\"could not start ffmpeg ({what}): {err}\"))?;` and 72-76 `let tail: Vec<&str> = stderr.lines().rev().take(6).collect(); Err(format!(\"ffmpeg failed at '{what}': {}\", tail.into_iter().rev().collect::<Vec<_>>().join(\" / \")))` appear again, character for character, in run_reporting at muxer.rs:436 and 463-467.",
+    "corrected_claim": "",
+    "reachable_by": "Maintainers only; no runtime effect. The two error messages are identical today.",
+    "fix_assessment": "A small `fn ffmpeg_failure(what: &str, stderr: &str) -> String` used by both functions removes the copy. Trivial and safe, but cosmetic."
+   }
+  ]
+ },
+ {
+  "id": "VP-36",
+  "title": "frames*SR/fps audio-length formula is duplicated",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src-tauri/src/pipeline.rs:1002",
+   "src-tauri/src/recorder.rs:546"
+  ],
+  "claim": "The `frames*SR/fps` formula for audio length appears twice (pipeline.rs:1002 and recorder.rs:546).",
+  "scenario": "Clip and recording audio alignment can diverge if one copy changes.",
+  "fix": "Not given explicitly in the report (implied: one shared helper).",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/src/pipeline.rs:1002-1003 `let audio_frames = packets.len() as i64 * SAMPLE_RATE as i64 / self.shared.fps.max(1) as i64;` and src-tauri/src/recorder.rs:546 `let audio_frames = frames * SAMPLE_RATE as u64 / fps as u64;` where recorder.rs:538 has `let fps = meta.fps.max(1);`. Both derive the audio length from the video frame count, relying on the muxer's `-r fps` timeline.",
+    "corrected_claim": "Accurate but trivial. It is a one-line formula in two places, with different integer types (i64 vs u64). Both copies guard fps with `.max(1)` and agree today. Neighbouring 100ns<->sample-frame conversions (pipeline.rs:165, 181, 780, 818, 1049; recorder.rs:265) are repeated inline in the same way.",
+    "reachable_by": "Maintainers only. A drift could happen only if someone changes how the muxer derives the video timeline and updates just one of the two copies.",
+    "fix_assessment": "A shared `fn audio_frames_for(video_frames: u64, fps: u32) -> u64` next to SAMPLE_RATE would tie both callers to the same rule. Harmless, cosmetic."
+   }
+  ]
+ },
+ {
+  "id": "VP-37",
+  "title": "Vestigial EncodedPacket.track / duration_us fields and audio cases in buffer tests",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src-tauri/src/buffer.rs"
+  ],
+  "claim": "EncodedPacket.track and EncodedPacket.duration_us, and the audio cases in the buffer tests, are vestigial.",
+  "scenario": "Dead fields and tests for a code path that no longer exists.",
+  "fix": "Not given explicitly in the report (implied: remove them).",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "The only production constructor is src-tauri/src/mft.rs:1051-1057 `EncodedPacket { track: VIDEO_TRACK, pts_us: ..., duration_us: duration_100ns / 10, ... }`. No packets come from anywhere else: pipeline.rs:643-649 pushes the encoder callback's packets into the ring. A repo-wide grep finds `duration_us` only at buffer.rs:20 (declaration), mft.rs:1054 (write) and buffer.rs:236 (test helper), so it is never read. `track` is read only through `is_video()` (buffer.rs:26-27, used at buffer.rs:78 and 219, and recorder.rs:213 `if !packet.is_video() { return; }`), and in production it is always VIDEO_TRACK, so those checks are always true. The tests build audio packets: buffer.rs:248-250 `if frame % 3 == 0 { buf.push(packet(1, pts_ms, false, 100)); }` and buffer.rs:278 `\"audio packets slipped in\"`. `pub mod buffer` in lib.rs:2 is why the compiler does not report the dead field.",
+    "corrected_claim": "Accurate. Strictly, the `track` field is still read (by `is_video()`), but in production it only ever holds VIDEO_TRACK, so the reads are no-ops. `duration_us` is written and never read. The audio packets in the test `fill` helper exercise a situation the pipeline can no longer produce (audio goes to TrackRings, not the ReplayBuffer). The comment in the memory-budget test (\"1000 bytes per frame plus audio\") rests on them.",
+    "reachable_by": "Nothing at runtime; it is dead weight in data (16 bytes per packet) and tests.",
+    "fix_assessment": "Removing `track`, `duration_us`, `VIDEO_TRACK`, `is_video()` and the audio pushes in `fill` is safe. The `is_video()` filters at buffer.rs:78, buffer.rs:219 and recorder.rs:213 then go too, and the memory-budget tests' byte figures need a quick recheck (the 400_000 budget still holds with 1000 B/frame)."
+   }
+  ]
+ },
+ {
+  "id": "VP-24",
+  "title": "The last ~80 ms of every clip is silent",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/pipeline.rs:42",
+   "src-tauri/src/pipeline.rs:983-1026"
+  ],
+  "claim": "The mixer runs `AUDIO_LAG_100NS = 80ms` behind QPC now (pipeline.rs:42), and Pipeline::snapshot (pipeline.rs:983-1026) doesn't wait for the mixer to catch up, so window() fills the clip tail with zeros (80 ms minus encoder latency).",
+  "scenario": "Every saved clip ends with a short stretch of silence.",
+  "fix": "Wait up to ~100 ms for the mixer horizon to pass the clip end, or trim the trailing packets.",
+  "reported_confidence": "likely",
+  "slice": "03-video-pipeline",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "pipeline.rs:42 `const AUDIO_LAG_100NS: i64 = 80 * 10_000;`. pipeline.rs:775 `let target = now_100ns() - AUDIO_LAG_100NS;` with MIX_INTERVAL 10 ms (pipeline.rs:45). snapshot (pipeline.rs:983-1026) takes packets up to the newest one and sets `audio_frames = packets.len() * SAMPLE_RATE / fps` from `start_100ns = qpc_of(first_pts)`, with no wait on the mixer. state.rs:822-824 says 'There is nothing to wait for'. TrackRing::window (pipeline.rs:175-200) leaves zeros wherever `inner.samples.get(src)` is None. BUT ClipSnapshot.tracks is `self.shared.tracks.lock().clone()`, a Vec<Arc<TrackRing>> of the live rings, not a copy (pipeline.rs:545, 1019). The window is read only inside muxer::build at muxer.rs:172/190, after it builds the whole elementary stream and `std::fs::write(&video_path, &stream)` (muxer.rs:131-141), plus game_for and destination in state.rs:843-845. The mixer keeps filling the rings during that time.",
+    "corrected_claim": "A real trailing-silence defect exists, but it is not a fixed ~80 ms on every clip. At snapshot time the rings lag the clip end by roughly 80 ms plus up to 10 ms mixer tick, minus the encoder/pacer latency. The audio window is read later from the live rings, after muxer::build has assembled and written the whole .h264 file. So the silent tail is that lag minus the save-path time before the WAV write. It is typically some tens of ms on short clips and can be zero on long or high-bitrate clips whose video write takes longer than the lag.",
+    "reachable_by": "Every buffered clip save (hotkey, tray, UI, Stream Deck), and most visibly short clips on fast disks. Recordings via Recorder are a different path.",
+    "fix_assessment": "Waiting in save_clip, after releasing the pipeline lock, until a mixer horizon atomic (next_100ns, not exposed today) passes start_100ns + audio_frames, with a ~150 ms cap, fixes it deterministically. Trimming the last few video packets also works but shortens the clip."
+   }
+  ]
+ },
+ {
+  "id": "VP-31",
+  "title": "Mixed German and English user-facing error messages",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src-tauri/src/mft.rs",
+   "src-tauri/src/convert.rs",
+   "src-tauri/src/pipeline.rs"
+  ],
+  "claim": "German and English user-facing errors are mixed and reach banners via `?`, e.g. \"Encoder starten\", \"Paket abholen\", \"Taktgeber\", \"NV12-Textur fehlt\".",
+  "scenario": "Users see German error text in banners in an otherwise English UI.",
+  "fix": "Not given explicitly in the report (implied: unify error language).",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "German prefixes exist: mft.rs:717 and :839 `format!(\"Encoder starten: {err}\")`, mft.rs:1132 `\"Encoder-Faden: {err}\"`, convert.rs:228-229 `\"NV12-Textur: {err}\"` / `\"NV12-Textur fehlt\"` (make_slot, called from Converter::new at convert.rs:171), wgc.rs:199 `\"Capture-Sitzung: {err}\"`, pipeline.rs:712 `\"Taktgeber\"`, pipeline.rs:722 `\"Mischer\"`. These propagate with `?` through Pipeline::start (state.rs:497-503) to start_buffer_and_notify (lib.rs:365-369 `notify(app, \"error\", err.clone()); ... overlay::show(app, BannerKind::Error, \"Buffer will not start\", Some(err))`). The UI is English (index.html `lang=\"en\"`, no i18n). But `Paket abholen` (mft.rs:1024) comes from take_output, whose errors only go to log::warn (mft.rs:1312, :1384, :1424), and `Texturpuffer` (mft.rs:956, feed) only goes to log::warn (mft.rs:1366-1367).",
+    "corrected_claim": "Only the setup-time strings reach the toast and banner: 'Encoder starten', 'Encoder-Faden', 'NV12-Textur'/'NV12-Textur fehlt', 'Capture-Sitzung' (also from screenshot grab via wgc::start), 'Taktgeber', 'Mischer'. They show up only when the pipeline fails to start, as a short German prefix in front of the system error text. 'Paket abholen' (the reviewer's example) and 'Texturpuffer' go only to the log, not to banners.",
+    "reachable_by": "A user whose encoder activation, NV12 slot allocation, WGC session creation or thread spawn fails when the buffer starts (or when a screenshot is taken, for wgc.rs:199).",
+    "fix_assessment": "Translate the handful of prefixes to English, as the rest of the codebase already does (e.g. 'start encoder', 'capture session', 'pacer thread', 'mixer thread', 'NV12 texture missing'). Trivial and safe."
+   }
+  ]
+ },
+ {
+  "id": "VP-38",
+  "title": "convert.rs is #![cfg(windows)], so pure pacer and slot logic can't be tested",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [
+   "src-tauri/src/convert.rs"
+  ],
+  "claim": "convert.rs is `#![cfg(windows)]`, so the pure pacer and slot logic inside it cannot be unit-tested (on non-Windows CI).",
+  "scenario": "Bugs like VP-1 and VP-2 in pacer/slot logic have no test coverage.",
+  "fix": "Not given explicitly in the report (implied: move pure logic out of the cfg(windows) module and test it).",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/src/convert.rs:16 `#![cfg(windows)]`; convert.rs has no #[cfg(test)]/#[test] at all (grep empty). But mft.rs:12 is also `#![cfg(windows)]` and still carries tests (mft.rs:1447 `#[cfg(test)] mod tests` ... `fn an_idr_opens_a_gop`), so the cfg gate does not stop tests on Windows. The real coupling: `pub struct Latest { converter: Mutex<Converter>, ... encoder: Mutex<Option<(Arc<crate::mft::EncoderStats>, usize)>> }` (convert.rs:581-612), `fn on_frame(&mut self, texture: &ID3D11Texture2D, ...)` (convert.rs:577), `pace()` does `latest.converter.lock(); converter.texture(slot as usize).clone()` (convert.rs:727-729); slot rotation `self.next_slot = (self.next_slot + 1) % self.slots.len()` sits inside Converter::convert next to D3D11 video-processor calls (convert.rs:337-338). Only CI with Rust is release.yml on windows-latest, which runs no tests.",
+    "corrected_claim": "convert.rs has zero unit tests. The obstacle is not the #![cfg(windows)] gate alone (mft.rs is gated the same way and has tests that run under cargo test on Windows) but that the pacer timing math and slot bookkeeping are fused with D3D11 objects (Latest owns a Converter that needs a real ID3D11Device; FrameSink takes &ID3D11Texture2D; slot rotation lives inside Converter::convert), so they cannot be exercised without a GPU on any platform; and no CI job runs cargo test anyway (see VP-39).",
+    "reachable_by": "Developers/CI only; regressions in pace() (index/pts math, overrun counting) or slot_would_be_snatched go uncaught.",
+    "fix_assessment": "Extracting the tick schedule (due time, pts, duplicate/overrun decisions) and the slot-availability rule into plain functions/structs without D3D types would make them testable on every platform; it only helps if some CI job then actually runs cargo test."
+   }
+  ]
+ },
+ {
+  "id": "VP-44",
+  "title": "B-frames with raw Annex-B remux at -r, pts-filtered snapshot and discarded PTS is fragile (S5)",
+  "severity": "low",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/mft.rs",
+   "src-tauri/src/muxer.rs",
+   "src-tauri/src/buffer.rs"
+  ],
+  "claim": "B-frames (enabled via CLIPPIBOY_BFRAMES or a driver default) combined with raw Annex-B remux at -r fps, a pts-filtered snapshot and discarded PTS is fragile.",
+  "scenario": "With reordered frames, snapshot cut points and CFR remux may produce misordered or broken output.",
+  "fix": "Not given explicitly in the report.",
+  "reported_confidence": "speculative",
+  "slice": "03-video-pipeline",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "B-frames: mft.rs:392-400 `let count = env_opt_u32(\"CLIPPIBOY_BFRAMES\")?; ... CODECAPI_AVEncMPVDefaultBPictureCount` (otherwise not set; README.md:648 'unset means the driver's own choice, which is what ships'). Mux: muxer.rs:138-143 concatenates raw packet bytes into clip_*.h264; muxer.rs:261-263 `// The elementary stream carries no timestamps — the frame rate supplies them.` `command.arg(\"-f\").arg(\"h264\").arg(\"-r\").arg(fps...)` with `-c:v copy` (muxer.rs:296); same path for recordings (recorder.rs:433, 595). PTS: mft.rs:1032 `let pts_100ns = sample.GetSampleTime()` is the only timestamp read; no MFSampleExtension_DecodeTimestamp anywhere, and pts_us is used only for the ring/audio anchor. Snapshot: buffer.rs:197 `.filter(|p| p.pts_us >= start_pts)`. But keyframes are IDR/SPS (mft.rs:935 `matches!(header & 0x1f, 5 | 7)`, mft.rs:1031 CleanPoint), and with closed GOPs nothing before an IDR in decode order has pts >= the IDR's, so the filter selects exactly a seq cut; the first packet is the GOP's minimum pts, so the audio anchor (pipeline.rs:989) is right, and audio length comes from packet count (pipeline.rs:1004), which reordering does not change. The mft.rs:1259 comment shows the author already knew output can arrive reordered.",
+    "corrected_claim": "Only the remux step is fragile. With B-frames on (opt-in through CLIPPIBOY_BFRAMES, or whatever the driver defaults to, mainly NVENC, which runs without low latency per mft.rs:433-437), the MP4 timestamps depend entirely on ffmpeg rebuilding presentation order from a raw Annex-B stream under -c copy, because the encoder's PTS/DTS never reach the mux. Without picture-timing SEI this commonly gives unset or pts==dts timestamps, so frames play in decode order (judder). That rests on ffmpeg behaviour that cannot be checked here. The pts-filtered snapshot is not itself broken by reordering: with closed IDR GOPs it is the same as a sequence cut, and with open GOPs it only drops leading pictures that could not be decoded anyway.",
+    "reachable_by": "A user or tester who sets CLIPPIBOY_BFRAMES>0, or a GPU driver whose H.264 MFT emits B-frames by default (unknown; AMF/QSV run in low-latency mode, which typically suppresses them).",
+    "fix_assessment": "Cheapest robust fix: explicitly set AVEncMPVDefaultBPictureCount=0 unless the env var asks otherwise, which removes the dependency on ffmpeg's raw-stream timestamp guessing. Supporting B-frames properly would mean carrying the encoder's PTS (and DTS) into the mux, for example a timestamped intermediate container, instead of a bare elementary stream with -r."
+   }
+  ]
+ },
+ {
+  "id": "VP-29",
+  "title": "Screenshot read_back runs for every arriving frame, not just the first",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "src-tauri/src/shot.rs:531-533"
+  ],
+  "claim": "shot.rs:531-533 is `let _ = sender.try_send(read_back(&gpu, frame.texture));`, so the staging copy, a blocking Map and a 24 MB (4K) conversion run for every frame that arrives before the capture is dropped, even though only the first result can be sent.",
+  "scenario": "Several full read-backs and conversions per screenshot at 4K.",
+  "fix": "Check whether the channel is already full before calling read_back.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "shot.rs:531-533 `move |frame| { let _ = sender.try_send(read_back(&gpu, frame.texture)); }`: read_back (staging CreateTexture2D, CopyResource, blocking Map, BGRA->RGB loop, shot.rs:566-620) runs before the channel is looked at. Bounds: the frame pool has 2 buffers (wgc.rs:189-194, `2`), callbacks are serialized by `Mutex::new(on_frame)` (wgc.rs:213, :251), and grab drops the capture as soon as recv returns (shot.rs:543-548). Capture::drop does RemoveFrameArrived/Close (wgc.rs:66-72). Also, the bounded(1) channel is emptied by `receiver.recv_timeout`, so a later frame does not find it full (the comment at shot.rs:517-518 is inaccurate).",
+    "corrected_claim": "The waste is real but bounded. Typically at most one extra read-back: a frame WGC wrote into the second pool buffer while the first was being converted, and only on a changing screen or a moving cursor (cursor capture is on). It runs on the callback thread after grab() has already returned the shot, so it does not delay the screenshot. It costs an extra ~25 MB transient allocation and some CPU/GPU time at 4K. 'Several' read-backs per screenshot is overstated.",
+    "reachable_by": "Screenshots of a source that redraws (game, video, cursor movement) at high resolution.",
+    "fix_assessment": "The proposed 'check whether the channel is full' does not work reliably: once the main thread has received, the bounded(1) channel is empty again, so later callbacks still run read_back. An AtomicBool claimed with swap(true) before read_back (or dropping the sender after the first send) is the robust fix."
+   }
+  ]
+ },
+ {
+  "id": "VP-21",
+  "title": "Async MF_E_TRANSFORM_STREAM_CHANGE handling consumes the HaveOutput event without retrying and never re-reads SPS/PPS",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/mft.rs:1015-1023",
+   "src-tauri/src/mft.rs:896-911"
+  ],
+  "claim": "On MF_E_TRANSFORM_STREAM_CHANGE (mft.rs:1015-1023) the code sets the new output type then does `return Ok(None)`, consuming the METransformHaveOutput event without calling ProcessOutput again. The SPS/PPS header is never re-read afterwards because catch_up_on_header (mft.rs:896-911) stops at the first non-empty header.",
+  "scenario": "One packet is delayed or stuck, in-flight pairing is off by one, and a stale header may be prepended to clips.",
+  "fix": "Call ProcessOutput again immediately; re-read the header; as a fallback extract SPS/PPS (NAL 7/8) from the first IDR packet.",
+  "reported_confidence": "likely",
+  "slice": "03-video-pipeline",
+  "status": "unverified",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "unverifiable",
+    "severity_suggestion": "info",
+    "evidence": "mft.rs:1015-1023: on MF_E_TRANSFORM_STREAM_CHANGE it calls `GetOutputAvailableType(0,0)` and `SetOutputType`, then `return Ok(None);`. mft.rs:1307-1323: the METransformHaveOutput branch treats Ok(None) as a no-op, with no retry and no `sent.pop_front()`. mft.rs:896-911 catch_up_on_header: `if !*pending { return; }` and `*pending = false` once a non-empty header is read, and nothing ever sets it back to true. However, catch_up_on_header runs only after a packet has been delivered (mft.rs:1314-1319), so for the change 'once at the beginning' the comment describes (before the first packet), the header is read from the post-change current type. A stale header needs a mid-stream type change after a header was already captured, or a non-empty setup header (mft.rs:1238). muxer.rs:137 prepends the header once, and encoders that write SPS/PPS inline before IDRs override it. The sync path (mft.rs:1362-1391) is effectively dead: the software MFT fails at MFT_MESSAGE_SET_D3D_MANAGER (mft.rs:742-755).",
+    "corrected_claim": "The code does consume the HaveOutput event and return without a retry, and the header chase stops at the first non-empty header. Whether a packet is lost or delayed depends on whether the async MFT sends a fresh METransformHaveOutput after SetOutputType. FFmpeg mfenc, as recalled, also clears async_have_output and waits for a new event in this case. The stale-header case needs a mid-stream output-type change after the header was captured. That is not the start-of-stream change the code targets, and it is harmless when the encoder writes SPS/PPS inline. None of this can be checked from source.",
+    "reachable_by": "Only a hardware async H.264 MFT (NVENC/AMF/QSV driver) that returns MF_E_TRANSFORM_STREAM_CHANGE and does not re-signal METransformHaveOutput, or one that changes its output type mid-stream after delivering a header and does not repeat SPS/PPS inline.",
+    "fix_assessment": "Calling ProcessOutput again immediately is risky: an async MFT may reject ProcessOutput without a pending HaveOutput event (E_UNEXPECTED), or give the sample to the retry and then fail on the re-signalled event. Setting header_pending = true after a stream change, and extracting SPS/PPS (NAL 7/8) from the first IDR packet as a fallback, are cheap and safe hardening."
+   }
+  ]
+ },
+ {
+  "id": "VP-40",
+  "title": "MinUpdateInterval equal to the frame period may skip alternate frames (S1)",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/wgc.rs"
+  ],
+  "claim": "WGC MinUpdateInterval is set exactly equal to the frame period; because of jitter this may cause WGC to skip alternate frames.",
+  "scenario": "Delivered frame rate halves intermittently, and the CFR pacer repeats frames.",
+  "fix": "Since the pacer does CFR anyway, use about 0.5-0.9 × the period.",
+  "reported_confidence": "speculative",
+  "slice": "03-video-pipeline",
+  "status": "unverified",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "unverifiable",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/src/wgc.rs:205-208 `if fps > 0 { let interval: TimeSpan = Duration::from_nanos(1_000_000_000 / fps as u64).into(); let _ = session.SetMinUpdateInterval(interval); }` - fps is recording.fps (pipeline.rs:671-676 passes `recording.fps`), and capture::fps_choices (capture.rs:598-606) always offers the panel refresh itself, so interval == refresh period is the normal 'source' choice. The value is truncated (integer ns, then 100 ns ticks), i.e. marginally shorter than 1/fps. The pacer (convert.rs:694-733) repeats the last slot on any tick without a new frame and counts it in `duplicated`.",
+    "corrected_claim": "The code does set MinUpdateInterval to exactly (slightly under, by truncation) one frame period. Whether that halves delivery depends on how WGC/DWM implement the interval (comparing vsync-quantized present times against the last delivered frame with or without tolerance) and on the panel's true refresh (e.g. 60.02 Hz vs nominal 60). If WGC does gate on 'elapsed >= interval', the more likely effect is broader than alternate-frame skips: with fps not a divisor of refresh (60 on 144 Hz, 120 on 165 Hz) delivery would quantize to ceil(interval/vsync) vsyncs (about 48 and 82 fps), and the pacer fills the gap with duplicates. None of this can be checked from source; the call is also a no-op where the API is missing (pre-Windows 11).",
+    "reachable_by": "Any recording on Windows 11 where SetMinUpdateInterval exists, especially fps == panel refresh or fps not dividing the refresh rate.",
+    "fix_assessment": "A margin (about 0.5-0.9x period) is cheap since the pacer is CFR anyway, but every extra WGC frame is converted to NV12 and rotates a slot, so it raises converter load and slot churn (relevant to VP-2); verify with the existing `duplicated` counter on real hardware before and after."
+   }
+  ]
+ },
+ {
+  "id": "VP-41",
+  "title": "MFTEnumEx called without adapter LUID; MFT may belong to a different adapter (S2)",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/mft.rs"
+  ],
+  "claim": "MFTEnumEx is called without an adapter LUID, so on same-vendor multi-GPU machines the chosen MFT may belong to a different adapter than the D3D11 device.",
+  "scenario": "Ryzen APU + AMD dGPU: the encoder MFT is bound to the other adapter than the capture device.",
+  "fix": "Use MFTEnum2 with the device's adapter LUID.",
+  "reported_confidence": "speculative",
+  "slice": "03-video-pipeline",
+  "status": "unverified",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "unverifiable",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/src/mft.rs:219-226 `MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER, Some(&input), Some(&output), ...)` - no adapter attribute; no LUID/MFTEnum2 anywhere in src-tauri/src (grep empty). Selection is by vendor string only: mft.rs:710-714 `candidates.iter().position(|c| c.id == Some(wanted))` via vendor_of/vendor_to_encoder (mft.rs:159-178, `MFT_ENUM_HARDWARE_VENDOR_ID_Attribute`). The D3D device goes to a different rule: gpu.rs:141-147 picks the same-vendor adapter with max dedicated_vram (comment explicitly names the Ryzen iGPU+dGPU case). The device is handed over with MFT_MESSAGE_SET_D3D_MANAGER (mft.rs:739-757), and an error there aborts with 'device to encoder: ...'.",
+    "corrected_claim": "Code facts hold: the MFT is chosen by vendor id alone, with no adapter LUID, while the D3D11 device is chosen as the same-vendor adapter with the most VRAM, so nothing ties the two together on a two-Radeon machine. Whether that is a defect depends on Media Foundation and driver behaviour that cannot be checked here: whether MFTEnumEx returns one activate per adapter (each carrying MFT_ENUM_ADAPTER_LUID) and lists the iGPU's first, and whether the AMD MFT then refuses the other adapter's device at SET_D3D_MANAGER (a loud failure), does a cross-adapter copy, or just runs on whatever device it is given (no problem).",
+    "reachable_by": "Users with two GPUs of the same vendor (Ryzen APU + Radeon dGPU, Intel iGPU + Arc) on hardware encoders whose drivers register MFTs per adapter.",
+    "fix_assessment": "MFTEnum2 with MFT_ENUM_ADAPTER_LUID set from DXGI_ADAPTER_DESC1.AdapterLuid (gpu.rs already reads desc per adapter) is the documented way to tie the MFT to the device; keep MFTEnumEx as a fallback for systems where MFTEnum2 is unavailable."
+   }
+  ]
+ },
+ {
+  "id": "VP-42",
+  "title": "fps choices up to panel refresh exceed H.264 Level 5.2 at 1440p/4K (S3)",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/capture.rs"
+  ],
+  "claim": "The fps choices go up to the panel's refresh (165/240). At 1440p/4K that exceeds H.264 Level 5.2 (1440p ≤ ~144 fps, 4K ≤ ~64 fps).",
+  "scenario": "The MFT may refuse the media type or emit out-of-level streams.",
+  "fix": "Not given explicitly in the report (implied: cap fps per resolution/level).",
+  "reported_confidence": "speculative",
+  "slice": "03-video-pipeline",
+  "status": "unverified",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "unverifiable",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/src/capture.rs:598-606 `const STEPS = [30, 60, 120]; ... choices.push(refresh)` - fps up to panel refresh regardless of resolution; fit_to_target (capture.rs:641) only snaps fps to those steps. UI mirrors it: src/routes/Recording.tsx:14 `const HEIGHTS = [720, 1080, 1440, 2160]` and fpsChoices (Recording.tsx:27-30). Encoder sets only profile: mft.rs:780 `output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High...)`; no MF_MT_MPEG2_LEVEL / level anywhere (grep empty), and frame rate goes in as `MF_MT_FRAME_RATE` (mft.rs:523). A SetOutputType refusal propagates as Err 'Ausgabetyp: ...' (mft.rs:791-793). Arithmetic is right: Level 5.2 MaxMBPS 2,073,600 / 14,400 MB (1440p) = 144 fps; / 32,400 MB (2160p) = 64 fps.",
+    "corrected_claim": "Confirmed in code: 1440p at 165/240 and 2160p at 120/144+ can be configured, and no level is requested or capped. But Level 5.2 is not the top H.264 level (6.0-6.2 cover these rates), and since the app requests no level the MFT picks one itself. The outcome rests on driver behaviour not checkable here: a hardware MFT that auto-selects 6.x produces a valid stream (some hardware decoders may still reject it); one limited to 5.2 may refuse SetOutputType (recording fails loudly with 'Ausgabetyp') or mislabel the stream; and the encoder may simply lack the throughput.",
+    "reachable_by": "Users with 1440p >144 Hz or 4K >=120 Hz panels who pick the high fps option (the UI marks the refresh rate as '(source)').",
+    "fix_assessment": "Capping fps per resolution (or reading the encoder's supported level and frame-rate range) in fps_choices and the UI would prevent it, but it needs real-hardware evidence first; at minimum, log the level the encoder chose so field reports can tell."
+   }
+  ]
+ },
+ {
+  "id": "VP-7",
+  "title": "No device-removed / encoder-death detection or recovery; errors only logged and a stale ring is saved as current",
+  "severity": "high",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/mft.rs:1312",
+   "src-tauri/src/mft.rs:1344",
+   "src-tauri/src/mft.rs:1174-1176",
+   "src-tauri/src/mft.rs:1284-1290",
+   "src-tauri/src/pipeline.rs:605-609"
+  ],
+  "claim": "Encoder failures are only logged: mft.rs:1312 and mft.rs:1344 are both `Err(err) => log::warn!(\"{err}\")`; mft.rs:1174-1176 is `Disconnected => log::warn!(\"encoder has stopped — one frame is lost\"); return false;`; the encoder thread exits quietly on event-queue errors (mft.rs:1284-1290). Nothing calls GetDeviceRemovedReason, and only `dropped` is counted (pipeline.rs:605-609). Shared::report() is only called on the capture path and only the first error per run is surfaced, so no banner appears and no restart happens.",
+  "scenario": "A TDR or driver reset mid-game (also driver update, eGPU unplug, hybrid GPU switch): WGC stops delivering, the pacer repeats the last slot, the MFT fails or shuts down. The log gets ~60 warn lines per second and dropped climbs, but no banner appears. The ring keeps its pre-failure packets so 'Save clip' writes minutes-old footage as 'the last 30 s', or the ring silently fills with a frozen frame.",
+  "fix": "Send encoder/D3D errors through Shared::report. Add a status-tick watchdog: no new packet for more than 2 s, or GetDeviceRemovedReason() != S_OK, reports and auto-restarts with a new device. Treat D2DERR_RECREATE_TARGET the same way, and flag saves whose newest packet is stale.",
+  "reported_confidence": "likely",
+  "slice": "03-video-pipeline",
+  "status": "not-verified",
+  "final_severity": "high",
+  "votes": []
+ },
+ {
+  "id": "VP-10",
+  "title": "Recorder job queue is an unbounded std mpsc channel",
+  "severity": "medium",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/recorder.rs:146"
+  ],
+  "claim": "The recorder taps packets and audio blocks to its writer thread over `let (tx, rx) = channel::<Job>();` (recorder.rs:146), an unbounded std mpsc channel with no backpressure or fail policy.",
+  "scenario": "A slow or sleeping HDD, NAS, USB drive or AV scan stalls the writer; video (~5 MB/s at 40 Mbit) plus PCM per source piles up in RAM indefinitely.",
+  "fix": "Use a byte-bounded channel with an explicit fail-and-stop policy.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "VP-11",
+  "title": "Recorder file I/O runs while holding the packet-ring and tracks locks",
+  "severity": "medium",
+  "category": "perf",
+  "locations": [
+   "src-tauri/src/pipeline.rs:954-964",
+   "src-tauri/src/recorder.rs:306-322"
+  ],
+  "claim": "pipeline.rs:954 takes `let ring = self.shared.packets.lock();` and Recorder::start (create_dir_all, File::create, meta write + rename, thread spawn) runs at pipeline.rs:964 while that lock is held. open_track (recorder.rs:306-322) writes meta.json from the mixer thread while holding shared.tracks.",
+  "scenario": "Starting a recording on slow storage blocks the encoder's on_packet (which locks Shared.packets), so in_flight grows, submits wait or drop, and the NV12 slot-overwrite problem (VP-2) gets worse. Meta writes on slow disks stall the mixer.",
+  "fix": "Do the file creation before taking the lock and only install the recorder under it. Move the meta writes into the writer thread.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "VP-13",
+  "title": "Recording free-space guard ignores mix.pcm and stems, so finalize fails on long multi-source recordings",
+  "severity": "medium",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/lib.rs:894-895",
+   "src-tauri/src/recorder.rs:580-583"
+  ],
+  "claim": "The room guard is `if free < needed + RECORDING_SPARE_BYTES` with `needed = estimated mp4 size` (lib.rs:894-895). It does not account for finalize's sum_tracks writing mix.pcm (recorder.rs:580-583) or per-track stems.",
+  "scenario": "A 2-hour recording with two or more main-mix sources: sum_tracks writes mix.pcm at ~691 MB/h, which the 512 MB spare can't cover. Finalize fails, the folder is kept, and it fails the same way on every start.",
+  "fix": "Count mix PCM and stems in the guard, or skip pre-summing and let ffmpeg amix all the PCMs.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "VP-14",
+  "title": "VideoProcessor auto-processing is not disabled, so driver enhancements may alter footage",
+  "severity": "medium",
+  "category": "quality",
+  "locations": [
+   "src-tauri/src/convert.rs:141-168"
+  ],
+  "claim": "The VideoProcessor setup (convert.rs:141-168) only sets colour spaces; there is no `VideoProcessorSetStreamAutoProcessingMode(.., FALSE)`. Auto-processing is on by default.",
+  "scenario": "Driver 'enhancement' features (sharpening, denoise, RTX video enhancement) may alter the captured footage.",
+  "fix": "Disable auto-processing with VideoProcessorSetStreamAutoProcessingMode(.., FALSE).",
+  "reported_confidence": "likely",
+  "slice": "03-video-pipeline",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "VP-15",
+  "title": "VideoProcessor content description uses output size and sets no rects, so a resized window is stretched",
+  "severity": "medium",
+  "category": "quality",
+  "locations": [
+   "src-tauri/src/convert.rs:141-168",
+   "src-tauri/src/wgc.rs:229-242",
+   "src-tauri/src/state.rs:774"
+  ],
+  "claim": "The content description in convert.rs:141-168 uses `InputWidth: width, InputHeight: height`, i.e. the output size rather than the source size, and no stream source/destination rectangle or background colour is set. The WGC frame pool is recreated on size change (wgc.rs:229-242) but window capture does not restart (state.rs:774).",
+  "scenario": "A window resized after start is stretched to the fixed encoder size.",
+  "fix": "Set stream source and destination rects that preserve aspect (letterbox) with a black background, and use the real source size in the content description.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "VP-16",
+  "title": "ffmpeg/ffprobe runs have no timeout and no kill-on-close job object",
+  "severity": "medium",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/muxer.rs:65-68",
+   "src-tauri/src/muxer.rs:432-458",
+   "src-tauri/src/muxer.rs:476-488",
+   "src-tauri/src/edit.rs:749-796",
+   "src-tauri/src/muxer.rs"
+  ],
+  "claim": "muxer::run uses `command.output()` (muxer.rs:65-68); run_reporting (muxer.rs:432-458) does `.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()` then `child.wait()`; ffprobe (muxer.rs:476-488) uses `.output()`. None has a timeout/kill, and children are not placed in a job object with KILL_ON_JOB_CLOSE.",
+  "scenario": "A network share vanishes mid-write: ffmpeg blocks forever, SavingGuard stays set, and every later save says 'already being saved' until restart. A crash during a save leaves an orphaned ffmpeg process.",
+  "fix": "Put ffmpeg/ffprobe in a job object with KILL_ON_JOB_CLOSE; wait with a timeout and kill.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "AU-17",
+    "slice": "04-audio-edit",
+    "title": "No cancel, timeout or kill for ffmpeg, and it runs at normal priority next to the game",
+    "claim": "The ffmpeg runner in edit.rs:749-796 (and the muxer's `run`) has no Job Object, `kill`, `try_wait` or timeout anywhere in the crate (grep-confirmed). A hung hardware encoder holds `edit::WORKING` forever; on app exit ffmpeg children are orphaned (Windows does not kill children); x264 `-preset medium` exports started from the in-game console compete with the game at normal priority.",
+    "locations": [
+     "src-tauri/src/edit.rs:749-796",
+     "src-tauri/src/muxer.rs"
+    ],
+    "fix": "Put children in a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; use `BELOW_NORMAL_PRIORITY_CLASS`; add a cancel token that kills the child and a stall watchdog when `out_time` stops advancing; consider `-hwaccel d3d11va` for decoding."
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "VP-17",
+  "title": "ffmpeg inherits the parent's stdin (no Stdio::null, no -nostdin)",
+  "severity": "medium",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/muxer.rs:432-458"
+  ],
+  "claim": "run_reporting (muxer.rs:432-458) spawns ffmpeg with piped stdout/stderr but no stdin setting and without `-nostdin`, so stdin is inherited.",
+  "scenario": "When the app is started from a console, ffmpeg reads that console's stdin.",
+  "fix": "Use Stdio::null() for stdin plus -nostdin.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "VP-18",
+  "title": "Orphaned .part.mp4 files in the clip folder are never cleaned up",
+  "severity": "medium",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/muxer.rs:323",
+   "src-tauri/src/lib.rs:677-688",
+   "src-tauri/src/edit.rs:422"
+  ],
+  "claim": "The in-progress output `<stem>_<id>.part.mp4` is written beside the target clip (muxer.rs:323), but the startup leftover cleanup (lib.rs:677-688) only cleans data_dir/temp.",
+  "scenario": "A crash during a save leaves a `<stem>_<id>.part.mp4` in the user's clip folder forever.",
+  "fix": "Sweep stale *.part.mp4 at startup.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "AU-43",
+    "slice": "04-audio-edit",
+    "title": "Temp files litter the user's clip folder after a crash",
+    "claim": "Edit temp files `*.{pid}.neu.mp4` (edit.rs:422) and export files `\"{stem} (N MB).mp4\"` are written into the user's clip folder and are never cleaned up after a crash.",
+    "locations": [
+     "src-tauri/src/edit.rs:422"
+    ],
+    "fix": "No explicit fix given; implied: clean up stale temp files (e.g. in `repair`)."
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "VP-19",
+  "title": "Closed or recreated window is never recovered during window capture",
+  "severity": "medium",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/pipeline.rs:689-695",
+   "src-tauri/src/state.rs:772-776"
+  ],
+  "claim": "The WGC Closed handler only sets a flag and reports once (pipeline.rs:689-695). Drift detection returns None for windows: `|| config.target_kind != TargetKind::Monitor` (state.rs:772-776), so nothing restarts or re-targets capture.",
+  "scenario": "The game window closes or restarts with a new HWND. After one banner, the buffer encodes the last frame forever.",
+  "fix": "Stop the buffer, or re-resolve the window by process and restart.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "VP-30",
+  "title": "halt_pipeline holds the pipeline mutex during the stop",
+  "severity": "medium",
+  "category": "quality",
+  "locations": [
+   "src-tauri/src/state.rs:559-561",
+   "state.rs:559"
+  ],
+  "claim": "state.rs:559-561 is `if let Some(mut pipeline) = self.pipeline.lock().take() { pipeline.stop(); }`; under Rust 2021 the temporary lock guard lives across stop().",
+  "scenario": "is_buffering, save and start callers block for up to the 2 s drain.",
+  "fix": "Bind the take() result to a local first.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "ST-8",
+    "slice": "07-state-concurrency",
+    "title": "halt_pipeline holds the pipeline lock during the whole Pipeline::stop",
+    "claim": "state.rs:559: `if let Some(mut pipeline) = self.pipeline.lock().take() { pipeline.stop(); }`. In edition 2021 the guard temporary lives through the whole `if let`, so the `pipeline` mutex is held across `Pipeline::stop`'s joins (the entire encoder drain).",
+    "locations": [
+     "state.rs:559"
+    ],
+    "fix": "`let p = self.pipeline.lock().take(); if let Some(mut p) = p { p.stop(); }`"
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "VP-8",
+  "title": "Hardware MFT is never shut down (no IMFShutdown / ShutdownObject / SET_D3D_MANAGER(0))",
+  "severity": "medium",
+  "category": "robustness",
+  "locations": [
+   "src-tauri/src/mft.rs:716",
+   "src-tauri/src/mft.rs:1440-1444"
+  ],
+  "claim": "The MFT is created by `candidates[pick].activate.ActivateObject()` (mft.rs:716) and the IMFActivate is dropped at the end of build. The run ends with only `ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0)` (mft.rs:1440-1444). There is no IMFShutdown::Shutdown, no IMFActivate::ShutdownObject, and no MFT_MESSAGE_SET_D3D_MANAGER(0). Media Foundation makes the caller of ActivateObject responsible for shutdown, and async MFTs own event queues and worker threads.",
+  "scenario": "Some vendor MFTs keep the encoder session, device manager and D3D device alive. Each buffer restart can leak an NVENC/AMF session until the consumer session cap is hit and 'Buffer will not start' appears, along with VRAM growth.",
+  "fix": "Store the activate object. After the drain: SET_D3D_MANAGER(0), then cast::<IMFShutdown>()?.Shutdown(), then activate.ShutdownObject(). Send MFT_MESSAGE_NOTIFY_END_OF_STREAM before COMMAND_DRAIN.",
+  "reported_confidence": "likely",
+  "slice": "03-video-pipeline",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "VP-9",
+  "title": "Replay ring length and byte limits are not enforced when only one keyframe exists",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "src-tauri/src/buffer.rs:93",
+   "src-tauri/src/buffer.rs:128"
+  ],
+  "claim": "Trimming in the ReplayBuffer only runs `while self.keyframes.len() > 1 {` (buffer.rs:93), and the no-keyframe safety net returns early with `if !self.keyframes.is_empty() || self.packets.is_empty() { return; }` (buffer.rs:128). With exactly one keyframe neither the pts-length nor the byte-budget limit applies and the safety net is skipped, so the ring grows without bound. The GOP read-back from the encoder is only logged. Existing tests only cover zero or many keyframes.",
+  "scenario": "An encoder ignores the GOP setting (infinite GOP or intra-refresh) and sends only its initial IDR; the ring grows until OOM. (Report: the logic is confirmed, the trigger is speculative.)",
+  "fix": "If no keyframe arrives within 2× GOP, force one (CODECAPI_AVEncVideoForceKeyFrame). When over budget with a single GOP, drop the ring and wait for the next IDR (memory should win, as the module's own doc says). Add a unit test for the single-keyframe case.",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "VP-35",
+  "title": "sum_tracks duplicates write_mix_wav",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src-tauri/src/recorder.rs",
+   "src-tauri/src/pipeline.rs"
+  ],
+  "claim": "recorder::sum_tracks duplicates the mixing logic of write_mix_wav.",
+  "scenario": "Duplicate mixing code that can diverge.",
+  "fix": "Not given explicitly in the report (implied: share one implementation).",
+  "reported_confidence": "confirmed",
+  "slice": "03-video-pipeline",
+  "status": "refuted",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "refuted",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/src/pipeline.rs:222-234 write_mix_wav: allocates `vec![0i16; frames * CHANNELS]`, sums `track.window(from_100ns, frames)` from the in-memory TrackRings, then `write_wav(path, &sum)` (with a RIFF header). src-tauri/src/recorder.rs:453-485 sum_tracks: opens the files, streams 64 KiB blocks through `read_full`, tracks `longest` per block, and writes headerless PCM through a BufWriter. Its doc comment gives the reason it is separate: \"block by block — an hour of audio per source does not go through memory in one piece. Saturating, like `pipeline::write_mix_wav`\". The only code in common is the one expression `*slot = slot.saturating_add(sample)` (pipeline.rs:230 vs recorder.rs:476).",
+    "corrected_claim": "The two functions share only the one-line rule for combining samples (a saturating i16 add), and the code cross-references it on purpose. Everything else differs, and has to: the sources (TrackRing windows in memory vs PCM files streamed from disk), the output (a WAV with a header vs raw PCM), and the length rule (a fixed frame count vs the longest input). That is not duplicated mixing logic.",
+    "reachable_by": "Nothing at runtime. At most, a maintainer who changes the saturation policy has to touch two one-liners. The doc comment already points from one to the other.",
+    "fix_assessment": "\"Share one implementation\" is not practical without forcing in-memory rings and streamed files behind one abstraction. At most, a 3-line `fn mix_into(dst: &mut [i16], src: impl Iterator<Item=i16>)` helper could be shared, and that gains almost nothing."
+   }
+  ]
+ }
+]

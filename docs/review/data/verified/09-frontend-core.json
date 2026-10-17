@@ -1,0 +1,1612 @@
+[
+ {
+  "id": "FC-1",
+  "title": "UI config copy goes stale: patchConfig sends the whole stale config and ignores the core's corrected reply",
+  "severity": "high",
+  "category": "bug",
+  "locations": [
+   "src/store.ts:362-373",
+   "src/lib/ipc.ts:47",
+   "src-tauri/src/commands.rs:55-59",
+   "src-tauri/src/commands.rs:72-81",
+   "src-tauri/src/state.rs:367",
+   "src-tauri/src/lib.rs:472-507",
+   "src-tauri/src/lib.rs:542",
+   "src-tauri/src/lib.rs:586",
+   "src-tauri/src/commands.rs:110-118",
+   "src/routes/Recording.tsx:353-356"
+  ],
+  "claim": "patchConfig in src/store.ts:362-373 does `const config = { ...get().config, ...patch }; set({ config }); ... await api.setConfig(config);`, and src/lib/ipc.ts:47 types it as `setConfig: (config: AppConfig) => invoke<void>(\"set_config\", { config })` (also listed under the report's IPC-contract-drift finding: setConfig is typed void but the command returns a config). The core command actually returns AppConfig (commands.rs:55-59) after rewriting it: while a recording runs, a source change is reverted and the core calls `crate::notify(&app, \"error\", \"Stop the recording before changing the source.\")` (commands.rs:72-81); the encoder is replaced by `encode::resolve(...)` (state.rs:367); accent colours are cleaned. The UI discards that reply and keeps (and later resends) its own uncorrected whole config. The core also edits the config on its own and never tells the UI: `repair_screens()` (lib.rs:472-507, called on monitor changes at lib.rs:542 and :586) rewrites `recording.target_id`, the overlay screen and the console screen; there is no `config-changed` event.",
+  "scenario": "(a) During a recording the user picks another monitor; the core refuses but the tile stays \"Selected\". Every later unrelated toggle (a sound, the watermark) resends that target and shows the error toast again; once the recording stops, the next unrelated toggle silently applies the change and restarts the buffer (commands.rs:110-118), discarding buffered footage. (b) The user plugs/unplugs a monitor and `\\\\.\\DISPLAYn` is renumbered; the next unrelated setting change sends the old `targetId`, `target_changed` is true, the replay buffer restarts and everything it held is lost. (c) The user selects an encoder marked \"(not available)\" (selectable, Recording.tsx:353-356); UI and Dashboard keep showing it while the core runs a fallback.",
+  "fix": "1) Type `set_config` as `invoke<AppConfig>` and apply the reply behind a version guard (same ticket pattern as `clips-changed` at store.ts:301): `const v = ++cfgVersion; const next = await api.setConfig(config); if (v === cfgVersion) set({ config: next });`. 2) Emit `config-changed` from the core after `repair_screens`, the tray hint and token changes, and listen for it in `init`. 3) Better: replace the whole-config write with a core-side merged `patch_config(patch)`.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "impact",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src/store.ts:362-366 `const config = { ...get().config, ...patch }; set({ config }); ... await api.setConfig(config);` (reply discarded). src/lib/ipc.ts:47 `setConfig: (config: AppConfig) => invoke<void>(\"set_config\", { config })`. src-tauri/src/commands.rs:55-59 `pub fn set_config(...) -> AppConfig`, :72-81 reverts target while `state.is_recording()` and `crate::notify(&app, \"error\", \"Stop the recording before changing the source.\")`, :114-119 `let target_changed = ... next.recording.target_id != previous.recording.target_id ...; if target_changed && state.is_buffering() { state.stop_pipeline(); crate::start_buffer_and_notify(&app); }`. src-tauri/src/state.rs:367 `next.recording.encoder = crate::encode::resolve(next.recording.encoder);` (encode.rs:164-170 falls back to preferred_encoder). src-tauri/src/lib.rs:472-507 repair_screens mutates `config.recording`/overlay/console under the lock and only saves, no emit; called from watch_monitors lib.rs:542 and the drift restart lib.rs:586. capture.rs:548-551 repair rewrites `id` to the current device name when found by stable id. No `config-changed` emitter exists (grep of src-tauri/src for emit with config: none); the UI reads config only once at init (store.ts:263). Recording.tsx:242-248 tile click has no is-recording guard; Recording.tsx:352-356 unavailable encoders remain selectable. capture.rs:418-425 pick resolves by stable id first, so the restarted buffer in (b) lands on the right screen; the loss is the spurious restart itself. Partial mitigations already exist for other core-side edits: commands.rs:66 empty-token guard and :82 keep_once_flags (tray hint / usage notice).",
+    "corrected_claim": "",
+    "reachable_by": "Any local user through normal UI use: (a) picking another monitor tile during a manual recording, then toggling any other setting; (b) a monitor hot-plug/dock/driver reset that renumbers \\\\.\\DISPLAYn while the app is open (needs a stable panel id, which repair requires), followed by any settings change while the replay buffer runs; (c) choosing an encoder marked '(not available)'. No remote or untrusted input involved.",
+    "fix_assessment": "Fix 1 (type set_config as AppConfig and apply the reply behind a version ticket) is correct and fixes (a) and (c); fix 2 is needed for (b), but the tray-hint and token parts are already guarded in the core (commands.rs:66, :82). A smaller core-only fix for the buffer loss in (b): in set_config, when the incoming target_stable_id equals previous.target_stable_id (and is Some), keep previous.target_id before computing target_changed (or run capture::repair on the incoming recording/overlay/console choice only when the device name differs). That way a stale page cannot trigger a restart, without running a monitor enumeration on every slider move. Fix 3 (core-side merged patch_config) is the robust long-term option."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src/store.ts:362-367 `const config = { ...get().config, ...patch }; set({ config }); ... await api.setConfig(config);` (reply discarded). src/lib/ipc.ts:47 `setConfig: (config: AppConfig) => invoke<void>(\"set_config\", { config })`. src-tauri/src/commands.rs:54-58 `pub fn set_config(...) -> AppConfig`; :70-81 while `state.is_recording()` and the target differs it copies previous target_kind/id/stable_id back and `crate::notify(&app, \"error\", \"Stop the recording before changing the source.\")`; :82-84 clean_accent on both accents; :110-118 `target_changed && state.is_buffering()` -> `state.stop_pipeline(); crate::start_buffer_and_notify(&app);`; returns `next` at :157. src-tauri/src/state.rs:367 `next.recording.encoder = crate::encode::resolve(next.recording.encoder);` and encode.rs:164-171 falls back to preferred_encoder() when unavailable. src-tauri/src/lib.rs:472-507 repair_screens mutates config.recording/overlay/console_monitor under the lock and only saves to disk (no emit); called from watch_monitors (lib.rs:542) and watch_screen (lib.rs:586). capture.rs:548-551 rewrites target_id when the stable id now resolves to another device name. No `config-changed` event exists anywhere (grep of src-tauri/src and src). Recording.tsx:149-152 isPicked uses the UI's own rec; Recording.tsx:351-356 + Controls.tsx:152-155 render unavailable encoders as normal selectable <option>s; Dashboard.tsx:170 shows `config.recording.encoder`. The main window is only hidden on close (lib.rs:1276-1278, 1125), so the stale copy lives for the whole process. The authors already know the page is stale: config.rs:189-192 keep_once_flags and its test 'a_stale_settings_page_cannot_take_back_a_shown_notice' ('The page still holds the config it loaded at start and sends all of it with the next change').",
+    "corrected_claim": "",
+    "reachable_by": "Ordinary UI use: (a) picking a monitor/window tile during a manual recording, then toggling any other setting; (b) a monitor plug/unplug/renumber while the app runs (watch_monitors/watch_screen call repair_screens), followed by any patchConfig write - including the Recording page's own auto-fit useEffect (Recording.tsx:186-199) which calls setRec on open when size/fps no longer fit; (c) choosing an encoder labelled '(not available)'. The stale copy is only refreshed by the commands whose replies are applied (setHotkeys, setClipDir, regenerateControlToken, add/update/removeAudioSource).",
+    "fix_assessment": "Typing set_config as invoke<AppConfig> and applying the reply behind a monotonically increasing ticket fixes (a) and (c); (b) additionally needs a core-to-UI notification after repair_screens (which currently only takes &AppState, so an AppHandle must be plumbed in and the emit done after the lock is released). A core-side merged patch_config is the most robust option since it also stops a stale page from overwriting fields the core changed on its own."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src/store.ts:362-373 `const config = { ...get().config, ...patch }; set({ config }); ... await api.setConfig(config);` (reply ignored). src/lib/ipc.ts:47 `setConfig: (config: AppConfig) => invoke<void>(\"set_config\", { config })` while commands.rs:55-59 `pub fn set_config(...) -> AppConfig`. commands.rs:71-81: when `state.is_recording()` and target differs, the target is copied back from `previous` and `crate::notify(&app, \"error\", \"Stop the recording before changing the source.\")`. commands.rs:114-121: `target_changed ... if target_changed && state.is_buffering() { state.stop_pipeline(); crate::start_buffer_and_notify(&app); }`. state.rs:367 `next.recording.encoder = crate::encode::resolve(next.recording.encoder);` (encode.rs:164-171 falls back to preferred_encoder). lib.rs:472-507 repair_screens rewrites recording.target_id/overlay.monitor/console_monitor in place via config.lock() with no emit; capture.rs:548-551 sets `*id = Some(choice.target.id.clone())` when matched by stable id; called from watch_monitors (lib.rs:542) on the status tick (lib.rs:1024) and from watch_screen (lib.rs:586). UI loads config only once at init (store.ts:263); grep finds no config-changed listener. Recording.tsx:240-249 TargetCard onPick has no recording guard (TargetCard props at :512-519 have no disabled); isPicked derives from the UI copy. Recording.tsx:352-357 offers unavailable encoders as options; Dashboard.tsx:170 shows `config.recording.encoder` from the UI copy.",
+    "corrected_claim": "Accurate in mechanism and location. Two minor corrections: (1) the delayed source change after the recording stops is not fully silent - start_buffer_and_notify (lib.rs:345-361) shows a 'Replay buffer running' toast/banner and plays a sound - but it happens on an unrelated toggle and still discards the buffered footage; (2) the staleness is partly self-healing: setHotkeys, setClipDir, regenerateControlToken, upsertSource and removeSource (store.ts:392-429) replace the UI copy with the core's reply, so any of those actions resyncs it. Additional consequence not in the claim: after a runtime renumber (scenario b) while a recording runs, every unrelated toggle also triggers the 'Stop the recording before changing the source.' error toast.",
+    "reachable_by": "The user in ordinary use, from the main window. (a) Pick a different monitor/window tile on the Video page while a recording runs, then change any other setting that goes through patchConfig (Behaviour, Banner, Console, Friends, sounds, etc.). (b) No mistake needed: a monitor hot-plug, a dock, or a display waking from sleep that makes Windows hand out a new \\\\.\\DISPLAYn while ClippiBoy runs; watch_monitors repairs the core copy every tick, and the next settings change from the UI restarts the buffer. (c) Choose an encoder labelled '(not available)'. Likelihood: (b) and (c) are fairly common on multi-monitor setups and with hardware encoders missing; (a) is rarer. The loss is the in-memory replay buffer (minutes of footage), not saved clips.",
+    "fix_assessment": "Part 1 (type the reply as AppConfig and apply it behind a monotonic ticket, like clips-changed at store.ts:301) fixes (a) and (c) and is cheap. On its own it does not fix (b), because the core's repair_screens never reaches the UI. That needs part 2 (emit config-changed after repair_screens and listen in init) or part 3 (a core-side merged patch_config), and part 3 also removes the whole-config-resend class of bugs."
+   }
+  ]
+ },
+ {
+  "id": "FC-10",
+  "title": "Hotkey recorder cannot be started from the keyboard; recorder/Unbind buttons not tied to row labels",
+  "severity": "medium",
+  "category": "a11y",
+  "locations": [
+   "src/routes/settings/Hotkeys.tsx:329-333"
+  ],
+  "claim": "In settings/Hotkeys.tsx:329-333 recording starts only on `onMouseDown`; Enter/Space fire `click`, not mousedown, so keyboard users cannot assign hotkeys. The recorder button and the \"Unbind\" buttons are not associated with their row labels.",
+  "scenario": "A keyboard-only user tabs to a hotkey recorder and presses Enter or Space; nothing starts recording, so they cannot assign hotkeys. Screen readers announce the buttons without the row's label.",
+  "fix": "Add an `onClick`/`onKeyDown` path to start recording, and tie the recorder and Unbind buttons to their row labels.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src/routes/settings/Hotkeys.tsx:326-333 the recorder <button type=\"button\"> has only `onMouseDown={(event) => { event.stopPropagation(); setRecording((on) => !on); }}` -- no onClick or onKeyDown. The only keydown listener (Hotkeys.tsx:296-317, `window.addEventListener(\"keydown\", onKeyDown, true)`) is installed inside `useEffect(() => { if (!recording) return; ...` so it exists only after recording has started. Keyboard activation of a <button> (Enter/Space) dispatches `click`, never `mousedown`, so Tab+Enter/Space does nothing. grep finds no other HotkeyInput or synthetic mousedown dispatch in src. Labels: Row renders its label as `<p className=\"text-sm font-medium\">{label}</p>` (settings/shared.tsx:66) with no id/aria wiring; the recorder button's name is its content (kbd keys or \"Not set\"/\"Press a key ...\"), and every Unbind button is `aria-label=\"Unbind\"` (Hotkeys.tsx:356-357), identical across the five rows (Hotkeys.tsx:176-254).",
+    "corrected_claim": "",
+    "reachable_by": "Any keyboard-only or screen-reader user on Settings > Hotkeys (all five rows: Save clip, Buffer on/off, Screenshot, Recording, Console). Mouse users are unaffected.",
+    "fix_assessment": "Do not simply add onClick next to the existing onMouseDown toggle: a mouse click would fire both and toggle twice. Move the toggle to onClick, keep onMouseDown only for stopPropagation (so the window mousedown listener at Hotkeys.tsx:310 does not end recording), and give the recorder and Unbind buttons names that include the row label (e.g. aria-label=`Unbind ${label}` / aria-labelledby the Row label id)."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src/routes/settings/Hotkeys.tsx:326-333: `<button type=\"button\" disabled={busy} onMouseDown={(event) => { event.stopPropagation(); setRecording((on) => !on); }}` - no onClick/onKeyDown, and recording is the only path to onChange with a new value (keydown listener installed only `if (!recording) return;` at :291-292). Keyboard activation of a <button> (Enter on keydown, Space on keyup) dispatches only `click`, never `mousedown`, so Tab+Enter/Space does nothing. Labels: Row (settings/shared.tsx:63-70) renders `<p className=\"text-sm font-medium\">{label}</p>` with no id/htmlFor; the recorder button's name is its content (kbd keys / \"Not set\" / \"Press a key …\") and the unbind button is `aria-label=\"Unbind\"` (Hotkeys.tsx:354-355) on all five rows (Save clip, Buffer on/off, Screenshot, Recording start/stop, Console, :176-252). The hint text at :256 even says \"Click and press the key you want\".",
+    "corrected_claim": "",
+    "reachable_by": "Ordinary use by a keyboard-only or screen-reader user in Settings > Hotkeys. Not a security issue. Defaults exist (config.rs:47 `save_clip_hotkey: \"Ctrl+Shift+S\"`, model.rs:384 `Alt+C`), so such a user keeps the default bindings and can still unbind via the × button (which has onClick), but cannot assign or change any of the five hotkeys.",
+    "fix_assessment": "Moving the toggle to onClick (keeping the mousedown stopPropagation, or ignoring the button in the window mousedown listener) fixes keyboard start; with Enter the click fires during keydown before the effect installs its capture listener, so the same keystroke is not recorded. Give the Row label an id and point aria-labelledby (or an aria-label like `Unbind ${label}`) at it for both buttons."
+   }
+  ]
+ },
+ {
+  "id": "FC-11",
+  "title": "Most Toggles have no accessible name",
+  "severity": "medium",
+  "category": "a11y",
+  "locations": [
+   "src/routes/settings/shared.tsx:54-71",
+   "src/routes/settings/Behaviour.tsx:226",
+   "src/routes/settings/Banner.tsx",
+   "src/routes/settings/Console.tsx",
+   "src/routes/settings/Friends.tsx",
+   "src/routes/settings/Sounds.tsx",
+   "src/routes/AudioMixer.tsx:578"
+  ],
+  "claim": "24 of 33 `<Toggle>`s have no `label`, because `Row` renders its label in a `<p>` (settings/shared.tsx:54-71) without wiring it to the control; examples: Behaviour.tsx:226, Banner, Console, Friends, Sounds settings, and `QuickSetup` at AudioMixer.tsx:578.",
+  "scenario": "A screen-reader user reaches a toggle in Settings and hears only \"switch, on/off\" with no name.",
+  "fix": "Add a `ToggleRow` that wires `aria-labelledby` to the row label.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ui/Controls.tsx:17-35: `<button role=\"switch\" aria-checked={checked} aria-label={label} ...><span .../></button>` - the only name source is the optional `label` prop; the content is an empty span. src/routes/settings/shared.tsx:63-70 Row renders the label as a bare `<p>` with no id, no <label>, and does not pass it to children. A scan of all 33 `<Toggle` uses in src/ finds only one with `label=` (AudioMixer.tsx:431-432 `label={`${source.label} enabled`}`); the other 32 have none, e.g. Setup.tsx:341/344/347, StreamDeck.tsx:61, Friends.tsx:34,37,44,50,80,83,92,95,98,104, Sounds.tsx:42,98, Banner.tsx:36,42,49,56,63,73,80,174, Console.tsx:37,131,141, Behaviour.tsx:18,33,40,48, AudioMixer.tsx:578 `<Toggle checked={row.on} onChange={row.set} />`. Behaviour.tsx has only 56 lines, so the cited Behaviour.tsx:226 does not exist. No aria-labelledby anywhere in src (grep finds only one htmlFor, in ExportDialog.tsx:165).",
+    "corrected_claim": "The defect is real and wider than stated: 32 of 33 Toggles (not 24) have no accessible name, including the three in the first-run Setup (Setup.tsx:341-347) and the Stream Deck control-port switch (StreamDeck.tsx:61). The Behaviour.tsx:226 location is wrong; its unnamed toggles are at lines 18, 33, 40 and 48. The Sounds.tsx:98 per-sound toggles are not even inside a Row, so a ToggleRow alone would not cover them.",
+    "reachable_by": "Ordinary use by a screen-reader user on any Settings tab, the first-run Setup and the Audio Mixer quick setup. Sighted keyboard users are unaffected (switches can be focused and toggled with Enter/Space via onClick). No security impact.",
+    "fix_assessment": "A ToggleRow (or a Row that creates an id with useId and passes aria-labelledby) fixes the Row-based cases. The Sounds per-kind toggles and AudioMixer QuickSetup rows need an explicit label (for example `${label} sound on`, `${row.title}`), as the AudioMixer.tsx:431 use already does."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src/components/ui/Controls.tsx:5-37 Toggle renders `<button role=\"switch\" aria-checked={checked} aria-label={label} ...>` whose only child is an empty `<span>`, so with `label` undefined it has no accessible name (no text content, no title). settings/shared.tsx:54-71 Row renders `<div ...><div className=\"min-w-0\"><p className=\"text-sm font-medium\">{label}</p>...</div><div className=\"shrink-0\">{children}</div></div>` with no id, <label>, aria-labelledby or htmlFor. Scanning every `<Toggle .../>` in src/**/*.tsx: 33 total, only AudioMixer.tsx:431-432 passes `label={`${source.label} enabled`}`; the other 32 pass none: Setup.tsx:341,344,347; AudioMixer.tsx:578 (`<Toggle checked={row.on} onChange={row.set} />`); StreamDeck.tsx:61; Friends.tsx:34,37,44,50,80,83,92,95,98,104; Sounds.tsx:42,98; Banner.tsx:36,42,49,56,63,73,80,174; Console.tsx:37,131,141; Behaviour.tsx:18,33,40,48. None is wrapped in a <label>.",
+    "corrected_claim": "The defect is real and wider than stated: 32 of 33 Toggles (not 24) have no accessible name. It also covers the first-run Setup.tsx (341/344/347) and StreamDeck.tsx:61. The cited Behaviour.tsx:226 does not exist (the file has 56 lines); Behaviour's unlabelled Toggles are at lines 18, 33, 40 and 48. Sounds.tsx:98 (the per-sound toggle) is not inside a Row and sits next to a plain <p>{label}</p>, so a Row-only fix would not cover it, and neither would it cover AudioMixer.tsx:578.",
+    "reachable_by": "Screen-reader users (Narrator/NVDA over WebView2) on every Settings tab with switches, the first-run Setup screen and the Audio Mixer Quick setup card; they hear 'switch, on/off' with no name.",
+    "fix_assessment": "Having Row generate an id (useId) and pass aria-labelledby (or a ToggleRow wrapper) fixes the ~29 Row-hosted toggles. Sounds.tsx:98 and AudioMixer.tsx:578 sit outside Row and need an explicit label prop (e.g. label={label} / label={row.title})."
+   }
+  ]
+ },
+ {
+  "id": "FC-12",
+  "title": "Recording page selects have no labels",
+  "severity": "medium",
+  "category": "a11y",
+  "locations": [
+   "src/routes/Recording.tsx:292-372"
+  ],
+  "claim": "The Resolution, Frame rate, Quality, Encoder and Keyframe interval selects in Recording.tsx:292-372 have no `label`.",
+  "scenario": "Screen-reader users hear unnamed comboboxes on the Recording page.",
+  "fix": "Give each select an accessible label.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/routes/Recording.tsx:297-386: the five <Select> calls (Resolution, Frame rate, Quality, Encoder, Keyframe interval) pass only value/options/onChange, never `label`. src/components/ui/Controls.tsx:127-145: Select renders `<select aria-label={label} ...>`, so aria-label is undefined. The visible caption comes from the local Row (Recording.tsx:492-508): `<p className=\"text-sm font-medium\">{label}</p>` in a sibling div, with no <label htmlFor>, id or aria-labelledby linking it to the select. A <select> does not take its name from content, so its accessible name is empty. Reached via App.tsx:87 `route === \"recording\" && <Recording .../>` (normal navigation). Other callers do pass the prop (settings/Banner.tsx:95, settings/Console.tsx:69 `label=\"Screen\"`), so the gap is specific to this page.",
+    "corrected_claim": "",
+    "reachable_by": "Ordinary use by a screen-reader user (Narrator/NVDA in WebView2) who opens the Recording page and tabs to the Quality section. In focus mode each control is announced only as 'combo box, <selected value>' with no name. In browse mode the preceding <p> caption is still read in order, which softens the impact. This is not a security issue and no other actor is involved.",
+    "fix_assessment": "Passing `label=\"Resolution\"` etc. to each Select is a five-line fix and uses the existing `label` prop. Wiring Row's caption through an id plus aria-labelledby would also work and would carry the hint as aria-describedby."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src/routes/Recording.tsx:292,315,331,351,364 - all five `<Select value=... options=... onChange=...>` calls pass no `label` prop. src/components/ui/Controls.tsx:127-150 - Select renders `<select aria-label={label} ...>`, so with label undefined React omits aria-label; no id/htmlFor/title is set. src/routes/Recording.tsx:492-508 - local Row renders the visible text only as `<p className=\"text-sm font-medium\">{label}</p>` beside `<div className=\"shrink-0\">{children}</div>`, with no <label>, htmlFor or aria-labelledby linking it to the select. grep finds no `<label`, `htmlFor` or `aria-label` anywhere in Recording.tsx (only aria-pressed at :525 on TargetCard). Card (src/components/ui/Card.tsx:8-20) is a plain div.",
+    "corrected_claim": "",
+    "reachable_by": "Any screen-reader or voice-control user on the Recording page; tabbing to each of the five Quality selects announces only 'combobox' plus the current value, with no name.",
+    "fix_assessment": "Easy and fits the existing API: Select already maps a `label` prop to aria-label, so passing label=\"Resolution\" etc. (or having Row pass its label / wire aria-labelledby with useId) fixes all five."
+   }
+  ]
+ },
+ {
+  "id": "FC-13",
+  "title": "Mixer M/S/⧉ buttons and label input are unnamed and lack state",
+  "severity": "medium",
+  "category": "a11y",
+  "locations": [
+   "src/routes/AudioMixer.tsx:608-633",
+   "src/routes/AudioMixer.tsx:333"
+  ],
+  "claim": "The M/S/⧉ `MiniToggle`s (AudioMixer.tsx:608-633) have no `aria-pressed`/`aria-label`; ⧉ only has a `title`. The source label `<input>` (AudioMixer.tsx:333) is unnamed.",
+  "scenario": "Screen-reader users cannot tell what the mute/solo/⧉ buttons do or whether they are on, and the label field is announced without a name.",
+  "fix": "Add `aria-pressed` and `aria-label` to the MiniToggles and a label to the input.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src/routes/AudioMixer.tsx:608-633 - `function MiniToggle({active, activeClass, onClick, children, title})` renders `<button title={title} onClick={onClick} className={cn(..., active ? activeClass : ...)}>{children}</button>`: no aria-pressed, no aria-label; `active` only changes classes. Call sites :399-429 pass children `M`, `S`, `⧉`; only the third passes `title=\"Own audio track in the MP4\"`. src/routes/AudioMixer.tsx:332-339 - `<input value={source.label} onChange=... className=...>` with no aria-label, placeholder, title, id or wrapping <label>; the enclosing Card (src/components/ui/Card.tsx:8-20) is a plain div. Contrast: neighbouring controls are labelled (Slider label `Volume ${source.label}` :385, Toggle label `${source.label} enabled` :429, aria-label=\"Remove source\" :440).",
+    "corrected_claim": "Small nuance: the M and S buttons are not strictly nameless; their text content gives them the names 'M' and 'S' (and the third gets '⧉' from content, with the title only as description). The real defects are that these names are cryptic, that no on/off state is exposed (no aria-pressed; state is colour-only), and that the label <input> has no accessible name at all.",
+    "reachable_by": "Any screen-reader user on the Audio mixer page, for every audio source row.",
+    "fix_assessment": "Correct and low-risk: add `aria-pressed={active}` and a descriptive `aria-label` prop to MiniToggle (e.g. `Mute ${source.label}`, `Solo ...`, `Own track ...`), and `aria-label={`Name of ${source.label}`}` (or similar) to the input."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/routes/AudioMixer.tsx:608-633: MiniToggle renders `<button title={title} onClick={onClick} className={cn(..., active ? activeClass : ...)}>{children}</button>`. There is no aria-pressed and no aria-label, and `active` reaches only the CSS class. Uses at :399-429: M (muted) and S (solo) pass no title. ⧉ (separateTrack) passes `title=\"Own audio track in the MP4\"`. src/routes/AudioMixer.tsx:333-339: `<input value={source.label} onChange=... className=...>` has no aria-label, id/label or placeholder. In the same row, Toggle gets `label={`${source.label} enabled`}` (:431-433) and Slider gets `label={`Volume ${source.label}`}` (:384-385), so naming is inconsistent within the row. Reached via App.tsx:86 `route === \"audio\" && <AudioMixer />`.",
+    "corrected_claim": "Calling the buttons 'unnamed' is not quite right. Under accname their names come from their content, so they are announced as 'M', 'S' and the glyph '⧉', and the title on ⧉ becomes a description rather than the name. Those names do not say what the buttons do and do not name the source. The real defect is that mute, solo and own-track state is exposed only through color (no aria-pressed), and the label input has no accessible name at all.",
+    "reachable_by": "Ordinary use by a screen-reader user on the Audio mixer page. Each source row repeats three toggle buttons whose on/off state cannot be perceived. This is not a security issue and no other actor is involved.",
+    "fix_assessment": "Adding `aria-pressed={active}` and a required `label` prop (for example `Mute ${source.label}`, `Solo ${source.label}`, `Own track for ${source.label}`) to MiniToggle, plus `aria-label={`Name of ${source.label}`}` or a similar label on the input, fully fixes this and matches how Toggle and Slider are already named."
+   }
+  ]
+ },
+ {
+  "id": "FC-14",
+  "title": "Gallery tile actions stay invisible when keyboard-focused",
+  "severity": "medium",
+  "category": "a11y",
+  "locations": [
+   "src/routes/Clips.tsx:560",
+   "src/routes/Clips.tsx:572"
+  ],
+  "claim": "The heart, folder and delete buttons on tiles use `opacity-0 group-hover:opacity-100` (Clips.tsx:560, :572) with no `focus-visible`/`group-focus-within` reveal.",
+  "scenario": "A keyboard user tabs through the gallery and focus lands on invisible buttons.",
+  "fix": "Reveal the actions on `focus-visible` / `group-focus-within`.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Clips.tsx:560 heart <button> (a real, tabbable button) gets `\"text-white/70 opacity-0 group-hover:opacity-100 hover:text-white\"` when not a favorite; Clips.tsx:572 wrapper div of the IconAction buttons (Show in folder / Delete clip, Clips.tsx:1162-1185, plain <button>s) gets `\"opacity-0 group-hover:opacity-100\"` unless confirming/discarding. Tile wrapper Card has `\"group overflow-hidden\"` (Clips.tsx:436) and no focus-within variant; grep finds no `group-focus`/`focus-within` anywhere in src. The global ring `:focus-visible { outline: 2px solid var(--color-accent) }` (index.css:64) is painted on an element whose own opacity (heart) or ancestor opacity (folder/delete) is 0, so the ring is invisible too. Contrast: Friends.tsx:441/450 and Clips.tsx:1109 already use `focus-visible:opacity-100` for the same pattern.",
+    "corrected_claim": "",
+    "reachable_by": "Ordinary use: any user pressing Tab in the Clips gallery. After the thumbnail button, focus moves onto the heart (when the clip is not yet a favorite), then Show in folder and Delete clip, all invisible, and the focus ring is hidden as well. Enter on the invisible delete only opens ConfirmDelete, which is forced visible, so nothing is deleted by accident. The same actions can also be reached from the clip context menu (clipMenu.tsx:148 favorites, :213 Show in folder, :240 Delete...), e.g. with the Menu key. A mouse-first game-clip app has few keyboard-only users, so real-world impact is small.",
+    "fix_assessment": "The fix is correct and cheap. Add `focus-visible:opacity-100` to the heart button and `group-focus-within:opacity-100` (or `focus-within:opacity-100`) to the action wrapper div, matching what Friends.tsx already does."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src/routes/Clips.tsx:556-561 heart <button> className: clip.favorite ? \"text-live\" : \"text-white/70 opacity-0 group-hover:opacity-100 hover:text-white\"; Clips.tsx:565-573 wrapper div of the folder/delete IconActions: confirming === clip.id || discarding === clip.id ? \"opacity-100\" : \"opacity-0 group-hover:opacity-100\". IconAction (Clips.tsx:1162-1185) is a plain <button> with no tabIndex/focus classes, so it is in the tab order. 'group' is set on the tile Card (Clips.tsx:436). No group-focus-within / focus-visible:opacity rule exists for these (grep: only Friends.tsx:441,450 and Clips.tsx:1109 use focus-visible:opacity-100). The global ring in src/index.css:64-67 (:focus-visible { outline: 2px solid ... }) does not help: opacity 0 on the element or its ancestor also hides the outline.",
+    "corrected_claim": "",
+    "reachable_by": "Any sighted keyboard user tabbing through the Clips gallery: focus goes from the visible tile thumbnail button to an invisible heart (unless already favorited), then invisible 'Show in folder' and 'Delete clip' buttons; Enter on the invisible delete opens the confirm (which then becomes visible).",
+    "fix_assessment": "Correct and cheap: add group-focus-within:opacity-100 (or focus-visible:opacity-100 on the heart and on each IconAction plus group-focus-within on the wrapper), matching the pattern already used in Friends.tsx:441 and Clips.tsx:1109."
+   }
+  ]
+ },
+ {
+  "id": "FC-15",
+  "title": "Dashboard clip cards and Stat cards are clickable divs without keyboard support",
+  "severity": "medium",
+  "category": "a11y",
+  "locations": [
+   "src/routes/Dashboard.tsx:227-231",
+   "src/routes/Dashboard.tsx:300-303"
+  ],
+  "claim": "Dashboard clip cards and Stat cards (Dashboard.tsx:227-231, :300-303) are `div onClick` with no role, `tabIndex` or keyboard handling.",
+  "scenario": "Keyboard and screen-reader users cannot open recent clips or stat targets from the Dashboard.",
+  "fix": "Use buttons/links, or add role, tabIndex and key handling.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/routes/Dashboard.tsx:226-231 <Card key={clip.id} interactive onClick={() => setPlaying(index)} className=\"cursor-pointer overflow-hidden\">; Dashboard.tsx:299-303 Stat: <Card interactive={!!onClick} onClick={onClick} className={cn(\"p-5\", onClick && \"cursor-pointer\")}>. Card (src/components/ui/Card.tsx:8-21) renders a bare <div {...rest}> and 'interactive' only adds hover classes: no role, no tabIndex, no onKeyDown. The arrow inside the clip card (Dashboard.tsx:262-264) is a <span>, not a button. grep for tabIndex/role=/onKeyDown in Dashboard.tsx returns nothing. The codebase already does it properly elsewhere: Recording.tsx:522-533 <Card role=\"button\" tabIndex={0} ... onKeyDown={(e) => { if (e.key === \"Enter\" || e.key === \" \") ...}}>, so the Dashboard cards are the odd ones out.",
+    "corrected_claim": "Accurate as stated, but the impact is narrower than 'cannot open': the same destinations have keyboard paths elsewhere. The Stat targets (Video, Audio) are NavBar <button>s (src/components/NavBar.tsx:24,27,39-42), and the recent clips can be opened from the Clips gallery, reached via the Dashboard's 'See all' <Button> (Dashboard.tsx:206), where each tile thumbnail is a real <button>. What keyboard and screen-reader users lose is the Dashboard shortcut and the in-place ClipPlayer over the recent list.",
+    "reachable_by": "Keyboard-only and screen-reader users on the Dashboard: the recent clip cards and the 'Video' / 'Audio sources' Stat cards are not focusable and are not announced as controls.",
+    "fix_assessment": "Fine: follow the pattern already in src/routes/Recording.tsx:522-533 (Card with role=\"button\", tabIndex={0}, Enter/Space onKeyDown), or better have Card render those itself whenever onClick is set, which fixes both Dashboard sites at once."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Dashboard.tsx:227-231 `<Card key={clip.id} interactive onClick={() => setPlaying(index)} className=\"cursor-pointer overflow-hidden\">`; Dashboard.tsx:300-303 Stat renders `<Card interactive={!!onClick} onClick={onClick} ...>`. Card (components/ui/Card.tsx:8-21) renders a plain `<div>` that spreads its props, with no role and no tabIndex; `interactive` only adds hover classes. grep finds no onKeyDown or tabIndex in Dashboard.tsx. Inside the clip card the arrow is a `<span>` (IconArrowUpRight), not a button. Only two Stats take onClick: Video goes to \"recording\" and Audio sources goes to \"audio\" (Dashboard.tsx:166-181).",
+    "corrected_claim": "",
+    "reachable_by": "Ordinary use by keyboard or screen-reader users on the Dashboard. The cards are not in the tab order and are not announced as controls. Equivalent keyboard paths do exist: the \"See all\" <Button> (Dashboard.tsx:204) opens the Clips gallery, whose thumbnails are real <button>s (Clips.tsx:455), and the NavBar <button>s (NavBar.tsx:39-42) reach Audio and Video. So the defect is the missing Dashboard shortcut, not a feature that is out of reach.",
+    "fix_assessment": "The fix is right: render the clickable cards as <button> (or give Card an `as`/`asButton` option), or add role=\"button\", tabIndex={0} and an Enter/Space onKeyDown. A semantic button is cleaner than retrofitting key handling."
+   }
+  ]
+ },
+ {
+  "id": "FC-17",
+  "title": "Menu opened by keyboard on Friends \"More\" appears top-left",
+  "severity": "medium",
+  "category": "a11y",
+  "locations": [
+   "src/routes/Friends.tsx:448"
+  ],
+  "claim": "A menu opened by keyboard-activating \"More\" (Friends.tsx:448, `onClick={openMenu}`) is positioned from the event's `clientX/Y`, which are 0 for keyboard-generated clicks.",
+  "scenario": "A keyboard user presses Enter on \"More\" and the menu appears at the top-left corner of the window, away from the button.",
+  "fix": "Use the button's bounding rect when `event.detail === 0`.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/routes/Friends.tsx:446-449 `<button aria-label={`More for ${friend.displayName}`} onClick={openMenu} ... focus-visible:opacity-100>` is a normal tabbable button. openMenu (Friends.tsx:368-369) passes the click event straight to `menu.open(event, [...])`, and src/components/ui/Menu.tsx:84-86 stores `x: trigger.clientX, y: trigger.clientY` without looking at the trigger element. A click that Chromium/WebView2 synthesises from Enter/Space on a button is positionless (clientX = clientY = 0, detail = 0). Surface's layout effect (Menu.tsx:124-128) then clamps it to `Math.max(EDGE, ...)` = (8, 8), the top-left of the window. Neither file checks event.detail or calls getBoundingClientRect on the trigger.",
+    "corrected_claim": "",
+    "reachable_by": "Ordinary local use: a keyboard user who Tabs to a friend row's 'More' button on the Friends page and presses Enter or Space. The menu still works from the keyboard (Arrow keys and Enter through the window capture listener at Menu.tsx:156-182). It just opens about 8 px from the window's top-left corner, away from the row. The context-menu key and Shift+F10 open it through the row's onContextMenu, which Chromium places at the focused element, so those are unaffected.",
+    "fix_assessment": "The proposed fix is correct and small: in openMenu, when event.detail === 0, call menu.open with clientX/clientY taken from event.currentTarget.getBoundingClientRect() (for example left/bottom), plus the event's preventDefault and stopPropagation."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/routes/Friends.tsx:448 `<button aria-label={`More for ${friend.displayName}`} onClick={openMenu} ... focus-visible:opacity-100>` (a reachable tab stop). Friends.tsx:368 `const openMenu = (event: MouseEvent) => menu.open(event, [...])` passes the click event straight through. src/components/ui/Menu.tsx:84-86 `setOpen({ x: trigger.clientX, y: trigger.clientY, ... })` has no fallback to an element rect. Menu.tsx:121-128 only clamps: `x: Math.max(EDGE, Math.min(x, ...))` with EDGE = 8 (line 105). Menu.tsx:202 `style={{ left: at.x, top: at.y }}` on a `fixed` surface. No code in src checks event.detail or uses a trigger rect for menus (grep finds none). A keyboard-activated button click is a synthetic, positionless click (clientX/clientY = 0, detail = 0) under the HTML 'fire a synthetic pointer event' rules and in Chromium/WebView2. That leads to (0,0), clamped to (8,8): the top-left of the window.",
+    "corrected_claim": "",
+    "reachable_by": "A keyboard user who tabs to a friend row's 'More' button and presses Enter or Space. The menu still works with arrow keys and Enter (Menu.tsx:156-176), but it shows up far away from the button.",
+    "fix_assessment": "Using event.currentTarget.getBoundingClientRect() (for example its bottom-left) when event.detail === 0 fixes it. Put the fix in the button's own onClick handler, not in the shared openMenu, because the row's onContextMenu (Friends.tsx:410) also calls openMenu with a real pointer position. A better place would be a helper in Menu.tsx, so that clipMenu and other button-opened menus get the same fallback."
+   }
+  ]
+ },
+ {
+  "id": "FC-18",
+  "title": "Menu lacks Home/End/Tab handling and aria-activedescendant",
+  "severity": "medium",
+  "category": "a11y",
+  "locations": [
+   "src/components/ui/Menu.tsx"
+  ],
+  "claim": "The Menu component has no Home/End/Tab keyboard handling and no `aria-activedescendant`.",
+  "scenario": "Keyboard users cannot jump to first/last items or Tab out cleanly, and screen readers are not told which item is active.",
+  "fix": "Add Home/End/Tab handling and `aria-activedescendant`.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ui/Menu.tsx:156-176 onKey handles only \"Escape\", \"ArrowDown\"/\"ArrowUp\" and `event.key === \"Enter\" && active >= 0`; no Home/End/Tab branch, so Tab moves focus in the page underneath while the menu stays open (no focusin/focusout listener; it closes only on pointerdown outside, blur, resize, scroll at :179-184). Menu.tsx:195-200 `role=\"menu\"` with no aria-activedescendant, and the comment at :198-200 says \"The menu deliberately takes no focus\" (onMouseDown preventDefault). Active item is shown only by a CSS class at :227. Mitigations: ArrowUp from nothing selects the last item and arrows wrap (:168-169), so first/last are one keypress away. Reachability: the menu opens on contextmenu events (TextMenu.tsx:117/120 document listener, Clips.tsx:442, Friends.tsx:410, clipMenu.tsx:246, ClipPlayer/ShotViewer), which the keyboard ContextMenu key / Shift+F10 also fires on the focused element, so keyboard users can open it.",
+    "corrected_claim": "The facts hold, but the screen-reader gap is wider than stated: focus never moves into the menu (Menu.tsx:198-200), so assistive tech is not told the menu opened at all, not just which item is active. Missing Home/End costs little because the arrows wrap. The worse Tab problem is that the menu stays open while focus moves on.",
+    "reachable_by": "Ordinary use by keyboard-only or screen-reader users of the desktop app (right-click menus on clips, friends and text fields, opened with the ContextMenu key or Shift+F10). It has no security impact and is of limited practical reach in a mouse-centric game-capture app.",
+    "fix_assessment": "Adding Home/End is trivial, and Tab should close the menu. But aria-activedescendant on the role=menu div would be ignored, because only the element that holds DOM focus can carry it. That needs either moving focus into the menu (against the deliberate design that keeps text-field selection and avoids an editor blur-save) or setting aria-activedescendant/aria-owns on the still-focused trigger element."
+   },
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ui/Menu.tsx:156-176: the window keydown handler handles only `Escape`, `ArrowDown`/`ArrowUp` (which wrap: `selectable[(next + selectable.length) % selectable.length]`, :169) and `Enter` (`if (event.key === \"Enter\" && active >= 0)`, :173). It has no Home, End, Tab or Space branch, and there is no `aria-activedescendant` anywhere in src. Menu.tsx:198-199 is decisive for the screen-reader part: `// The menu deliberately takes no focus: the text field underneath would otherwise lose its selection`. Focus stays on the trigger or text field, and `active` (:117) only switches a background class (:227). Tab is not swallowed and does not close the menu (closing happens only on pointerdown outside, blur, resize, scroll or Escape, :179-184). So Tab moves focus through the page underneath while the menu stays open, and because the buttons sit at the end of the portal host (:99) Tab can also land on them.",
+    "corrected_claim": "Literally true, but the details are off. (1) Home/End: arrow navigation wraps, and the first ArrowDown/ArrowUp jumps straight to the first/last item (:168). Under the WAI-ARIA APG, Home/End are required only when wrapping is not supported, so this part is a minor gap. (2) The real Tab problem is that Tab neither closes the menu nor is trapped. Focus moves on underneath while a stale menu stays open, and keyboard Enter keeps firing the highlighted item (:173) wherever focus has gone. (3) Screen readers learn nothing because focus never enters the menu, by design (:198-199). Adding `aria-activedescendant` to the role=menu div would do nothing, because that attribute only works on the element that holds DOM focus. Impact is an a11y gap, not a functional break: the menu is a context-menu convenience, and its actions (clip actions, text-field cut/copy/paste) have other routes.",
+    "reachable_by": "Keyboard and screen-reader users who open a context menu (the Menu key or Shift+F10 fires `contextmenu`, which TextMenu.tsx:57-120, Clips.tsx:442, Friends.tsx:410 and clipMenu.tsx:246 turn into `menu.open`).",
+    "fix_assessment": "Home/End are a cheap win, and the most useful change is to close the menu on Tab. Putting `aria-activedescendant` on the menu container will not work while the menu takes no focus. It would have to sit on the focused element (for example the text field, pointing at item ids), or the menu would have to take focus and restore the selection afterwards."
+   }
+  ]
+ },
+ {
+  "id": "FC-19",
+  "title": "Missing ARIA state on Segmented, NavBar and Toasts",
+  "severity": "medium",
+  "category": "a11y",
+  "locations": [
+   "src/components/ui/Controls.tsx",
+   "src/components/NavBar.tsx",
+   "src/components/Toasts.tsx"
+  ],
+  "claim": "`Segmented` has no `aria-pressed` or radiogroup semantics; the NavBar has no `aria-current=\"page\"`; Toasts have no live region.",
+  "scenario": "Screen-reader users cannot tell which segment or page is selected, and toast messages are never announced.",
+  "fix": "Add radiogroup/`aria-pressed` semantics to Segmented, `aria-current=\"page\"` to the active NavBar item and an `aria-live` region for Toasts.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ui/Controls.tsx:62-86: Segmented renders a plain `<div className=...>` with no role and buttons that have only `key`, `data-slide`, `onClick` and `className`. Selection is shown only by `value === key ? \"text-black\" : \"text-ink-muted ...\"` (:81) and the sliding pill. There is no aria-pressed, aria-checked or radiogroup. src/components/NavBar.tsx:57-67: nav buttons carry `onClick` and `className` (`route === id ? \"text-ink\" : \"text-ink-muted ...\"`) and no aria-current. src/components/Toasts.tsx:81-99: the toast stack is `<div ref={stack} className=\"pointer-events-none fixed ...\">` with no role and no aria-live, and the messages are added dynamically through the `notice` event (:44-46). A grep of src finds no aria-live anywhere. The only role=\"status\" is src/console/Trouble.tsx:129, which belongs to a different window. App.tsx:92 mounts `<Toasts />` with no wrapping live region. Toggle (:17-19) does use role=switch and aria-checked, which shows the omission in Segmented is not deliberate.",
+    "corrected_claim": "",
+    "reachable_by": "Screen-reader users on any Segmented control (settings index, Colors, Banner, Console, Friends, Setup, ShotViewer), on the NavBar, and for every `notice` event emitted by the backend (including error toasts, which show for 6 s and are never announced).",
+    "fix_assessment": "The fix is right and cheap. Use role=radiogroup/radio with aria-checked (or aria-pressed) on Segmented, aria-current=\"page\" on the active NavBar button, and role=\"status\"/aria-live=\"polite\" on the toast stack (role=\"alert\" for errors). A related bug to fix at the same time: Segmented's `disabled` only adds `pointer-events-none` on the wrapper (:65) and never sets `disabled` or aria-disabled on the buttons. In Banner.tsx:148 and Console.tsx:118 keyboard users can therefore still Tab to and activate a 'disabled' segment."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ui/Controls.tsx:62-86 Segmented renders a plain <div> with <button onClick={() => onChange(key)}> per option; selection is only `value === key ? \"text-black\" : \"text-ink-muted ...\"` (:81) plus an aria-hidden SlidingIndicator (SlidingIndicator.tsx:72-74); no role=radiogroup/radio, aria-checked or aria-pressed. Also, `disabled` only adds `pointer-events-none opacity-40` to the wrapper (:65) and never sets disabled on the buttons, so keyboard users can still Tab to and activate a 'disabled' Segmented. src/components/NavBar.tsx:57-66 nav buttons have no aria-current; active state is only `route === id ? \"text-ink\" : ...`. src/components/Toasts.tsx:81-84 the container has no aria-live/role=status/alert, and grep finds no live region anywhere in src/ except console/Trouble.tsx:129. Reachable: App.tsx:64 and :92 render NavBar and Toasts always, Segmented is used in 9 places (settings, Setup, ShotViewer), and toasts come from lib.rs:57-64 notify() on clip saves and errors.",
+    "corrected_claim": "Accurate. One addition: Segmented's `disabled` prop does not disable its buttons for keyboard users (Controls.tsx:65), so a keyboard user can still change a 'disabled' setting.",
+    "reachable_by": "Ordinary use by screen-reader users on every page (the nav bar and toasts are always mounted) and in every settings page that uses Segmented. It has no security impact.",
+    "fix_assessment": "The proposed fix is correct and cheap. The toast container is already always mounted (Toasts.tsx:77-79), so adding role=status/aria-live=polite to it (aria-live=assertive or role=alert for error toasts) will announce reliably. aria-pressed or role=radio+aria-checked on Segmented buttons and aria-current=\"page\" on the active NavBar button are one-liners. Segmented should also pass `disabled` through to its buttons."
+   }
+  ]
+ },
+ {
+  "id": "FC-20",
+  "title": "--color-ink-faint fails WCAG AA contrast",
+  "severity": "medium",
+  "category": "a11y",
+  "locations": [
+   "src/styles/tokens.css"
+  ],
+  "claim": "`--color-ink-faint: #5c5c68` measures 2.84:1 on surface, 2.63:1 on elevated and 3.04:1 on base, failing WCAG AA; it is used 83 times, mostly for small hint text.",
+  "scenario": "Low-vision users cannot read hint text rendered in ink-faint.",
+  "fix": "Use `#80808c`, which gives 4.79:1 and 4.44:1.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src/styles/tokens.css:4-7,14: `--color-base: #08080a; --color-surface: #121215; --color-elevated: #1a1a1f; --color-hover: #22222a; ... --color-ink-faint: #5c5c68;`. Computed WCAG relative-luminance ratios: #5c5c68 on base 3.04, surface 2.84, elevated 2.63, hover 2.39. No runtime override of the token exists (only definition is tokens.css:14; lib/accent.ts does not touch ink colors). grep finds 88 'ink-faint' occurrences in src/, 83 of them text-ink-faint/placeholder:text-ink-faint, almost all on text-xs/text-[11px]/text-[10px] hint lines (e.g. routes/settings/Storage.tsx:108 `<p className=\"mt-0.5 text-xs text-ink-faint\">{hint}</p>`, Dashboard.tsx:316, Console.tsx:1525), plus inactive nav labels (NavBar.tsx:164) and placeholders. Small text needs 4.5:1, so every use fails 1.4.3; the bg-ink-faint status dots (Friends.tsx:492, console/Friends.tsx:224) also miss the 3:1 non-text threshold on surface.",
+    "corrected_claim": "",
+    "reachable_by": "Any user viewing settings hints, empty states, placeholders, inactive nav items and metadata labels; worst for low-vision users and on bg-elevated/bg-hover cards.",
+    "fix_assessment": "Lightening the token is the right single-point fix, but the proposed #80808c only reaches 4.44:1 on --color-elevated (and 4.05:1 on --color-hover), so it still fails AA there; something around #868692 or higher is needed, which nearly collapses into --color-ink-muted (#8a8a96), so the faint/muted hierarchy would need rethinking."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/styles/tokens.css:4-6,14: `--color-base: #08080a; --color-surface: #121215; --color-elevated: #1a1a1f; ... --color-ink-faint: #5c5c68;`. Recomputed WCAG 2.x ratios: 3.04:1 on base, 2.84:1 on surface, 2.63:1 on elevated, 2.39:1 on hover #22222a, 2.75:1 on the console HUD (--hud-top rgba(23,20,32,.96)), all under the 4.5:1 AA minimum for normal text. The app is dark-only: src/index.css:19-21 sets `body { background: var(--color-base) }`, and nothing in src/lib overrides ink-faint (accent.ts swaps only the accent and logo shades). The token appears 87 times outside its definition (88 counting tokens.css), not 83. Nearly all are small text: `text-xs text-ink-faint` hints (Recording.tsx:220/253/278/447/479, Storage.tsx:108/204/370, Hotkeys.tsx:255, About.tsx:122, ExportDialog.tsx:155/196), `text-[11px]` labels (Setup.tsx:412/425, Console.tsx:819/1048/1122), and placeholders (Clips.tsx:768/789, ClipMeta.tsx:210/308, Friends.tsx:206/259). Some sit on elevated: AudioMixer.tsx:627 `bg-elevated text-ink-faint`. A few are non-text (status dots at Friends.tsx:492, settings/shared.tsx:114; icons at Clips.tsx:782/796, Console.tsx:1391), and even those miss the 3:1 non-text minimum on surface and elevated.",
+    "corrected_claim": "The mechanism and the ratios are correct. The token appears 87 times rather than 83. The proposed replacement #80808c is still below AA on the elevated surface (4.44:1) and the hover surface (4.05:1).",
+    "reachable_by": "Every user in ordinary use: the hint text, placeholders and sub-labels render on almost every screen of the main window and the in-game console. It hurts low-vision users most, and is worse on a dim screen or in the overlay over a bright game. It is purely visual, with no security or data impact.",
+    "fix_assessment": "#80808c clears 4.5:1 on base and surface but not on elevated (4.44) or hover (4.05). AA on elevated needs at least about #81818d, and on hover about #888894, which is practically ink-muted #8a8a96, itself only 4.63:1 on hover. The real fix is to raise ink-faint to about #83838f or more and accept a smaller gap from ink-muted, or keep faint only for non-text and large text and move the small hints to ink-muted."
+   }
+  ]
+ },
+ {
+  "id": "FC-21",
+  "title": "Reduced-motion rule covers only cb-* animations",
+  "severity": "medium",
+  "category": "a11y",
+  "locations": [
+   "src/styles/motion.css:377",
+   "src/routes/Friends.tsx:164",
+   "src/components/ui/SlidingIndicator.tsx"
+  ],
+  "claim": "The reduced-motion block at motion.css:377 covers only `cb-*` animations; Tailwind `transition-*`, `SlidingIndicator` and `animate-pulse` (Friends.tsx:164) ignore `prefers-reduced-motion`.",
+  "scenario": "A user with reduced motion enabled still sees transitions, the sliding indicator and pulsing placeholders.",
+  "fix": "Add `motion-reduce:transition-none` or a global reduced-motion rule.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/styles/motion.css:377-383: `@media (prefers-reduced-motion: reduce) { [class*=\"cb-\"] { animation-duration: 1ms !important; animation-delay: 0ms !important; animation-iteration-count: 1 !important; } }` - only animation properties, only on elements whose class contains 'cb-'; no transition override and no other global reduced-motion rule in src/ (others are scoped: console/console.css:735,1215 and overlay/overlay.css:230,330 only for cb-dock/cb-sheet/cb-card etc.). src/components/ui/SlidingIndicator.tsx:79 `\"transition-[transform,width] duration-[260ms] ease-[var(--ease-out-soft)]\"` with no prefersReducedMotion() check (used by NavBar.tsx:54 and Controls.tsx:70). src/routes/Friends.tsx:164 `<Card className=\"h-[112px] animate-pulse\" />`, and Card.tsx:12 classes contain no 'cb-', so the infinite pulse is not matched. Tailwind transform transitions likewise unguarded: Menu.tsx:207, Button.tsx:37, ColorPicker.tsx:141, Controls.tsx:32. JS-driven animations (lib/motion.ts animate(), useFlip, usePresence, useCountUp) do honour the setting, which the claim does not contradict.",
+    "corrected_claim": "",
+    "reachable_by": "Any user with the OS 'reduce motion / show animations off' setting, on the main window's nav bar, segmented controls, menus, buttons and the Friends profile loading placeholder.",
+    "fix_assessment": "Adding motion-reduce:transition-none to SlidingIndicator, Menu and similar, swapping animate-pulse for motion-safe:animate-pulse, or adding a global `*{transition-duration:1ms!important}` under the media query would fix it. The remaining motion is short and mostly colour/opacity (pulse is opacity only), and prefers-reduced-motion maps to WCAG 2.3.3 (AAA), so this is low severity rather than medium."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/styles/motion.css:377-383: `@media (prefers-reduced-motion: reduce) { [class*=\"cb-\"] { animation-duration: 1ms !important; animation-delay: 0ms !important; animation-iteration-count: 1 !important; } }`. It touches only CSS animations on elements whose class contains `cb-`, never `transition-*`, not even cb- transitions such as `.cb-ring-arc { transition: stroke-dashoffset 600ms linear }` at motion.css:353. Grepping src for `motion-reduce` or `motion-safe` finds nothing. src/components/ui/SlidingIndicator.tsx: `\"transition-[transform,width] duration-[260ms] ease-[var(--ease-out-soft)]\"`, with JS setting `pill.style.transform = translate(...)` and no prefersReducedMotion() check. It is used by NavBar.tsx:54 (every route change) and Controls.tsx:70 (segmented controls). src/routes/Friends.tsx:164: `if (!me) return <Card className=\"h-[112px] animate-pulse\" />;`. Card.tsx:12 adds no cb- class, so Tailwind's infinite pulse is not caught by the selector. The JS side is covered: src/lib/motion.ts animate() returns null when reduced motion is on, and useFlip, usePresence, useCountUp, ClipPlayer, ShotViewer and BusyVeil all check prefersReducedMotion(). overlay.css:230/330 and console.css:735/1215 have their own blocks.",
+    "corrected_claim": "The facts are correct, but the impact is smaller than 'medium' suggests. Of 86 Tailwind transitions in .tsx files, 61 are colour or opacity fades (51 transition-colors, 10 transition-opacity), which are not vestibular motion. About 20 move transform, width or height for 200-300ms: SlidingIndicator, transition-transform, transition-[width] and similar. The pulse is an opacity pulse, shown only while signed in before the friends profile (`me`) arrives. WCAG 2.3.3 (Animation from Interactions) is a AAA criterion.",
+    "reachable_by": "Any user who turned on the OS 'reduce motion' setting (on Windows, Settings > Accessibility > Visual effects > Animation effects off, which WebView2 reports as prefers-reduced-motion). They see it in ordinary use: switching routes in the NavBar, changing a segmented control, or opening Friends while signed in before the profile loads. Nothing else can trigger it, and there is no security impact.",
+    "fix_assessment": "A global rule under the existing media query, for example `*, ::before, ::after { transition-duration: 1ms !important; animation-duration: 1ms !important; animation-iteration-count: 1 !important; }`, covers it in one place and keeps the 'ends in its final state' contract. Nothing in src listens for transitionend, so it is safe; only Console.tsx:920 uses onAnimationEnd, and 1ms still fires it. Sprinkling `motion-reduce:transition-none` per call site would be easy to miss."
+   }
+  ]
+ },
+ {
+  "id": "FC-24",
+  "title": "No frontend tests",
+  "severity": "medium",
+  "category": "test-gap",
+  "locations": [
+   "package.json"
+  ],
+  "claim": "There is no frontend test setup or test file; pure functions such as `format.ts`, Hotkeys `accelerator`/`risky`/`supported`, Recording `fit`/`fpsChoices`/`memoryBudgetMb`, `screenChoice`, `slotFor`/`usePresence`, `timeLeft` and `lastSeenText` are untested.",
+  "scenario": "Regressions in store logic or pure helpers are not caught before release.",
+  "fix": "Add `vitest` with `jsdom`, `@testing-library/react`, and `mockIPC`/`clearMocks` from `@tauri-apps/api/mocks` for store tests; test the listed pure functions first (move Recording helpers into `lib/`).",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "package.json devDependencies list only @tailwindcss/vite, @tauri-apps/cli, @types/react(-dom), @vitejs/plugin-react, tailwindcss, typescript, vite -- no vitest/jest/testing-library; scripts have no \"test\". `git ls-files | grep -E '\\.test\\.|\\.spec\\.'` returns only server/src/shares.test.ts and server/src/telemetry.test.ts; nothing under src/. The named helpers exist and are untested: src/lib/links.ts:106 `export function timeLeft`, src/lib/friends.ts:58 `export function lastSeenText`, src/lib/usePresence.ts:24/102 `usePresence`/`slotFor`, src/routes/settings/Hotkeys.tsx:89/102/135 `supported`/`accelerator`/`risky`, src/routes/settings/shared.tsx:32 `screenChoice`, src/routes/Recording.tsx:27/45/66 `fpsChoices`/`fit`/`memoryBudgetMb`, src/lib/format.ts:3-44 format helpers. README.md:729-734 documents only `cargo test --lib` as the logic check; the UI is exercised only manually via mock.ts (`npm run dev`).",
+    "corrected_claim": "",
+    "reachable_by": "Not a runtime defect and not triggerable by any user/friend/remote party; it only affects the maintainer (single author, 50 commits by EinFabo) whose UI-helper regressions would ship uncaught. Hotkeys/Recording helpers are module-private (not exported), so testing them requires moving them as the fix says.",
+    "fix_assessment": "Reasonable: vitest + jsdom with @tauri-apps/api/mocks is the standard setup, and starting with the pure helpers (after exporting/moving the private Hotkeys/Recording functions into lib/) is the cheapest win. Medium severity overstates a pure test-gap with no demonstrated bug; low is more accurate."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "package.json scripts are dev/build/preview/tauri/app/ffmpeg/probe/report/app:build with no test script, and devDependencies hold no vitest/jest/testing-library/jsdom (none in node_modules either). `git ls-files src | grep -iE 'test|spec'` finds nothing; the only *.test.ts files in the repo are server/src/shares.test.ts and server/src/telemetry.test.ts (the Worker, not the UI). Every helper named exists and has no test: src/lib/format.ts:3-44 (formatDuration, formatSize, formatAgo, formatBufferSeconds, fileName, clipName), src/routes/settings/Hotkeys.tsx:89 `function supported`, :102 `function accelerator`, :135 `function risky`, src/routes/Recording.tsx:27 `fpsChoices`, :45 `fit`, :66 `memoryBudgetMb`, src/routes/settings/shared.tsx:32 `screenChoice`, src/lib/usePresence.ts:24/102 `usePresence`/`slotFor`, src/lib/links.ts:106 `timeLeft`, src/lib/friends.ts:58 `lastSeenText`.",
+    "corrected_claim": "",
+    "reachable_by": "Any developer change to the React UI or its helpers; nothing is defective at runtime, it is a test-coverage gap.",
+    "fix_assessment": "Sensible: vitest fits the existing Vite setup and needs no extra bundler config. The Hotkeys/Recording helpers are module-private (not exported), so they would have to be moved to src/lib or exported before they can be tested; mockIPC is only needed for store tests."
+   }
+  ]
+ },
+ {
+  "id": "FC-25",
+  "title": "No pull-request CI: nothing runs tsc on PRs",
+  "severity": "medium",
+  "category": "dx",
+  "locations": [
+   ".github/workflows/release.yml",
+   ".github/workflows/ffmpeg.yml",
+   ".github/workflows/pages.yml"
+  ],
+  "claim": "`.github/workflows` only contains release, ffmpeg and pages workflows; nothing runs `tsc` (or lint/tests) on pull requests.",
+  "scenario": "A PR that breaks type-checking or the Rust tests is merged without any automated check.",
+  "fix": "Add a `ci.yml` on `pull_request` running `npm ci && tsc --noEmit && eslint . && vitest run`, plus `cargo test` on Windows.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": ".github/workflows has only ffmpeg.yml (`on: push: tags: [\"ffmpeg-*\"]`), pages.yml (`push: branches: [main] paths: [\"site/**\", ...]`, workflow_dispatch, workflow_run) and release.yml (`push: tags: [\"v*\"]`, workflow_dispatch). None has a `pull_request` trigger and none runs cargo test, `npm test` in server/, or a linter. No local hook substitutes for it: there is no .husky, lefthook or pre-commit config, and .git/hooks holds only samples. One detail the claim leaves out: tsc does run at release time, because release.yml calls tauri-action -> `tauri build` -> src-tauri/tauri.conf.json:9 `\"beforeBuildCommand\": \"npm run build\"` -> package.json `\"build\": \"tsc --noEmit && vite build\"`. Streamdeck's `npm run pack` also runs its own tsc. So a type error cannot ship, but it is caught only when the tag is pushed. The 271 Rust #[test] functions in src-tauri/src and the server node --test suite never run in any workflow.",
+    "corrected_claim": "",
+    "reachable_by": "Any push or PR to main. Type errors fail later in the tagged release build (tsc --noEmit runs via beforeBuildCommand). Rust and server test regressions are never checked automatically and can ship.",
+    "fix_assessment": "Adding a pull_request/push CI is right, but the command as written would fail: the repo has no ESLint config or dependency and no vitest, so `eslint .` and `vitest run` need FC-24's setup first, or should be dropped. The more valuable parts are `cargo test` on windows-latest (the crate is Windows-only) and `npm test` in server/."
+   },
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": ".github/workflows contains only ffmpeg.yml (`on: push: tags: [\"ffmpeg-*\"]`), pages.yml (`push: branches: [main] paths: [\"site/**\", ...]`, workflow_dispatch, workflow_run) and release.yml (`push: tags: [\"v*\"]`, workflow_dispatch) -- none on pull_request, none run `cargo test` or `server` `npm test`. BUT release.yml runs `tauri-apps/tauri-action@v0`, i.e. `tauri build`, and src-tauri/tauri.conf.json:9 `\"beforeBuildCommand\": \"npm run build\"` with package.json `\"build\": \"tsc --noEmit && vite build\"` -- so tsc --noEmit DOES run in CI on every release tag, before an installer is published. No ESLint config exists in the repo (`git ls-files | grep -i eslint` empty). Git history: 0 merge commits, 50 commits all by one author directly on main.",
+    "corrected_claim": "No CI runs on pull requests or on pushes to main for the app/server code, and the Rust unit tests (~300 #[test]/#[cfg(test)] markers in src-tauri/src) and the server's `node --test src/*.test.ts` are never run in CI at all. However, tsc does run in CI: the release workflow's `tauri build` executes `npm run build` = `tsc --noEmit && vite build`, so a frontend type error fails the release job before anything is published. A type error is therefore caught at tag time, not at commit time; test regressions are not caught anywhere. The 'PR merged without checks' scenario is theoretical here: the repo has a single author committing directly to main with no PR merges.",
+    "reachable_by": "Only the maintainer's own workflow; no user, friend or remote party can trigger anything. Practical impact: a Rust/server logic regression can be tagged and auto-published (releaseDraft: false, updater picks it up) without its existing tests having run; a TS type error merely delays a release because the tag build fails.",
+    "fix_assessment": "Adding a ci.yml on push/pull_request is sensible, but it should run what exists: `npm ci && npx tsc --noEmit`, `cd server && npm ci && npm test && npm run check`, and `cargo test --lib` on windows-latest (README says tests need the Windows side). `eslint .` and `vitest run` as proposed would fail today since neither is configured; also consider making release.yml depend on `cargo test` so a red test blocks auto-published updates."
+   }
+  ]
+ },
+ {
+  "id": "FC-28",
+  "title": "Oversized components: Clips.tsx (1187 lines) and AudioMixer.tsx (866 lines)",
+  "severity": "medium",
+  "category": "quality",
+  "locations": [
+   "src/routes/Clips.tsx",
+   "src/routes/AudioMixer.tsx"
+  ],
+  "claim": "`Clips.tsx` has 1187 lines and `AudioMixer.tsx` 866 lines, each mixing many sub-components and hooks.",
+  "scenario": "Large files make memoization, testing and review hard and contribute to the gallery's full re-renders.",
+  "fix": "Split Clips.tsx into `ClipTile` (memo), `FilterBar` (`GameFilters`, `Chip`, `ConfirmChip`), `NameField`, `SearchField`, a `useGalleryFilter` hook (counts and visible list) and `usePlayerSession`. Split AudioMixer.tsx into `SourceRow` (memo), `useSourceDrag`, and move `QuickSetup`/`AddSourcePanel` out.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "`wc -l`: src/routes/Clips.tsx 1187, src/routes/AudioMixer.tsx 866 (exact). Clips.tsx holds Clips (68-685, ~618 lines) plus Counted:686, NameField:697, SearchField:773, GameFilters:813, Chip:1039, ConfirmChip:1121, IconAction:1162. The tile body is inline JSX in Clips' render (Clips.tsx:426 `{tiles.map(({ item: clip, key, leaving }, slot) => { ... <Card key={key} ...` through ~648), so any Clips state change (query, renaming, confirming, ...) re-renders every tile. AudioMixer.tsx holds AudioMixer (111-478, drag state at 142/174-196 and rows inline at 249), exported QuickSetup:479 (consumed by components/Setup.tsx:12), SourceMeter:603, MiniToggle:608, AvailableSources:635, MixedInHint:653, PickOne:691, AddSourcePanel:729, SourceColumn:827. But the high-frequency re-render source is already handled: Clips.tsx:80-92 `useShallow` comment ('ohne Selektor rendert die ganze Galerie ... zwanzigmal die Sekunde neu'), AudioMixer.tsx:123-125 deliberately omits `levels`, and SourceMeter:604 subscribes per meter. Larger files exist that the finding ignores: ShotViewer.tsx 1649, console/Console.tsx 1528, ClipPlayer.tsx 1108, ShotAnnotate.tsx 1094.",
+    "corrected_claim": "The line counts and the many-components-per-file shape are accurate, but file length does not cause the re-renders. What actually happens is that the gallery tile is inline, unmemoized JSX inside the 618-line Clips component, so local state changes such as typing in search or renaming repaint every tile. Store-driven re-renders from the 20 Hz audio levels are already prevented by useShallow and the per-meter SourceMeter. These are also not the largest frontend files: ShotViewer, Console, ClipPlayer and ShotAnnotate are bigger. This is a maintainability issue, not a defect.",
+    "reachable_by": "Developers maintaining the code. At runtime, any local state change in Clips (search keystrokes, rename, delete confirmation) repaints all tiles, which costs performance but is not incorrect behaviour.",
+    "fix_assessment": "The most useful step is extracting a memoized ClipTile with stable callbacks, because that fixes the real re-render cost. The rest of the split (FilterBar, the hooks, moving QuickSetup and AddSourcePanel) is optional cleanup, and QuickSetup should move to components/ anyway because of FC-29."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "wc -l: src/routes/Clips.tsx 1187, src/routes/AudioMixer.tsx 866. Clips.tsx:68 `export function Clips(` runs to ~line 685 (about 618 lines in one component, with about 10 useState plus many refs at :93-136), then Counted:686, NameField:697, SearchField:773, GameFilters:813, Chip:1039, ConfirmChip:1121, IconAction:1162. Tiles are rendered inline at Clips.tsx:426 `{tiles.map(({ item: clip, key, leaving }, slot) => { ... <Card` with no memo anywhere (grep memo: no hits), and SearchField at :392 calls setQuery on Clips, so every keystroke re-renders every tile. AudioMixer.tsx: AudioMixer:111, exported QuickSetup:479, SourceMeter:603, MiniToggle:608, AvailableSources:635, MixedInHint:653, PickOne:691, AddSourcePanel:729, SourceColumn:827. Clips.tsx:79-92 already uses useShallow to stop audio-level store updates from re-rendering the gallery.",
+    "corrected_claim": "The line counts and the mixing of components are accurate. The re-render cost does not come from file size: it comes from rendering the tile body inline inside Clips (Clips.tsx:426) with no memoized tile, so any Clips state change (search keystroke, renaming, confirming, links) re-renders the whole grid. The heaviest re-render source, audio meters at 20 Hz, is already removed with useShallow (Clips.tsx:79-92).",
+    "reachable_by": "Not a runtime defect. Developers pay the maintainability cost. The related re-render cost hits the user during ordinary use of the Clips gallery, for example typing in search or renaming.",
+    "fix_assessment": "Splitting out a memoized ClipTile with stable callbacks is the part that actually helps performance; moving GameFilters/Chip/ConfirmChip and QuickSetup/AddSourcePanel into their own files is cosmetic but harmless. useGalleryFilter/usePlayerSession hooks would make the 600-line Clips body testable."
+   }
+  ]
+ },
+ {
+  "id": "FC-29",
+  "title": "Inverted dependencies: components import from routes",
+  "severity": "medium",
+  "category": "quality",
+  "locations": [
+   "src/components/Setup.tsx:11-14",
+   "src/components/Share.tsx:11"
+  ],
+  "claim": "Components import from routes: Setup.tsx:11-14 takes `TargetCard`, `QuickSetup`, `Hotkeys` and `Row` from route files, and Share.tsx:11 takes `Avatar`.",
+  "scenario": "Shared UI pieces live in route modules, coupling global overlays to route code.",
+  "fix": "Move these into `components/`.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/Setup.tsx:11-14: `import { TargetCard } from \"@/routes/Recording\"; import { QuickSetup } from \"@/routes/AudioMixer\"; import { Hotkeys, keyLabel } from \"@/routes/settings/Hotkeys\"; import { Row, screenChoice, USAGE_HINT } from \"@/routes/settings/shared\";` and src/components/Share.tsx:11 `import { Avatar } from \"@/routes/Friends\";`. The exports exist at Recording.tsx:512 TargetCard, AudioMixer.tsx:479 QuickSetup, settings/Hotkeys.tsx:62 keyLabel / :142 Hotkeys, settings/shared.tsx:32 screenChoice / :51 USAGE_HINT / :54 Row, Friends.tsx:466 Avatar. These are the only components->routes imports (grep over src/components, src/lib, src/store.ts). Both overlays are mounted globally from src/App.tsx:11,16. No import cycle: none of those route files imports components/Setup or components/Share, and there is no React.lazy or route-level code splitting (vite.config has only main/overlay/console entries), so there is no bundle or cycle effect.",
+    "corrected_claim": "The claim is accurate. The impact is coupling and layering only: there are no circular imports and no code-splitting penalty, so nothing breaks at runtime.",
+    "reachable_by": "Developers only, when refactoring or moving route modules. Nothing triggers it at runtime.",
+    "fix_assessment": "Moving Avatar, TargetCard, QuickSetup, Hotkeys/keyLabel and Row/screenChoice/USAGE_HINT into components/ (or Row into components/ui) and having the routes import them is a straightforward, mechanical fix."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/Setup.tsx:11-14: `import { TargetCard } from \"@/routes/Recording\"; import { QuickSetup } from \"@/routes/AudioMixer\"; import { Hotkeys, keyLabel } from \"@/routes/settings/Hotkeys\"; import { Row, screenChoice, USAGE_HINT } from \"@/routes/settings/shared\";` src/components/Share.tsx:11: `import { Avatar } from \"@/routes/Friends\";` Both components are mounted globally from src/App.tsx:11,16. No import cycle exists: the route files import only @/components/ui/*, icons, lib and store (Recording.tsx:1-11, AudioMixer.tsx:1-19, Friends.tsx:1-11, settings/Hotkeys.tsx:1-9, settings/shared.tsx:1-2); Recording.tsx:7 imports from components/NavBar, but only as a type. The app has no lazy()/dynamic import(), so this coupling does not break any code splitting.",
+    "corrected_claim": "Accurate, but the impact is limited to code organisation. There is no import cycle and no bundle or code-splitting effect, because no route is lazy-loaded. routes/settings/shared.tsx is already meant as a shared helper module, so importing Row/screenChoice/USAGE_HINT from it is the mildest of these cases.",
+    "reachable_by": "No runtime trigger. Developers face the risk: a later route-to-component import (for example a route using Setup or Share) would create a cycle, and refactoring a route can silently break the global Setup and Share overlays.",
+    "fix_assessment": "Moving Avatar, TargetCard, QuickSetup, the Hotkeys editor and the settings Row helpers into src/components/ (and leaving routes to re-import them) is a cheap, mechanical, low-risk change."
+   }
+  ]
+ },
+ {
+  "id": "FC-30",
+  "title": "Row component exists twice",
+  "severity": "medium",
+  "category": "quality",
+  "locations": [
+   "src/routes/Recording.tsx:492",
+   "src/routes/settings/shared.tsx:54"
+  ],
+  "claim": "`Row` is defined twice: Recording.tsx:492 and settings/shared.tsx:54.",
+  "scenario": "The two copies can drift (e.g. an a11y fix to one Row is missed in the other).",
+  "fix": "Keep a single shared Row in components/.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/routes/Recording.tsx:492 `function Row({ label, hint, children }` (private, used 5x in that file) and src/routes/settings/shared.tsx:54 `export function Row({ label, hint, children }` are byte-identical (diff of lines 492-510 vs 54-72 after stripping `export` shows no difference). The shared copy is already reused cross-route: src/components/Setup.tsx:14 `import { Row, screenChoice, USAGE_HINT } from \"@/routes/settings/shared\";`. The other Row functions in src/console/Audio.tsx:83 and src/console/Friends.tsx:105 have different props (source/bars, friend/presence) and are unrelated components, not duplicates.",
+    "corrected_claim": "",
+    "reachable_by": "No runtime trigger: pure maintainability duplication. Both copies currently render identical markup, so no user-visible drift exists today; only a future edit to one copy could diverge the Recording page rows from the Settings/Setup rows.",
+    "fix_assessment": "Trivially correct: delete the private Row in Recording.tsx and import Row from @/routes/settings/shared (as Setup.tsx already does), or move it to components/ui. Medium severity is overstated; low/info."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/routes/Recording.tsx:492 `function Row({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode; })` and src/routes/settings/shared.tsx:54 `export function Row({ ... })` are byte-identical (diff of lines 492-510 vs 54-72 differs only in the `export` keyword): same `<div className=\"flex items-center justify-between gap-6 p-5\">`, label `<p className=\"text-sm font-medium\">`, hint `<p className=\"mt-1 text-xs text-ink-muted\">`, `<div className=\"shrink-0\">`. Recording.tsx imports (lines 1-11) do not include settings/shared, and it renders <Row> 5 times. The shared Row is already imported by 9 settings pages and by src/components/Setup.tsx:14 (`import { Row, screenChoice, USAGE_HINT } from \"@/routes/settings/shared\"`). src/console/Audio.tsx:83 and src/console/Friends.tsx:105 also define `Row`, but with different props and markup, so they are not duplicates.",
+    "corrected_claim": "",
+    "reachable_by": "Maintainers only. This is duplicated code, not a runtime defect; both copies currently render the same output.",
+    "fix_assessment": "Correct and trivial. Recording.tsx can import Row from \"./settings/shared\" the way Setup.tsx already does and drop its local copy; moving Row to components/ is optional and would mean updating 10 import sites."
+   }
+  ]
+ },
+ {
+  "id": "FC-33",
+  "title": "Startup snapshots in friends/share stores can overwrite newer pushes",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src/lib/friends.ts:42-43",
+   "src/lib/share.ts:40-41",
+   "share.ts:39-42",
+   "friends.ts"
+  ],
+  "claim": "friends.ts:42-43 and share.ts:40-41 register `listen` and fire the initial snapshot `invoke` in parallel; the snapshot reply is applied with `setState(view, true)` regardless of whether a push already arrived.",
+  "scenario": "A push event arrives before the snapshot reply; the older snapshot then replaces the newer pushed state.",
+  "fix": "Ignore the snapshot if an event has already arrived, or add a version field.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "FP-55",
+    "slice": "10-frontend-player-console",
+    "title": "Store initialisation races invoke() against listen()",
+    "claim": "share.ts:39-42 and friends.ts initialise with `invoke(...)` racing `listen(...)`, so an older snapshot can overwrite a newer event.",
+    "locations": [
+     "share.ts:39-42",
+     "friends.ts"
+    ],
+    "fix": "Fetch after listening, or keep a version counter."
+   }
+  ],
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/lib/friends.ts:41-44 `void listen<FriendsView>(\"friends-state\", (event) => useFriends.setState(event.payload, true)); void invoke<FriendsView>(\"friends_state\").then((view) => useFriends.setState(view, true));` and src/lib/share.ts:39-42 same pattern for share-state/share_state; neither has a flag/version. Core side: src-tauri/src/friends.rs:188-190 `friends.view.lock().clone()` (snapshot), friends.rs:800-803 `emit` clones the view and `app.emit(\"friends-state\", view)`; share.rs:235-237 / share.rs:1059-1061 likewise. Tauri 2.11.5 delivers events via `webview.eval` (tauri-2.11.5/src/webview/mod.rs:1974-1975 emit_js -> eval) while the command reply travels back on the IPC protocol response (src/ipc/protocol.rs respond), two independent channels with no ordering guarantee. node_modules/@tauri-apps/api/event.js:71-82 shows listen() sends its IPC synchronously before the snapshot invoke is issued, so a push emitted after the core reads the snapshot can land in JS before the snapshot reply, and `setState(view, true)` then replaces it.",
+    "corrected_claim": "Real but narrow: the window is only between the core cloning the state for the snapshot and the reply reaching JS. It is reachable at startup for friends (main and console windows are both created at startup, console.rs:54-56, while friends.rs is signing in/connecting and emitting), and the stale view persists until the next friends-state/share-state push. For share.rs the transfer list is in-memory and empty at startup, so the share variant is practically unreachable. The \"also\" fix (FP-55: fetch after awaiting listen) would not fix this overwrite; it only addresses missed events.",
+    "reachable_by": "Core state pushes (friends sign-in/connection/presence, transfer progress) emitted in the few-millisecond window while the main or console window's module-level snapshot invoke is in flight at page load.",
+    "fix_assessment": "Setting a `pushed` flag in the listener and skipping the snapshot's setState when it is set works, because the listen IPC is issued before the snapshot invoke; a monotonically increasing version field from the core is more robust. Awaiting listen before invoke alone does not close this race."
+   }
+  ]
+ },
+ {
+  "id": "FC-34",
+  "title": "useLinks.refresh has no ticket and can race itself",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src/lib/links.ts:63"
+  ],
+  "claim": "`useLinks.refresh` (links.ts:63) applies results without a ticket/version guard.",
+  "scenario": "Two overlapping refreshes resolve out of order and the older result overwrites the newer one.",
+  "fix": "Add a ticket/version guard to refresh.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/lib/links.ts:60-67 `async refresh() { ... set(await linkApi.state()); ... }` with no ticket. Callers that can overlap: links.ts:83 (after create), :92 (after remove), :127 (`links-changed` event), :130-132 (every friends-state push whose signedIn differs from the store's, which stays stale until the first refresh resolves, so repeated presence pushes can start several), :133 (startup), :143 (10-min interval). Core: src-tauri/src/links.rs:303-317 `let links = load();` is read BEFORE `fetch_quota(&app, &token).await` (a network GET to /shares/quota, links.rs:290-298), so an earlier refresh holding an older `links` snapshot can resolve after a later one when its network call is slower. links-changed is emitted from links.rs:397, 620, 633, 652.",
+    "corrected_claim": "",
+    "reachable_by": "A periodic/sign-in refresh in flight (slow quota request) when a link is created or deleted (links-changed + create/remove refresh), or a sign-out while a signed-in refresh is still waiting on the server; the older result then restores stale links/quota/signedIn until the next refresh.",
+    "fix_assessment": "A module-level ticket (`const t = ++seq; const s = await linkApi.state(); if (t === seq) set(s)`), the same pattern store.ts:301-308 already uses for clips-changed, fixes it."
+   }
+  ]
+ },
+ {
+  "id": "FC-35",
+  "title": "Text-field menu Paste into number inputs prepends and throws",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src/lib/dom.ts:48",
+   "src/components/TextMenu.tsx:31-37",
+   "src/components/ui/ColorPicker.tsx:222"
+  ],
+  "claim": "dom.ts:48 includes `\"number\"` in the text input types. In TextMenu.tsx:31-37, `selectionStart` is `null` for number inputs (treated as 0), so pasted text is prepended, and then `setSelectionRange` throws `InvalidStateError` (an unhandled rejection from the async `onSelect`). Paste also bypasses `maxLength`.",
+  "scenario": "Using the context-menu Paste on the RGB number fields in ColorPicker.tsx:222 prepends the pasted text to the current value and raises an unhandled InvalidStateError.",
+  "fix": "Handle number fields separately (replace the whole value) and wrap the call in try/catch.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/lib/dom.ts:2 `const TEXT_TYPES = [..., \"password\", \"number\"];` so isTextField accepts number inputs (dom.ts:12-15). src/components/TextMenu.tsx:66-67 `const start = el.selectionStart ?? 0; const end = el.selectionEnd ?? 0;` (selectionStart/End are null for type=number per HTML spec), Paste at :97-101 calls replaceSelection which does `setValue(el, value.slice(0, start) + text + value.slice(end))` (:34) then `el.setSelectionRange(at, at)` (:36), which throws InvalidStateError for type=number. src/components/ui/Menu.tsx:137-141 `run` calls `entry.onSelect();` without awaiting or catching, so the async rejection is unhandled. Targets: ColorPicker.tsx:222-227 `type=\"number\" min={0} max={255}` and ExportDialog.tsx:170-176. setValue (TextMenu.tsx:20-28) uses the prototype setter, which ignores maxLength (ClipMeta.tsx:198 maxLength=32, routes/Friends.tsx:198 maxLength=60).",
+    "corrected_claim": "Mechanism as claimed. Visible effect on the RGB fields: the prepended string goes through the number sanitiser and ColorPicker.tsx:108-111/toHex (lines 23-28) clamping, so pasting \"64\" into \"128\" yields 64128 -> 255, and pasting non-numeric text (e.g. \"#ff0000\") sanitises to \"\" -> Number(\"\") = 0. Cut and Copy are always disabled on number fields because `selected` is \"\". The maxLength bypass applies to the text fields, not the number ones.",
+    "reachable_by": "A user right-clicking an RGB field in the colour picker (or the export size field) and choosing Paste; maxLength bypass via Paste into the tag or status fields.",
+    "fix_assessment": "For number inputs (selectionStart === null) replace the whole value and skip setSelectionRange; wrapping the selection call in try/catch and having Menu.run catch promise rejections is a cheap belt-and-braces. Clamping pasted text to el.maxLength would close the maxLength gap."
+   }
+  ]
+ },
+ {
+  "id": "FC-36",
+  "title": "Record and buffer buttons have no in-flight guard",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src/store.ts:454-471",
+   "src/store.ts:432-442",
+   "src-tauri/src/state.rs:975"
+  ],
+  "claim": "The record (store.ts:454-471) and buffer (store.ts:432-442) actions have no in-flight guard; the buffer toggle flips optimistically.",
+  "scenario": "Double-clicking \"Record\" either gives a spurious \"A recording is already running.\" (from the core's lifecycle lock in state.rs:975) or stops the just-started recording. The optimistic buffer flip can flicker until the next 1 Hz status.",
+  "fix": "Add `recordingBusy`/`bufferBusy` state and disable the buttons while a call is in flight.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/store.ts:454-471 toggleRecording sets `recordingSaving` only when `was` is true and has no in-flight flag; src/routes/Dashboard.tsx:118-122 Record button `disabled={saving}` where `saving = recordingSaving || recordingProgress !== null` (:75), so it stays enabled while a start is in flight. Core: src-tauri/src/commands.rs:352-359 `#[tauri::command(async)] toggle_recording` checks `state.is_recording()` (state.rs:437-439 `self.recorder.lock().is_some()`) outside any lock; state.rs:973-976 `let _lifecycle = self.lifecycle.lock(); if self.is_recording() { return Err(\"A recording is already running.\".into()); }`, and the recorder is only stored at state.rs:997 after launch_pipeline and up to a 5 s keyframe wait (state.rs:1010-1016). The error is surfaced by lib.rs:224-228 start_recording_and_notify (error toast, error sound, overlay \"Recording will not start\"), not returned to the store. Buffer: store.ts:432-442 flips `bufferActive` optimistically; a second click calls stopBuffer, and commands.rs:343-347 stop_buffer is a no-op while status.buffer_active is still false, so the UI shows stopped while the core starts, until the next engine-status (lib.rs:1065-1071 `if tick % 20 == 0 { ... handle.emit(\"engine-status\", status)` in a 50 ms loop, lib.rs:944, i.e. 1 Hz).",
+    "corrected_claim": "Accurate. Detail: the spurious \"A recording is already running.\" appears as a core toast/sound/overlay error banner, not via the store's lastError (toggle_recording returns Ok(is_recording)). The console's own record button (Console.tsx:523-527) goes through a `run(\"rec\", ...)` helper, so this applies to the Dashboard buttons.",
+    "reachable_by": "A user double-clicking Record (especially with the buffer off, when the start launches the pipeline and waits for a keyframe) or Start/Stop buffer on the Dashboard.",
+    "fix_assessment": "A store-level busy flag that disables the buttons and ignores re-entry while the call is in flight fixes the UI side; the core's check-then-act in toggle_recording outside the lifecycle lock would also remain racy for hotkey/tray/Stream Deck callers."
+   }
+  ]
+ },
+ {
+  "id": "FC-37",
+  "title": "Page scroll position carries over between routes",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/App.tsx:65"
+  ],
+  "claim": "`<main className=\"... overflow-y-auto\">` (App.tsx:65) keeps its `scrollTop` across the keyed route swap; nothing resets or restores it per route.",
+  "scenario": "Leaving a scrolled gallery opens Settings scrolled down, and returning to the gallery loses its own scroll position.",
+  "fix": "Reset or restore the scroll position per route.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/App.tsx:66 `<main className=\"relative h-full overflow-y-auto pt-24 pb-16\">` is the only scroll container for the routes and is not keyed; the keyed child is inside it: App.tsx:77 `<div key={route} className=\"cb-rise ...\">` with conditional route rendering (78-88). A grep of src/ for scrollTo/scrollTop/scrollIntoView finds only ShotViewer.tsx:808 (an unrelated textarea), so nothing resets or saves main's scrollTop per route. Clips.tsx has no own vertical scroll container (only overflow-x-auto at 904), so the gallery scrolls inside <main>.",
+    "corrected_claim": "",
+    "reachable_by": "Any user who scrolls a long page (typically the gallery) and then switches tabs via NavBar, UsageNotice or the focus-clip event; the browser only clamps scrollTop to the new page's height.",
+    "fix_assessment": "Resetting main's scrollTop to 0 on route change (a ref on <main> plus an effect on `route`) fixes the carry-over; restoring the gallery's own position would also need a per-route scroll map, since the routes unmount."
+   }
+  ]
+ },
+ {
+  "id": "FC-50",
+  "title": "Memory-budget slider cannot return to automatic (0) once dragged",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/routes/Recording.tsx:468-477"
+  ],
+  "claim": "Once the memory-budget slider on the Recording page has been dragged, it cannot go back to 0 (automatic); there is no \"Auto\" choice.",
+  "scenario": "A user experiments with the memory budget and cannot restore the automatic default.",
+  "fix": "Add an \"Auto\" choice for the memory budget.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/routes/Recording.tsx:66-70 `if (buffer.memoryMb > 0) return buffer.memoryMb; ... return Math.max(64, Math.round((plain * 3) / 2));` (0 = automatic, derived from bitrate x buffer length). Recording.tsx:468-476 `<Slider ... min={64} max={4096} step={64} onChange={(memoryMb) => patchConfig({ buffer: { ...config.buffer, memoryMb } })}` so any change (drag, click, arrow key) stores a value >= 64. src/components/ui/Controls.tsx:91-115 Slider is a bare <input type=range> with `onChange={(e) => onChange(Number(e.target.value))}`: no reset, double-click or Auto affordance. `grep memoryMb src` finds only types.ts:137, mock.ts:53 and Recording.tsx; nothing writes memoryMb: 0 back. The buffer-length slider (Recording.tsx:399-407), clip slider (434-443), Setup.tsx:154-161 and Behaviour.tsx:21 all spread `...config.buffer` and keep the pinned memoryMb. Backend set_config (src-tauri/src/commands.rs:55-85) does not normalise memory_mb, and config.rs:100-103 `if buffer.memory_mb > 0 { return buffer.memory_mb as u64 * 1024 * 1024; }` honours the pinned value from then on.",
+    "corrected_claim": "",
+    "reachable_by": "Any user who touches the Memory budget slider on the Recording page, even with a single click or arrow key. The only way back to automatic is editing or deleting %APPDATA%/ClippiBoy/config.json by hand. Side effect: once the budget is pinned it no longer follows later buffer-length or bitrate changes, so lengthening the buffer can leave the ring capped below what that length needs (the buffer then holds less than its full length).",
+    "fix_assessment": "Adding an 'Auto' toggle or reset button that writes memoryMb: 0, with the slider showing the derived value while in auto, fixes it fully; a Select or Segmented control with an Auto entry would also work. Optionally show '(auto)' next to the MB readout so the state is visible."
+   }
+  ]
+ },
+ {
+  "id": "FC-27",
+  "title": "vite.config.ts is not type-checked",
+  "severity": "medium",
+  "category": "dx",
+  "locations": [
+   "vite.config.ts"
+  ],
+  "claim": "`vite.config.ts` is not covered by the TypeScript type-check (`tsc --noEmit`).",
+  "scenario": "Type errors in the Vite config go unnoticed until build time.",
+  "fix": "Include vite.config.ts in a type-checked tsconfig (e.g. a node tsconfig) and run it in a `typecheck` script.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "tsconfig.json: `\"include\": [\"src\"]` and it is the only tsconfig; package.json `\"build\": \"tsc --noEmit && vite build\"` (no -p for another project), tauri.conf.json `\"beforeBuildCommand\": \"npm run build\"`; no other typecheck in .github/workflows. Standalone check `tsc --noEmit --moduleResolution bundler vite.config.ts` reports only `vite.config.ts(1,36): error TS2307: Cannot find module 'node:url'` because @types/node is not installed (node_modules/@types has only babel__*, estree, react, react-dom).",
+    "corrected_claim": "Correct that vite.config.ts is outside the type-check, but the scenario is off: Vite strips the config's types with esbuild and never reports type errors, so pure type errors go unnoticed permanently, while errors that actually break the config surface immediately at `npm run dev`/`tauri dev` start, not only at build time. The file currently has no type errors apart from the missing Node typings.",
+    "reachable_by": "Developers editing vite.config.ts only; no runtime or user-facing path.",
+    "fix_assessment": "A tsconfig.node.json including vite.config.ts works only after adding @types/node as a devDependency (otherwise it fails at once on 'node:url'); worth it but trivial in impact for a 30-line config."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "tsconfig.json:21 `\"include\": [\"src\"]`, and there is no other tsconfig in the repo root. package.json build is `tsc --noEmit && vite build` (the Tauri beforeBuildCommand is `npm run build`), so tsc only sees src/**. `--listFilesOnly` lists no vite.config.ts. Vite 6.4.3 loads the config through bundleConfigFile, which uses esbuild build$3 (node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:49443) and only strips types. I type-checked vite.config.ts on its own from scratchpad. The only error is `vite.config.ts(1,36): error TS2307: Cannot find module 'node:url'`, because @types/node is not installed (node_modules/@types has only babel__*, estree, react, react-dom).",
+    "corrected_claim": "One detail is off. Type errors in vite.config.ts are not caught at build time either, because Vite strips types with esbuild without checking them. Only runtime failures appear. Today the file type-checks cleanly apart from the missing @types/node.",
+    "reachable_by": "Developers editing vite.config.ts. There is no runtime or user impact.",
+    "fix_assessment": "Adding a tsconfig.node.json (or a project reference) that includes vite.config.ts works, but it also needs @types/node as a devDependency or the check fails at once on `node:url`. Without that, `tsc -b` or a typecheck script would break the build."
+   }
+  ]
+ },
+ {
+  "id": "FC-32",
+  "title": "init() is not idempotent; listeners register twice and are never removed",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "src/App.tsx:31-33",
+   "src/store.ts:272-332",
+   "src/store.ts:228",
+   "src/lib/friends.ts",
+   "src/lib/share.ts",
+   "src/lib/links.ts",
+   "src/lib/hidden.ts"
+  ],
+  "claim": "App.tsx:31-33 calls `void init()` in an effect, which StrictMode runs twice in dev. Every `listen()` in store.ts:272-332 registers twice and is never removed. In browser mode there are two 80 ms intervals (store.ts:228). Vite HMR repeats this for the module-level listeners in friends.ts, share.ts, links.ts and hidden.ts.",
+  "scenario": "In dev, events are handled twice and `clips-changed` triggers two reads; HMR accumulates duplicate listeners. (Dev only.)",
+  "fix": "A module-level `initPromise ??= ...` guard, and keep the unlisten handles.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/main.tsx:12 `<React.StrictMode>` wraps App; src/App.tsx:32-34 `useEffect(() => { void init(); }, [init]);` with no cleanup and no guard; src/store.ts:216-340 init() has no once-guard, every `await events.onX(...)` return value (UnlistenFn, ipc.ts:205-219 `listen(...)`) is discarded; store.ts:228 `setInterval(..., 80)` in browser mode with no handle kept; store.ts:301-310 `let reads = 0` is local to each init() call, so each of the two clips-changed handlers runs its own listClips() and both apply. friends.ts:41-44, share.ts:39-42, links.ts:123-144 (3 listen + 2 setInterval) and hidden.ts:11-22 (listen + window focus listener) register at module top level with no import.meta.hot dispose (grep finds no `import.meta.hot` in src). init() is called only from App.tsx:33.",
+    "corrected_claim": "Accurate, dev-only. Nuance for HMR: a re-executed friends/share/links module creates a new zustand store, so the leaked old listeners write into the orphaned old store rather than handling events twice on the live one; it is a growing handler/interval leak (and links.ts's old intervals keep calling refresh on the dead store). Under StrictMode the duplicate handlers on the live store are mostly idempotent (clip-saved dedupes by id, others are plain set()); the visible cost is doubled IPC (two listClips per clips-changed, two Promise.all startup reads).",
+    "reachable_by": "Developers only: React StrictMode double-invoking effects in `tauri dev`/vite dev, and Vite HMR edits to the listed modules. Production builds call the effect once.",
+    "fix_assessment": "A module-level `initPromise ??= (async () => ...)()` guard in init() fixes the StrictMode duplication; for HMR the module-level listeners would additionally need `import.meta.hot?.dispose` to call the kept unlisten handles and clear the intervals."
+   }
+  ]
+ },
+ {
+  "id": "FC-38",
+  "title": "screenshotHasOriginal invokes an unregistered command (dead code)",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src/lib/ipc.ts:150-151",
+   "src-tauri/src/lib.rs:1283-1365",
+   "ipc.ts:150-151",
+   "ipc.ts:150"
+  ],
+  "claim": "`screenshotHasOriginal` in ipc.ts:150-151 invokes `screenshot_has_original`, which is not registered in the invoke handler list in lib.rs:1283-1365. It is unused.",
+  "scenario": "Any future caller would get a command-not-found error at runtime.",
+  "fix": "Remove the wrapper or register the command.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "ED-32",
+    "slice": "01-editor-bugs",
+    "title": "Dead IPC call screenshotHasOriginal invokes an unregistered command",
+    "claim": "`screenshotHasOriginal` in ipc.ts:150-151 invokes `\"screenshot_has_original\"`, which isn't registered in `lib.rs`.",
+    "locations": [
+     "ipc.ts:150-151"
+    ],
+    "fix": "Remove the dead call (or register the command)."
+   },
+   {
+    "id": "EF-34",
+    "slice": "02-editor-features",
+    "title": "Dead IPC wrapper api.screenshotHasOriginal",
+    "claim": "`api.screenshotHasOriginal` (ipc.ts:150-151) calls a Rust command that does not exist; it is dead code.",
+    "locations": [
+     "src/lib/ipc.ts:150-151"
+    ],
+    "fix": "No explicit fix proposed (flagged as dead code for the line-level reviewer)."
+   },
+   {
+    "id": "FP-59",
+    "slice": "10-frontend-player-console",
+    "title": "Dead ipc wrapper screenshotHasOriginal calls an unregistered command",
+    "claim": "ipc.ts:150 `screenshotHasOriginal` is a dead wrapper that calls a command that is not registered.",
+    "locations": [
+     "ipc.ts:150"
+    ],
+    "fix": "Remove the wrapper (or register the command)."
+   }
+  ],
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/lib/ipc.ts:150-151 `screenshotHasOriginal: (id: string) => invoke<boolean>(\"screenshot_has_original\", { id }),`. src-tauri/src/lib.rs:1283 `.invoke_handler(tauri::generate_handler![` ... (ends around 1368) lists commands::take_screenshot, write_screenshot, screenshot_edit but no screenshot_has_original, and a grep of src-tauri/src finds no fn of that name (only the helpers shot::has_original / edit::has_original). In src/, `screenshotHasOriginal` appears only at its definition, so it has no callers.",
+    "corrected_claim": "",
+    "reachable_by": "Nobody today (it has no callers); a future caller would get Tauri's command-not-found rejection.",
+    "fix_assessment": "Removing the wrapper is the right fix: screenshot_edit already returns `original_path: Option<String>` (commands.rs:435), which tells the UI the same thing."
+   }
+  ]
+ },
+ {
+  "id": "FC-39",
+  "title": "ipc.ts hotkey doc says \"All four at once\" for five hotkeys",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src/lib/ipc.ts:53-54"
+  ],
+  "claim": "The doc comment at ipc.ts:53-54 says \"All four at once\" while there are five hotkeys.",
+  "scenario": "Misleading documentation for the hotkey IPC call.",
+  "fix": "Correct the comment.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/lib/ipc.ts:54 `/** All four at once — the core only accepts them together. */` sits directly above setHotkeys(saveClip, toggleBuffer, screenshot, record, console) at 55-61, which takes five arguments. The Rust side matches: commands.rs:169-177 set_hotkeys(save_clip, toggle_buffer, screenshot, record, console).",
+    "corrected_claim": "",
+    "reachable_by": "Maintainers reading the doc only; no runtime effect.",
+    "fix_assessment": "Change it to 'All five at once'. Also merge it with the separate JSDoc block on line 53: TS tooling attaches only the nearest block, so the 'Throws when...' note is currently lost from hover docs."
+   }
+  ]
+ },
+ {
+  "id": "FC-42",
+  "title": "lockdown.ts matches physical event.code, missing zoom shortcuts on QWERTZ",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "src/lib/lockdown.ts"
+  ],
+  "claim": "`lockdown.ts` matches shortcuts on physical `event.code`, so on QWERTZ keyboards Ctrl+`+`/Ctrl+`-` (codes `BracketRight` and `Slash`) are not caught; it relies on Tauri's own zoom disable.",
+  "scenario": "A user with a German keyboard presses Ctrl++ / Ctrl+-; the lockdown handler does not block it and only Tauri's zoom disable stands in the way.",
+  "fix": "Match on `event.key` as well; (unverified) WebView2 `AreBrowserAcceleratorKeysEnabled=false` would be the robust lock if the wry/Tauri version exposes it.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/lib/lockdown.ts:53-59 `const { code } = event; ... if (event.ctrlKey && WITH_CTRL.has(code)) return true;` with WITH_CTRL (30-48) holding only \"Equal\",\"Minus\",\"Digit0\",\"NumpadAdd\",\"NumpadSubtract\",\"Numpad0\" for zoom. On German QWERTZ the '+' key is physical code BracketRight and '-' is Slash, so neither matches. The comment at lockdown.ts:78-79 says Tauri's zoom-hotkey switch-off is the main lock. That lock is on: tauri-runtime-2.11.3/src/webview.rs:526 `zoom_hotkeys_enabled: false` (default), tauri-utils-2.9.3/src/config.rs:2342 `zoom_hotkeys_enabled: false`, tauri.conf.json and console.rs/overlay.rs never enable it, and wry-0.55.1/src/webview2/mod.rs:572 `settings.SetIsZoomControlEnabled(attributes.zoom_hotkeys_enabled)?;`.",
+    "corrected_claim": "",
+    "reachable_by": "Any user with a non-US layout (QWERTZ/AZERTY) pressing Ctrl+'+' or Ctrl+'-' in any of the three windows. The keys pass the JS lockdown, but WebView2's IsZoomControlEnabled=false (Tauri default) still blocks zoom. That last part rests on WebView2's documented behaviour, which cannot be checked from source here.",
+    "fix_assessment": "Also matching event.key ('+', '-', '=', '0') with ctrlKey closes the second-lock gap cheaply. The 'unverified' AreBrowserAcceleratorKeysEnabled route exists in wry 0.55.1 (with_browser_accelerator_keys, webview2/mod.rs:582-584) but is not exposed by tauri/tauri-runtime-wry 2.11.x, so it would need with_webview plus webview2-com. It would also disable F5/Ctrl+F etc. wholesale, which may affect the hotkey recorder."
+   }
+  ]
+ },
+ {
+  "id": "FC-44",
+  "title": "Menu re-subscribes five window listeners on every render",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "src/components/ui/Menu.tsx:143-192"
+  ],
+  "claim": "The effect in Menu.tsx:143-192 depends on `selectable` and `run`, which are new on every render, so it removes and re-adds five window listeners on every render.",
+  "scenario": "Every re-render of an open menu churns five window listeners.",
+  "fix": "Memoize `selectable`/`run` or read them through refs so the effect subscribes once.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/components/ui/Menu.tsx:132-135 `const selectable = entries.map(...).filter(...).map(...)` and 137-141 `const run = (entry: MenuEntry) => {...}` are recreated on every render (no useMemo/useCallback, and vite.config.ts uses plain @vitejs/plugin-react with no React Compiler). Menu.tsx:192 `}, [active, entries, onClose, selectable, run]);` therefore re-runs the effect on every render. The effect removes and re-adds 5 window listeners (179-190: pointerdown, blur, resize, keydown, scroll). Surface re-renders on every onMouseEnter/onMouseLeave (219-220 setActive), on arrow keys, after mount (121-130 setAt/setShown), and whenever MenuProvider re-renders, since Surface is not memoized.",
+    "corrected_claim": "",
+    "reachable_by": "Any open context menu: hovering entries or using arrow keys re-renders Surface and churns the listeners. The cost is a few microseconds and nothing breaks.",
+    "fix_assessment": "Memoizing selectable/run alone is not enough: `active` is also a dependency and changes on every hover, which is the main source of re-renders. Read active, selectable and run (and entries) through refs, or move Enter handling to use a ref, so the effect subscribes once per open."
+   }
+  ]
+ },
+ {
+  "id": "FC-46",
+  "title": "SlidingIndicator transitions width",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "src/components/ui/SlidingIndicator.tsx"
+  ],
+  "claim": "`SlidingIndicator` transitions `width` (a layout property) rather than a transform.",
+  "scenario": "Each indicator move triggers layout on every animation frame.",
+  "fix": "Animate with `transform` (scaleX/translateX) instead of width.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/components/ui/SlidingIndicator.tsx:79 `\"transition-[transform,width] duration-[260ms] ease-[var(--ease-out-soft)]\"` and place() at 44-49 `pill.style.width = `${target.offsetWidth}px`; ... pill.style.transform = `translate(...)``. Width is a layout property, so during each 260 ms move the browser re-lays out the absolutely positioned (78 `absolute top-0 left-0`, pointer-events-none) span every frame. Used by the segmented control (Controls.tsx:70) and NavBar.tsx:54.",
+    "corrected_claim": "",
+    "reachable_by": "A user switching a tab or segment (or a ResizeObserver-driven re-place). This means about 16 frames of layout per move on one out-of-flow element, which costs very little.",
+    "fix_assessment": "Animating scaleX would distort the rounded-pill corners (border-radius scales with it), so it is not a drop-in fix. It would need a fixed-size pill with separately scaled end caps, or a clip-path/inset animation. Given the tiny cost, leaving it is reasonable."
+   }
+  ]
+ },
+ {
+  "id": "FC-3",
+  "title": "Main window keeps rendering and receiving 20 Hz IPC while the user is gaming",
+  "severity": "high",
+  "category": "perf",
+  "locations": [
+   "src-tauri/tauri.conf.json:27",
+   "src-tauri/src/overlay.rs:40-56",
+   "src-tauri/src/lib.rs:964-967",
+   "src/store.ts:272",
+   "src/routes/Clips.tsx:707",
+   "src/components/NavBar.tsx:176",
+   "src/components/NavBar.tsx:49",
+   "src/styles/motion.css:132-134",
+   "src/lib/accent.ts:157"
+  ],
+  "claim": "tauri.conf.json:27 gives the main window `--disable-features=...CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding`; per overlay.rs:40-56 and the README these flags exist for the banner, which now has its own data dir and browser process. The core emits `audio-levels` to `main` at 20 Hz whenever the window is visible and not minimized (lib.rs:964-967), including when behind the game, and store.ts:272 does `set({ levels })` on every page even with no meter on screen; each `set` runs every subscriber's selector (the gallery has one per tile, `NameField`, Clips.tsx:707). NavBar.tsx:176 renders `<LiveDot />` whenever the buffer runs, an infinite animation (motion.css:132-134, `cb-live-ring 2s infinite`) inside a `backdropFilter: \"blur(20px)\"` pill (NavBar.tsx:49), so the compositor produces frames continuously and likely re-blurs each frame. In RGB accent mode accent.ts:157 runs `setInterval(refresh, 80)` rewriting 16 root custom properties (whole-document style recalc), gated only by `!document.hidden`, which does not change when the window is merely occluded once occlusion detection is off.",
+  "scenario": "While the user is gaming with ClippiBoy's main window open behind the game, the main window keeps animating, re-blurring, recalculating styles every 80 ms in RGB mode (huge with a 1000-tile gallery) and processing 20 Hz level IPC that notifies every store subscriber, costing CPU/GPU during gameplay. Code facts confirmed; magnitude needs measuring.",
+  "fix": "1) Drop the three occlusion/backgrounding flags from the main window. 2) Add a frontend \"dormant\" mode driven by `onHidden`, `blur`, `focus` from lib/hidden.ts: set `html[data-dormant]` with `[data-dormant] [class*=\"cb-\"]{animation-play-state:paused}` and stop the accent interval. 3) Make levels opt-in (ref-counted `api.watchLevels(on)` while a `Meter` is mounted, or a separate tiny levels store). 4) Throttle RGB mode to 2-4 Hz or animate it with `filter: hue-rotate()` on the few accent surfaces.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "partial",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "tauri.conf.json:27 main window \"additionalBrowserArgs\": \"--disable-features=...,CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding\". overlay.rs:31-37 says these switches exist because the banner is \"hidden between banners, and over a fullscreen game covered\"; overlay.rs:46-50 + 62-68 + 166-176 and console.rs:62-71 give banner and console their own data dir \"EBWebView-overlay\" and BROWSER_ARGS, so the main window no longer has to share their flags. lib.rs:846-851 window_awake = `window.is_visible().unwrap_or(true) && !window.is_minimized()` (a window covered by a game is still visible), polled every 10 ticks at lib.rs:952-955; lib.rs:964-967 `if watched { handle.emit_to(\"main\", \"audio-levels\", &levels) }` every 50 ms. store.ts:272 `events.onLevels((levels) => set({ levels }))` runs on every page. Clips.tsx:707 `useEngine((state) => state.updateClip)` is one selector per tile, but it returns a stable function, so it costs almost nothing and causes no re-render. Clips.tsx:79-92 uses useShallow so the gallery does not re-render, and AudioMixer.tsx:604 is the only levels consumer. NavBar.tsx:49 `backdropFilter: \"blur(20px)\"`; NavBar.tsx:175-176 `{active ? <LiveDot /> ...}`; motion.css:132-134 `.cb-live-ring { animation: cb-live-ring 2s ... infinite; }`. accent.ts:149-151 `if (current?.mode === \"rgb\" && !document.hidden) applyAccent(current)`, accent.ts:157 `window.setInterval(refresh, FRAME_MS)` with FRAME_MS = 80 (accent.ts:63), and paint() writes 16 STEPS properties on documentElement.style (accent.ts:86-89). model.rs:419-421: AccentMode defaults to Solid, so RGB is opt-in. hide_to_tray (lib.rs:1123-1126) hides the window, which correctly stops levels; the defect only affects the window when it is open but covered.",
+    "corrected_claim": "The code facts are correct and the situation happens in ordinary use. When the main window is left open (not closed to tray, not minimized) behind a game, the core still sends 20 Hz audio-levels to it, because window_awake only checks visible/minimized and not covered. The renderer also never learns it is covered, because CalculateNativeWinOcclusion and backgrounding are turned off for the main window, which no longer needs those flags now that banner and console use their own data dir. So the NavBar LiveDot ring keeps the compositor making frames at the display rate, and in opt-in RGB mode the root custom properties are rewritten every 80 ms, forcing a style recalc of the whole document. The cost is overstated, though. The per-tile NameField selector is a trivial stable-function lookup that never re-renders, so the 20 Hz IPC adds only an event parse and a few thousand no-op selector calls per second. Re-running the backdrop blur every frame is plausible but unproven (in RGB mode the hero gradient behind the pill changes, so there it does re-blur). The only CPU cost that matters is RGB mode on a large, non-virtualised gallery, and RGB is not the default. Medium/low perf issue, not high.",
+    "reachable_by": "Ordinary use by the user: start ClippiBoy manually (the main window opens; only autostart hides it, lib.rs:1235-1238), leave the window open, and launch a game that covers it while the replay buffer runs (LiveDot shown). The worst case needs RGB accent mode chosen in settings and the Clips page with many clips as the current route. No attacker involvement.",
+    "fix_assessment": "Dropping the three flags from tauri.conf.json is the right core fix. It lets Chromium mark the covered window hidden, which stops the CSS animation, compositor frames and RGB refresh (that one is already gated on document.hidden). It does not stop the levels IPC, because the core gates on is_visible, so that needs the renderer to report visibilitychange to the core or the opt-in levels subscription the finding suggests. A blur/focus-based 'dormant' mode is too aggressive: it would freeze meters and animations on a main window shown on a second monitor during play."
+   },
+   {
+    "lens": "impact",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src-tauri/tauri.conf.json:27 main window: \"--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding\". overlay.rs:30-37 says these switches exist because the banner window is \"hidden between banners, and over a fullscreen game covered\" and \"The three switches keep the drawing going\"; overlay.rs:50-52 + data_dir() (EBWebView-overlay) show banner/console now run in their own browser process, so main is not forced to share the args. Tauri's hide does not touch WebView2 visibility: tauri-runtime-wry-2.11.4/src/lib.rs:3490 `WindowMessage::Hide => window.set_visible(false)` (tao window only, no controller.SetIsVisible). Levels: lib.rs:850 `window.is_visible().unwrap_or(true) && !window.is_minimized()`, lib.rs:964-967 `if watched { handle.emit_to(\"main\", \"audio-levels\", &levels) }` every 50 ms -> stops in tray/minimized, continues when merely covered. store.ts:272 `events.onLevels((levels) => set({ levels }))`; Clips.tsx:707 `useEngine((state) => state.updateClip)` per tile (stable fn, no re-render). NavBar.tsx:49 `backdropFilter: \"blur(20px)\"`, :176 `<LiveDot />` when buffer active; motion.css:132-133 `.cb-live-ring { animation: cb-live-ring 2s ... infinite; }`. accent.ts:147-148 `if (current?.mode === \"rgb\" && !document.hidden) applyAccent(current)`, :157 `window.setInterval(refresh, FRAME_MS)` with FRAME_MS = 80, paint() writes the 16 STEPS properties on documentElement.style; the docstring (accent.ts:122-123) intends it to run only \"as long as the window is showing\". Clips.tsx has no virtualization/content-visibility.",
+    "corrected_claim": "The code facts hold, but the impact is mis-weighted and the scope is wrong in both directions. (1) The 20 Hz level stream is close to free: Rust already stops it when main is hidden to tray or minimized (lib.rs:850). When it runs, each set() only re-runs trivial selectors such as `state.updateClip`, which return stable values, so nothing re-renders; 1000 tiles at 20 Hz is about 20k no-op calls per second. (2) The real costs are the always-on LiveDot compositor animation inside a backdrop-blur pill, which runs whenever the buffer is on (the normal state while gaming), and the opt-in RGB accent's whole-document style recalc every 80 ms, which is expensive with a large unvirtualized gallery. (3) These costs probably occur not only when main is behind the game but also when it sits in the tray. Tauri's hide() does not set the WebView2 controller invisible, and overlay.rs's own comment says these switches keep a hidden window drawing. So document.hidden likely stays false in the tray too, and the RGB interval and animation keep running there. That last point depends on WebView2 runtime behaviour. The magnitude is unmeasured, and nothing is broken, so this is a perf inefficiency, not a high-severity defect.",
+    "reachable_by": "Any user who games with the replay buffer on while the ClippiBoy main window is open behind the game, and very likely also while it is hidden to the tray (LiveDot animation, frame production). Users with RGB accent mode pay much more (whole-document style recalc at 12.5 Hz, growing with gallery size). No attacker involvement.",
+    "fix_assessment": "Step 1 alone is the right minimal fix. Change main's additionalBrowserArgs to \"--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection\" (keep wry's defaults) and drop CalculateNativeWinOcclusion and both backgrounding switches. WebView2 then marks the page hidden when it is covered, minimized or in the tray, which stops animation frames and makes the existing document.hidden gate in accent.ts work as its docstring intends. This looks safe: the frontend does no network work (no fetch/WebSocket in src; that runs in Rust), its timers are 30 s and up or UI-only, and hidden.ts already pauses video on tray. As a cheap extra guard, have accent.ts also check isHidden() from lib/hidden.ts. Step 2 (a dormant CSS mode) mostly becomes redundant. Step 3 (ref-counted levels) is not worth the complexity given the negligible cost. Step 4 (throttling RGB to 2-4 Hz, or scoping the variables off the root) is a reasonable separate improvement for large galleries."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "tauri.conf.json:27 main window: \"additionalBrowserArgs\": \"--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding\". The only documented reason is the banner (README.md:563-569; overlay.rs:30-38). overlay.rs:48-50 only says the main window keeps the GPU \"und darum seine eigenen Argumente\", with no reason given for the occlusion flags. overlay.rs:52-57 BROWSER_ARGS + data_dir 'EBWebView-overlay' (overlay.rs:63-68) give banner and console their own browser process. lib.rs:846-851 window_awake = `window.is_visible().unwrap_or(true) && !window.is_minimized().unwrap_or(false)`; tao util.rs:203 is_visible = IsWindowVisible, window.rs:627 is_minimized = IsIconic, so an occluded window counts as awake. lib.rs:960-967 `if tick % 10 == 0 { watched = window_awake(&handle, \"main\"); ...} if watched ... handle.emit_to(\"main\", \"audio-levels\", &levels)` runs every 50 ms. store.ts:272 `events.onLevels((levels) => set({ levels }))` runs on every route; zustand 5.0.15 vanilla.mjs setState calls `listeners.forEach(...)`, so every useEngine selector runs (Clips.tsx:707 NameField per tile; no virtualization or pagination in Clips.tsx). NavBar.tsx:49 `backdropFilter: \"blur(20px)\"` wraps BufferBadge (NavBar.tsx:87), which renders <LiveDot/> (NavBar.tsx:176). LiveDot.tsx uses `cb-live-ring`, and motion.css:132-134 has `animation: cb-live-ring 2s ... infinite`. accent.ts:147-157: `refresh = () => { if (current?.mode === \"rgb\" && !document.hidden) applyAccent(current); }` and `window.setInterval(refresh, FRAME_MS)` with FRAME_MS = 80 (accent.ts:64). paint() sets all 16 STEPS properties on documentElement.style (accent.ts:17-36, 83-86). Closing the window hides it (lib.rs:1276-1279 -> hide_to_tray), so the scenario needs the main window left open behind the game, which is ordinary use.",
+    "corrected_claim": "",
+    "reachable_by": "Any user who leaves the main window open (not closed to the tray, not minimized) behind a borderless or windowed game while the buffer runs. The 80 ms whole-document restyle needs RGB accent mode, and it costs most with a large clip gallery open.",
+    "fix_assessment": "Items 3 (ref-counted level subscription, or a Rust-side focus/occlusion check in window_awake) and 4 (throttle RGB, or use hue-rotate) are safe and fix the code-proven costs. Item 1 depends on WebView2 occlusion behaviour that cannot be checked from source, and it would also bring back timer throttling for the main window's player and drift timers (useClipMix.ts:353), so it needs a check on a real machine. Item 2 should pause animations only, never media, on blur."
+   }
+  ]
+ },
+ {
+  "id": "FC-16",
+  "title": "Focus is lost to <body> when delete is swapped for ConfirmDelete",
+  "severity": "medium",
+  "category": "a11y",
+  "locations": [
+   "src/components/ui/ConfirmDelete.tsx"
+  ],
+  "claim": "Clicking delete swaps the trigger for `ConfirmDelete`, so the focused element disappears and focus falls to `<body>`.",
+  "scenario": "A keyboard user activates delete and loses their place; the next Tab starts from the top of the document.",
+  "fix": "Move focus to ConfirmDelete's Cancel button (the safe default).",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Every caller swaps the focused trigger for the question by conditional render, e.g. src/components/ClipPlayer.tsx:963-979 `{askingDelete ? (<ConfirmDelete ... onCancel={() => setAskingDelete(false)} />) : (<Button ... onClick={() => setAskingDelete(true)}>Delete</Button>)}`; the same pattern is at ShotViewer.tsx:1078/1216, ClipEditor.tsx:186, settings/Friends.tsx:141, Clips.tsx:575/586 and Console.tsx:693. ConfirmDelete.tsx:11-13 deliberately takes no focus (\"unlike that one it does **not** focus its own confirm button\"), and there is no autoFocus, ref.focus(), focus trap or role=dialog anywhere around these sites (grep for .focus(/autoFocus/aria-modal finds only unrelated text fields). So when the user presses Enter/Space on Delete, the focused button is unmounted and document.activeElement falls back to <body>. Cancel (button or Escape, ConfirmDelete.tsx:43-49) unmounts the question and drops focus again.",
+    "corrected_claim": "The defect is real at every ConfirmDelete site, not only in ConfirmDelete.tsx: the trigger is unmounted, nothing gets focus, and the question that appears is neither focused nor announced (no live region), so a screen reader user hears nothing. The same happens on cancel. The stated consequence is wrong for this app's WebView2/Chromium engine, though. Chromium keeps a sequential-focus-navigation starting point where the removed element was, so the next Tab does not restart at the top of the document. It goes on from the old Delete position and normally lands on the question's own 'Confirm deletion' button, which comes first in ConfirmDelete.tsx:62. Escape still cancels because the listener sits on window. The impact is a lost screen-reader context, not a lost place in the Tab order.",
+    "reachable_by": "Ordinary local use by a keyboard or screen-reader user who activates any Delete / Discard / Free up space / Delete account button (clip player, screenshot viewer, gallery tile, editor, console, settings > Friends). Mouse users trigger the same focus loss but are not affected by it. Nobody remote can trigger it.",
+    "fix_assessment": "Focusing the Cancel button on mount (for example with a ref and focus({preventScroll:true}) in ConfirmDelete's effect) fits the component's 'no stray Enter confirms' rule and fixes every caller at once. Callers should also return focus to the trigger after cancel, which requires the callers' help, since the trigger is re-mounted."
+   },
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ui/ConfirmDelete.tsx:43-80 has no ref, focus() or autoFocus; its only effect adds a window keydown listener for Escape (lines 43-49). The doc comment at lines 11-13 says it deliberately does not focus its confirm button, and it focuses nothing else either. Every call site swaps the focused trigger out by conditional rendering, so the trigger unmounts: ShotViewer.tsx:1216 `{askingDelete ? (<ConfirmDelete .../>) : (<Button ... onClick={() => setAskingDelete(true)}>Delete</Button>)}`; the same pattern is at ShotViewer.tsx:1078 (Discard), ClipPlayer.tsx:963, ClipEditor.tsx:186 (Free up space), Clips.tsx:575/586 (IconAction 'Delete clip'), Console.tsx:693 and settings/Friends.tsx:141. When the focused button is removed, document.activeElement becomes <body>, and nothing tells a screen reader that the question appeared. Focus is also not given back when ConfirmDelete unmounts after Cancel, Escape or Confirm.",
+    "corrected_claim": "Focus does fall to <body> and the question is never focused or announced. That part is true at all 8 call sites, not only in ConfirmDelete.tsx, and focus is not given back to the trigger after Cancel or Escape either. The scenario overstates the effect: the app runs in WebView2 (Chromium), which keeps a sequential-focus-navigation starting point where the removed element was. So the next Tab most likely lands on the new Confirm button, the destructive one, rather than going back to the top of the document. This part rests on Chromium behaviour and cannot be checked from source here.",
+    "reachable_by": "Any keyboard or screen-reader user who activates a Delete, Discard, 'Free up space' or 'Delete account' trigger with Enter or Space.",
+    "fix_assessment": "Focusing the Cancel button on mount (autoFocus or a ref in a useEffect) is a sound fix and keeps the stated rule that a stray Enter or Space must not confirm. The fix should also give focus back to the trigger when the question is dismissed, otherwise focus is lost a second time on Cancel or Escape."
+   }
+  ]
+ },
+ {
+  "id": "FC-2",
+  "title": "Sliders write every intermediate value; dragging the buffer slider discards footage",
+  "severity": "high",
+  "category": "bug",
+  "locations": [
+   "src/routes/Recording.tsx:393-409",
+   "src/routes/Recording.tsx:468-477",
+   "src-tauri/src/state.rs:381-388",
+   "src-tauri/src/buffer.rs:69-73",
+   "src/routes/settings/Sounds.tsx:257-263",
+   "src/routes/settings/Sounds.tsx:297-303",
+   "Console.tsx:229-236",
+   "src/routes/AudioMixer.tsx:384-391"
+  ],
+  "claim": "The buffer-length slider in Recording.tsx:393-409 uses `onChange={(seconds) => patchConfig({ buffer: { ...config.buffer, seconds, ... } })}` and the memory-budget slider at Recording.tsx:468-477 does the same, so every intermediate drag value is written. The core applies each value immediately: state.rs:381-388 calls `shared.packets.lock().set_capacity(next.buffer.seconds, memory)` and buffer.rs:69-73 `set_capacity` calls `self.trim()`. The same per-move write pattern exists in Sounds.tsx:257-263 and :297-303 (100 steps), the console scale slider in Console.tsx:229-236, and the gain slider in AudioMixer.tsx:384-391 (`upsertSource` on every move).",
+  "scenario": "The buffer holds 10 minutes; the user drags the length slider down past 30 s and back to 5 min. The ring was trimmed to 30 s mid-drag and the footage is gone; the memory slider drops old GOPs the same way. Each tick is a synchronous `set_config` on the Tauri main thread running `replace_config`, which writes the config file (`config::save`), may spawn an audio-refresh thread enumerating the process tree, and calls `apply_autostart` (registry read), `overlay::reposition` and `console::relayout` - 30-100 times per drag. With optimistic updates and last-reply-wins, the thumb can also jump back while dragging.",
+  "fix": "Give `Slider` a local draft value and an `onCommit` callback fired on `pointerup`/`keyup` (or `change`) and write only on commit; alternatively reuse the `SETTLE_MS` debounce from Colors.tsx:29-34. On the core side, debounce `config::save`.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src/components/ui/Controls.tsx:114 `onChange={(e) => onChange(Number(e.target.value))}` on a plain <input type=range> (React onChange = every input event, no commit stage). src/routes/Recording.tsx:398-407 buffer slider -> patchConfig({buffer:{...seconds, clipSeconds: Math.min(config.buffer.clipSeconds, seconds)}}); :474-476 memory slider -> patchConfig. src/store.ts:362-367 patchConfig sets optimistically then `await api.setConfig(config)`; src/lib/ipc.ts:47 `invoke<void>(\"set_config\", ...)` so the reply is discarded. src-tauri/src/commands.rs:54-55 `#[tauri::command] pub fn set_config` (sync -> main thread) -> state.rs:381-388 `if next.buffer.seconds != previous.buffer.seconds || memory != ... { ... if self.buffer_wanted() { shared.packets.lock().set_capacity(next.buffer.seconds, memory); } }` -> buffer.rs:69-73 set_capacity calls trim(); buffer.rs:93-107 trim pops whole GOPs while `newest_pts - pts >= capacity_us` or `bytes > capacity_bytes`. Dropped packets are not recoverable. state.rs:398 config::save on every call. Other slider sites really are at src/routes/settings/Sounds.tsx:47-53 and :87-93 (file is 110 lines) and src/routes/settings/Console.tsx:47-54, not the cited lines; AudioMixer.tsx:384-391 is correct and goes through store.ts:411-423 upsertSource which does `set({ config })` with each reply.",
+    "corrected_claim": "Real: every drag tick of the buffer-length or memory-budget slider is a synchronous set_config that, while the replay buffer is running, immediately calls ReplayBuffer::set_capacity -> trim(), so overshooting below the final value mid-drag (e.g. 600 -> 30 -> 300) permanently drops the older GOPs; with memoryMb=0 (auto) the budget also follows seconds. Footage is only lost on an overshoot below the release value; a monotone drag to the target loses nothing beyond what the target itself would. A second persistent side effect the finding misses: Recording.tsx:404 clamps clipSeconds with Math.min on every tick, so dragging the buffer below the clip length and back leaves the clip length permanently reduced. Wrong details: Sounds.tsx lines are 47-53/87-93 and the console slider is src/routes/settings/Console.tsx:47-54; the 'last-reply-wins, thumb jumps back' effect does not apply to patchConfig sliders (set_config reply is typed void and ignored, store.ts:367) - it only applies to the AudioMixer gain slider via upsertSource. Main-thread cost per tick is real (config::save, overlay::reposition, apply_autostart is_enabled check; apply_audio is coalesced by the `applying` flag in audio/engine.rs:191) but bounded to ~39-100 steps per full sweep. Severity is medium, not high.",
+    "reachable_by": "Ordinary use by the local user: open the Recording page in the main window while the replay buffer is running and drag the Buffer length or Memory budget slider below the final value before releasing. No guard: the sliders have no disabled state while buffering and set_config/replace_config apply the capacity unconditionally when buffer_wanted() is true. Moderately likely (overshooting while dragging is common); impact is loss of the replay history buffered so far, captured while the user is in settings.",
+    "fix_assessment": "Commit-on-release (local draft value in Slider plus onCommit on pointerup/keyup/change) is the right fix for the buffer and memory sliders and also fixes the clipSeconds clamp; a plain SETTLE_MS-style debounce is weaker because a pause of more than 150 ms at a low value would still trim. Debouncing config::save on the core side is a reasonable extra but does not by itself prevent the trim."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src/components/ui/Controls.tsx:91-116 Slider is a bare <input type=\"range\"> with `onChange={(e) => onChange(Number(e.target.value))}`; there is no local draft, no commit on release and no debounce, and React's onChange on a range input fires on every input event. src/routes/Recording.tsx:393-409 `onChange={(seconds) => patchConfig({ buffer: { ...config.buffer, seconds, ... } })}` and :468-477 `onChange={(memoryMb) => patchConfig({ buffer: { ...config.buffer, memoryMb } })}`. src/store.ts:362-372 patchConfig sets the store and then calls `await api.setConfig(config)` on every call, with no throttling. src-tauri/src/commands.rs:54-55 `#[tauri::command] pub fn set_config` is a sync command (not `(async)`), so it is a blocking handler. It calls state.replace_config (:85), allow_clip_dir, overlay::reposition (:100), apply_autostart (:107; lib.rs:702 `manager.is_enabled()` on every call) and console::relayout when console fields change (:149). src-tauri/src/state.rs:375-388: when seconds or effective memory differ, `shared.packets.lock().set_capacity(next.buffer.seconds, memory)`. Then :398 `config::save(&next)`, which writes a temp file and renames it (config.rs:176-184). It also calls apply_audio -> engine.rs:187-195, which spawns a thread unless one is already applying. src-tauri/src/buffer.rs:69-73 set_capacity sets capacity_us/capacity_bytes and calls `self.trim()`. trim (:89-110) pops whole GOPs from the front while `newest_pts - pts >= capacity_us` or `bytes > capacity_bytes`, and the dropped packets are never restored when the capacity grows again. The other per-move writers exist too: Sounds.tsx:47-53 and :87-93 (`patch({ volume: value / 100 })`, 0-100 step 1 -> set_config). settings/Console.tsx:47-54 (`patchConfig({ consoleScale })`, 0.8-1.6 step 0.1, which triggers console::relayout). AudioMixer.tsx:384-391 (`upsertSource({ ...source, gainDb })` -> update_audio_source -> state.upsert_source -> replace_config, so config::save on every move).",
+    "corrected_claim": "The core mechanism is as described. Details: the Sounds sliders are at src/routes/settings/Sounds.tsx:47-53 and :87-93 (the file has only 110 lines), and the console-scale slider is at src/routes/settings/Console.tsx:47-54, not 'Console.tsx:229-236'. The 'thumb jumps back / last-reply-wins' point holds only for the AudioMixer gain slider: upsertSource applies the core's reply with `set({ config })` (store.ts:418-422). patchConfig ignores the reply of set_config (store.ts:367), so the buffer, memory, sound and console sliders cannot jump back that way. Shrinking the ring on purpose (releasing at a lower value) also discards footage by design. The defect is that values passed through mid-drag are applied for good.",
+    "reachable_by": "Any user dragging the Buffer length or Memory budget slider on the Recording page while the replay buffer is running. The ring is trimmed as soon as the thumb passes a value below the footage already held (or below the bytes held), and dragging back up does not restore it. Every slider listed above also causes per-move set_config calls with a synchronous config write.",
+    "fix_assessment": "Giving Slider a local draft value and committing on pointerup/keyup/change (or debouncing like Colors.tsx SETTLE_MS = 150) fixes both the footage loss mid-drag and the write storm. A core-side debounce of config::save alone would not stop the trim, because set_capacity runs before the save in replace_config."
+   },
+   {
+    "lens": "impact",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Controls.tsx:115 `onChange={(e) => onChange(Number(e.target.value))}` (React onChange on a range input fires on every step). Recording.tsx:399-408 and 474-476 call patchConfig on each step. store.ts:362-367 patchConfig sets state optimistically, then `await api.setConfig(config)`; ipc.ts:47 `setConfig: ... invoke<void>(\"set_config\")`, so the reply is never applied. state.rs:381-389: on a changed seconds/memory value, `shared.packets.lock().set_capacity(next.buffer.seconds, memory)`. buffer.rs:69-73 `set_capacity` -> `self.trim()`; buffer.rs:95-110 drops whole leading GOPs while `newest_pts - keyframes[1].pts >= capacity_us` or `bytes > capacity_bytes`. pipeline.rs:380-384 trims the audio rings the same way. Cost per step: config.rs:180-183 writes a temp file and renames it (atomic). engine.rs:191 drops an audio refresh when one is already running. lib.rs:702 does a registry check and returns early. commands.rs:111-113 shows the per-move writes are known and handled on purpose (no capture restart). The gain slider path is different: store.ts:418-422 `const config = await api.updateAudioSource(source); set({ config });` does apply each reply. The cited Sounds.tsx:257-263/297-303 and Console.tsx:229-236 do not exist (the files have 110 and 150 lines). The real sites are Sounds.tsx:47-53 and 87-93 and settings/Console.tsx:47-54.",
+    "corrected_claim": "Every step of a slider drag goes to the core. When the replay buffer is running and the length or memory slider passes below the value the user finally settles on, the ring (video and audio) is trimmed to that lower value at once, and the oldest unsaved footage is gone. Moving back up does not restore it; the ring only refills in real time. Footage is lost only on an overshoot below the final value during a live buffer. Saved clips are never touched. A drag that moves straight to its target loses nothing beyond what that target removes anyway. Each step runs set_config synchronously: an atomic config write, a registry check and an overlay reposition, while concurrent audio refreshes are dropped. That is wasteful but bounded, with no hang and no risk of corrupting the config. The thumb jumping back does not happen for patchConfig sliders (buffer, memory, sounds, console scale), because set_config's reply is discarded (ipc.ts:47, store.ts:367). It can happen briefly only for the mixer and console gain sliders, where upsertSource applies each reply (store.ts:418-422) and a stale reply can land after a newer optimistic value until the last reply arrives. A related side effect: when the buffer is dragged below the clip length, clipSeconds is clamped (Recording.tsx:405) and stays lowered after dragging back up. The Sounds.tsx and Console.tsx line numbers in the finding are wrong.",
+    "reachable_by": "The local user, by dragging the Buffer length or Memory budget slider on the Recording page while the replay buffer is running and passing below the value they end on. The gain flicker comes from dragging a volume slider in the Audio mixer or the console audio panel.",
+    "fix_assessment": "A local draft value plus a commit on pointerup/keyup (or the native `change` event) is correct and enough for the buffer and memory sliders. It also prevents the clipSeconds ratchet. Gain and console-scale sliders benefit from live feedback, so throttle those instead of committing on release, and discard stale upsertSource replies with a request sequence number. A smaller core-side guard is an alternative: keep live updates, but delay the shrinking set_capacity (and debounce config::save) by a few hundred ms after the last change."
+   }
+  ]
+ },
+ {
+  "id": "FC-23",
+  "title": "No ESLint config although eslint-disable comments exist; floating promises go undetected",
+  "severity": "medium",
+  "category": "quality",
+  "locations": [
+   "src/components/ClipPlayer.tsx:210",
+   "src/components/Setup.tsx:128",
+   "src/components/Share.tsx:295",
+   "src/components/ShotViewer.tsx:362",
+   "src/components/ShotViewer.tsx:414",
+   "src/routes/AudioMixer.tsx:242",
+   "src/routes/Clips.tsx:602"
+  ],
+  "claim": "The repo has no ESLint config, yet five `eslint-disable-next-line react-hooks/exhaustive-deps` comments exist (ClipPlayer.tsx:210, Setup.tsx:128, Share.tsx:295, ShotViewer.tsx:362, :414). Without `@typescript-eslint/no-floating-promises`, floating promises such as `upsertSource(s);` (AudioMixer.tsx:242) and `inTauri && api.revealClip()` (Clips.tsx:602) go unflagged.",
+  "scenario": "Hook-dependency mistakes and unhandled promise rejections slip into the frontend with no lint step to catch them.",
+  "fix": "Add a flat ESLint config with `eslint`, `typescript-eslint`, `eslint-plugin-react-hooks` (recommended-latest) and `eslint-plugin-jsx-a11y`, and enable `@typescript-eslint/no-floating-promises`.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "package.json devDependencies list only tailwind, tauri cli, @types/react*, vite plugin, typescript and vite. There is no eslint dependency, no node_modules/eslint*, and no eslint.config*/.eslintrc*/biome/oxlint file in the repo. `scripts.build` is `tsc --noEmit && vite build` and no workflow in .github/workflows runs a linter. grep finds exactly five `// eslint-disable-next-line react-hooks/exhaustive-deps` comments (ShotViewer.tsx:362, :414, Setup.tsx:128, ClipPlayer.tsx:210, Share.tsx:295); they are inert. Floating promises: AudioMixer.tsx:241-242 `onAdd={(s) => { upsertSource(s); setAdding(false); }}` is a real floating expression statement, but upsertSource (store.ts:411-423) awaits api.addAudioSource, and that backs onto src-tauri/src/commands.rs:302 `pub fn add_audio_source(...) -> AppConfig` (infallible). It can only reject on an IPC/serde failure, so in practice it does not produce an unhandled rejection. Clips.tsx:602 `onClick={() => inTauri && api.revealClip(clip.id)}` can really reject: commands.rs:772-786 returns Err for 'clip not found' or an opener failure, there is no catch, and no unhandledrejection handler exists in src/. But this is an expression-bodied arrow whose promise is *returned*, so @typescript-eslint/no-floating-promises would NOT flag it. Only no-misused-promises (checksVoidReturn.attributes) catches a promise-returning handler in a void-typed onClick.",
+    "corrected_claim": "Correct: the frontend has no lint step at all; the five eslint-disable comments are dead; nothing checks hook dependencies or promise handling. Overstated: this is a tooling gap, not a defect. Of the two examples, the AudioMixer.tsx:242 one cannot reject in practice because add_audio_source/update_audio_source return AppConfig, not Result. The Clips.tsx:602 one can reject ('clip not found' or an opener error, silently swallowed as an unhandled rejection), but the proposed rule no-floating-promises would not catch it. That needs @typescript-eslint/no-misused-promises.",
+    "reachable_by": "Not a runtime path itself; it affects developers. The only concrete runtime effect found is ordinary user use: clicking 'Show in folder' on a clip whose library entry vanished, or when the OS opener fails. The error is then dropped as an unhandled rejection with no toast. That is rare in practice.",
+    "fix_assessment": "Reasonable but incomplete. no-floating-promises needs type-aware linting (parserOptions.projectService) and should be paired with no-misused-promises to catch promise-returning JSX handlers like the Clips.tsx one. A lint step must also be added to build or CI, or the config changes nothing."
+   },
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "package.json has no eslint script or devDependency (scripts: dev/build=`tsc --noEmit && vite build`/...), node_modules has no eslint package, and no eslint.config.* or .eslintrc* exists outside node_modules. CI (.github/workflows/release.yml:40-52) runs only npm ci/pack, with no lint step. The five comments exist exactly as cited (ShotViewer.tsx:362, :414, Setup.tsx:128, ClipPlayer.tsx:210, Share.tsx:295 `// eslint-disable-next-line react-hooks/exhaustive-deps`) and have no effect. The floating promises are real and can reject: AudioMixer.tsx:242 `upsertSource(s);` -> store.ts:418-421 `await api.addAudioSource(source)` with no try/catch, after an optimistic `set` at :417, so a core rejection leaves the UI showing a source the core refused, plus an unhandled rejection. Clips.tsx:602 `onClick={() => inTauri && api.revealClip(clip.id)}` -> commands.rs:779-784 can return Err('clip not found' or an opener error), which nothing handles. No global unhandledrejection handler exists (src/main.tsx).",
+    "corrected_claim": "All the facts are correct: there is no ESLint setup, the five disable comments do nothing, and the cited promises can reject without being handled. Two details are off. First, `@typescript-eslint/no-floating-promises` checks expression statements, so it would flag `upsertSource(s);`. It would not flag Clips.tsx:602, because there the promise is the return value of a concise arrow passed to onClick. Catching that needs `@typescript-eslint/no-misused-promises` (checksVoidReturn). Second, a missing lint setup is a tooling gap, not a medium defect. The concrete harm is the unhandled upsertSource/revealClip rejections, where the optimistic source stays in the UI and errors are silently dropped.",
+    "reachable_by": "Developers adding code without a lint step; at runtime, any core-side failure of add_audio_source/update_audio_source or reveal_clip triggered by the user.",
+    "fix_assessment": "A flat ESLint config with typescript-eslint (type-aware), react-hooks and jsx-a11y is reasonable. Enable no-misused-promises along with no-floating-promises, and add a lint step to CI. Separately, upsertSource should catch errors and roll back or set lastError, the way patchConfig already does."
+   }
+  ]
+ },
+ {
+  "id": "FC-26",
+  "title": "tsconfig lacks noUncheckedIndexedAccess (51 errors when enabled)",
+  "severity": "medium",
+  "category": "quality",
+  "locations": [
+   "tsconfig.json",
+   "src/components/ui/Menu.tsx:166",
+   "src/components/ui/Menu.tsx:175",
+   "src/routes/AudioMixer.tsx:184",
+   "src/routes/AudioMixer.tsx:206",
+   "src/routes/Clips.tsx:519",
+   "src/routes/Friends.tsx:107",
+   "src/routes/Recording.tsx:37"
+  ],
+  "claim": "`tsconfig` lacks `noUncheckedIndexedAccess` (and `noImplicitReturns`). Enabling it yields 51 errors; the ones in this slice are Menu.tsx:166, :175, AudioMixer.tsx:184, :206, Clips.tsx:519, Friends.tsx:107 and Recording.tsx:37.",
+  "scenario": "Indexed accesses that may be undefined are typed as defined, hiding possible runtime `undefined` errors at those sites.",
+  "fix": "Turn on `noUncheckedIndexedAccess` and `noImplicitReturns` and fix the reported errors.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "tsconfig.json compilerOptions has strict/noUnusedLocals/noUnusedParameters/noFallthroughCasesInSwitch but neither noUncheckedIndexedAccess nor noImplicitReturns. I ran tsc 5.9.3 against scratchpad configs that extend the repo tsconfig. The base config gives 0 errors, +noUncheckedIndexedAccess gives exactly 51 (all 7 cited sites among them), and +noImplicitReturns gives 0. Every cited site is already guarded. Menu.tsx:164 `if (selectable.length === 0) return;` then :169 `selectable[(next + selectable.length) % selectable.length]`: the index is always in range. Menu.tsx:173 `active >= 0`, and active only ever holds an entries index (onMouseEnter setActive(index) :219, or a selectable value). AudioMixer.tsx:184 `rest.every((s, index) => s.id === config.sources[index].id)`: rest is sources minus one plus one, so the lengths match. AudioMixer.tsx:204 `if (from < 0 || to < 0 || to >= config.sources.length) return;` comes before the swap at :206. Clips.tsx:518 `{links[clip.id] && (` guards :519 `timeLeft(links[clip.id])`. routes/Friends.tsx:107 `presence[f.id] && !presence[f.id].game`. Recording.tsx:17 `const FPS = [30, 60, 120]`, and fpsChoices always returns a non-empty array, so `choices[0]` at :37 is defined.",
+    "corrected_claim": "tsconfig.json does lack noUncheckedIndexedAccess and noImplicitReturns, and turning on noUncheckedIndexedAccess does give 51 errors. noImplicitReturns gives 0. The 7 cited sites are not hidden runtime undefined bugs: each one is guarded by a length or bounds check, a truthiness check, or a non-empty constant, which the flag cannot see. The only one that is even in theory open is Menu.tsx:175. Surface has no key (Menu.tsx:99), so if `open` were replaced while it is mounted, a stale `active` could point past a shorter entries list. In practice the capture-phase pointerdown handler (Menu.tsx:152-155) closes the menu before a second right-click opens a new one. This is a hardening and style choice, not a defect.",
+    "reachable_by": "No user-reachable path at the cited sites. It only matters to developers as compile-time strictness for future code.",
+    "fix_assessment": "Turning on noUncheckedIndexedAccess is a reasonable hardening step, but nearly all 51 sites will need `!` or redundant checks because the code already guards them. noImplicitReturns can be turned on for free (0 errors)."
+   },
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "tsconfig.json has strict/noUnused*/noFallthroughCasesInSwitch but neither noUncheckedIndexedAccess nor noImplicitReturns. `tsc --noEmit -p tsconfig.json --noUncheckedIndexedAccess` (tsc 5.9.3) gives exactly 51 errors, including the 7 listed sites; `--noImplicitReturns` gives 0 errors. Every listed site is already guarded in code: Menu.tsx:164 `if (selectable.length === 0) return;` before :168 `selectable[(next + selectable.length) % selectable.length]` (index always in [0,len-1]); Menu.tsx:174 `active >= 0` and active only comes from selectable indices or onMouseEnter index (:219); AudioMixer.tsx:184 `rest.every((s, index) => s.id === config.sources[index].id)` where rest.length <= config.sources.length (filter + one splice); AudioMixer.tsx:202-206 `if (from < 0 || to < 0 || to >= config.sources.length) return;` before the swap; Clips.tsx:518-519 `{links[clip.id] && (... timeLeft(links[clip.id]) ...)}` (truthy guard TS cannot narrow on a property-key element access); routes/Friends.tsx:107 `presence[f.id] && !presence[f.id].game` (same); Recording.tsx:37 `?? choices[0]` where choices is FPS=[30,60,120] (:17) or a non-empty array containing refresh.",
+    "corrected_claim": "The flag is indeed off and enabling it yields 51 errors, but at all seven listed sites the access is already guarded by a length/bounds/truthy check, so no runtime `undefined` is reachable there; the errors are TS narrowing limitations, not hidden bugs. noImplicitReturns would add zero errors. The only conceivable stale-index path is Menu.tsx:175 if a second menu is opened via the keyboard context-menu key on the same portal host while one is open (Surface keeps its `active` state), which is a far-fetched edge case. This is a hardening/style suggestion, not a medium defect.",
+    "reachable_by": "No runtime trigger at the listed sites; developer-time type-safety only. The Menu stale-active edge case would need the user to open a context menu by keyboard while another is open and then press Enter.",
+    "fix_assessment": "Enabling noUncheckedIndexedAccess is reasonable hardening but costs 51 mostly-noise fixes (non-null assertions or redundant guards); noImplicitReturns can be turned on for free since it reports nothing."
+   }
+  ]
+ },
+ {
+  "id": "FC-31",
+  "title": "Friends route reports errors through a window CustomEvent",
+  "severity": "medium",
+  "category": "quality",
+  "locations": [
+   "src/routes/Friends.tsx:14-17"
+  ],
+  "claim": "`report()` in routes/Friends.tsx:14-17 sends errors through a window `CustomEvent` instead of the store.",
+  "scenario": "Error reporting bypasses the normal store/toast path, an odd side channel that is hard to trace.",
+  "fix": "Route errors through a store-level notify function.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/routes/Friends.tsx:14-17 `function report(error: unknown) { ... window.dispatchEvent(new CustomEvent(\"cb-friends-error\", { detail: message })); }`; listener in the same file, src/routes/Friends.tsx:95-99 `window.addEventListener(\"cb-friends-error\", onError)` inside SignedIn, which renders the error Card at :119-126. Callers are all descendants of SignedIn: :276 `action.catch(report)` (RequestRow accept/decline/cancel) and :398/:404 `friendsApi.remove(...).catch(report)` / `friendsApi.block(...).catch(report)` (friend context menu). The global store's lastError (src/store.ts:76) is only rendered on the Settings page (src/routes/settings/index.tsx:80), and the friends store (src/lib/friends.ts:39 `create<FriendsView>(() => empty)`) has no error field.",
+    "corrected_claim": "The mechanism is as described, but it is not a bypass of a working 'normal store/toast path': there is no app-wide toast, the engine store's lastError is shown only in Settings, and the friends store has no error slot. The CustomEvent is a file-local channel (emitter and sole listener both in routes/Friends.tsx) used to lift errors from deep rows to SignedIn's banner instead of prop drilling. The only behavioural consequence is that a rejection resolving after SignedIn unmounts (user navigates away or signs out mid-request) is dispatched with no listener and silently dropped, which a component-local useState would also lose. Purely a style/traceability concern.",
+    "reachable_by": "Ordinary use: user clicks Accept/Decline/Cancel on a friend request or Remove/Block in a friend's context menu and the Tauri command (friends_accept/remove/block) rejects, e.g. server refusal or offline. The path works and shows the banner; no attacker-reachable impact.",
+    "fix_assessment": "Replacing it with a store-level error (e.g. an `error` field on useFriends set by report and read by SignedIn) is a fine cleanup, but routing it into the engine store's lastError would surface friend errors on the Settings page instead of Friends, which would be worse. Low value; medium severity is overstated."
+   },
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/routes/Friends.tsx:14-17 `function report(error: unknown) { const message = typeof error === \"string\" ? error : \"Something went wrong.\"; window.dispatchEvent(new CustomEvent(\"cb-friends-error\", { detail: message })); }`. The listener is in SignedIn, Friends.tsx:95-99: `window.addEventListener(\"cb-friends-error\", onError)`, with cleanup. The only callers are RequestRow (Friends.tsx:276 `action.catch(report)`) and FriendRow's menu (Friends.tsx:398, 404 `.catch(report)`), and both render inside SignedIn, so every report reaches its listener. The event name appears only in this file. No frontend store-level notify path exists to bypass. Toasts.tsx is fed only by the Rust `listen<Notice>(\"notice\", ...)` event. useEngine's `lastError` (store.ts:76) is shown only in routes/settings/index.tsx:80. useFriends (lib/friends.ts:39-43) is replaced wholesale on every `friends-state` event via `useFriends.setState(event.payload, true)`, so an error field added there would be wiped.",
+    "corrected_claim": "report() does use a window CustomEvent, but only as a pub/sub between components in the same file. It works: the one listener (SignedIn) wraps every caller. It bypasses no existing store or toast path. The app has no frontend notify function: toasts come only from Rust `notice` events, and engine lastError appears only on the Settings page. This is a style preference, not a defect. Small real nits: a non-string rejection becomes the generic \"Something went wrong.\", and an error arriving after SignedIn unmounts (sign-out while a request is in flight) is silently dropped.",
+    "reachable_by": "Nobody at runtime, since it is a code-structure observation. The error path itself runs when a friends_accept/remove/block invoke rejects.",
+    "fix_assessment": "There is no store-level notify function to route into; one would have to be built. It could not live in useFriends, which is replaced on every backend push. Lifting `error` state into SignedIn and passing a setter down, or using a small React context, would do the job more simply."
+   }
+  ]
+ },
+ {
+  "id": "FC-40",
+  "title": "Outdated comment in store.ts about saving on every keystroke",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src/store.ts:490"
+  ],
+  "claim": "The comment at store.ts:490 about saving on every keystroke is outdated; `ClipMeta` now saves on blur.",
+  "scenario": "Misleading comment for maintainers.",
+  "fix": "Update or remove the comment.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/store.ts:489-491 `async updateClip(id, meta) { // Apply locally first: typing happens in a field that should show every keystroke right away, saving runs alongside.` Neither caller feeds keystrokes into the store. ClipMeta.tsx Field keeps its own `draft` state (265) and calls onSave from a 500 ms debounce (`window.setTimeout(() => commitRef.current(), 500)`, 296-300), on blur (`onBlur={commit}`, 320/330) and on unmount (304). Clips.tsx NameField also keeps a local draft and calls updateClip only from `commit` on blur/Enter (727-735, 764).",
+    "corrected_claim": "The comment is stale: no caller passes every keystroke to updateClip, because both fields keep their own draft. But ClipMeta does not save only on blur. It saves 500 ms after the last keystroke, on blur and on unmount; only the gallery's NameField saves on blur alone.",
+    "reachable_by": "Maintainers only; no runtime effect.",
+    "fix_assessment": "Rewording the comment is enough, e.g. 'apply locally first so the gallery and the open viewer show the new value before the core answers'. Keep the optimistic update itself."
+   }
+  ]
+ },
+ {
+  "id": "FC-45",
+  "title": "Meter keeps a 60 ms interval forever and animates width",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "src/components/ui/Controls.tsx:163-197"
+  ],
+  "claim": "`Meter` (Controls.tsx:163-197) keeps a 60 ms `setInterval` per meter for its whole lifetime and animates `width`, which triggers layout.",
+  "scenario": "Each visible meter runs a timer and forces layout continuously, even when levels are idle.",
+  "fix": "Use a ref plus `transform: scaleX` driven by requestAnimationFrame.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/components/ui/Controls.tsx:170-176 `const timer = setInterval(() => setShown((current) => (current < 0.005 ? 0 : current * 0.78)), 60); return () => clearInterval(timer); }, []);` runs for the whole mount. Controls.tsx:186 `transition-[width] duration-75 ease-linear` with 188 `width: `${pct}%``. When idle the updater returns 0 for current state 0, and React bails out before scheduling a render: node_modules/react-dom/cjs/react-dom-client.development.js:9151-9161 `eagerState = alternate(currentState, action); ... if (objectIs(eagerState, currentState)) return (enqueueUpdate$1(fiber, queue, update, 0), ...` with no scheduleUpdateOnFiber. pct is also clamped to 0 below -60 dB (181), so the style string does not change. Only usage: src/routes/AudioMixer.tsx:603-605 SourceMeter.",
+    "corrected_claim": "Each Meter does keep a 60 ms interval for its lifetime and animates `width`. But it does not force layout while idle: once `shown` reaches 0, setShown(c => 0) is eagerly bailed out by React (no render, no DOM write, no layout). The idle cost is one cheap timer tick per meter every 60 ms. Layout work only happens while a source carries signal (level > ~0.001), when the bar has to move anyway, and it is limited to one small bar per mixer source.",
+    "reachable_by": "Audio mixer page with sources: timers tick per meter always; layout happens only while levels are non-zero.",
+    "fix_assessment": "A ref plus transform: scaleX (with transform-origin left) and rAF would avoid layout and the idle timer. Clearing the interval when shown hits 0 and restarting it on a rising level is a smaller change. The gain is marginal either way."
+   }
+  ]
+ },
+ {
+  "id": "FC-47",
+  "title": "Tray icon sent as a 64 KB JSON number array",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "src/lib/accent.ts:142"
+  ],
+  "claim": "accent.ts:142 sends the 64 KB tray icon to the core as a JSON number array (`Array.from(pixels)`).",
+  "scenario": "Every accent refresh (every 80 ms in RGB mode) serializes and parses a large JSON array over IPC.",
+  "fix": "Send the pixels as binary.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/lib/accent.ts:67 `const ICON_SIZE = 128;` (128*128*4 = 65,536 bytes) and 142 `.then((pixels) => api.setLogoIcon(Array.from(pixels), ICON_SIZE))`, with src/lib/ipc.ts:46 `setLogoIcon: (rgba: number[], size: number) => invoke<void>(\"set_logo_icon\", { rgba, size })` sending a JSON number array, deserialized as `rgba: Vec<u8>` at src-tauri/src/commands.rs:805. But this happens only inside `take()` (132-145), debounced by ICON_MS=250 (139-144), with the comment 'not on every turn of the RGB hue, only when the accent itself changes'. The 80 ms refresh (146-148, 157) only calls applyAccent, which writes CSS variables. take() runs on getConfig at start-up and on 'accent-changed', which the core emits only when `previous.accent() != next.accent()` (commands.rs:91-95).",
+    "corrected_claim": "The tray icon is sent as an about 64K-element JSON number array (about 200 KB of JSON). It is sent once at start-up and once per actual accent change, debounced 250 ms, not every 80 ms in RGB mode. In RGB mode the icon is drawn once with the full rainbow wheel and the 80 ms tick touches only CSS variables.",
+    "reachable_by": "A user changing the accent colour or mode in settings, at most once per 250 ms of picker movement.",
+    "fix_assessment": "Sending the Uint8ClampedArray as a raw body (Tauri 2 InvokeBody::Raw with size in a header, read via tauri::ipc::Request) would avoid the JSON blow-up. That works, but the payoff is negligible at this frequency."
+   }
+  ]
+ },
+ {
+  "id": "FC-22",
+  "title": "Keyboard reorder in the mixer loses focus after one step",
+  "severity": "medium",
+  "category": "a11y",
+  "locations": [
+   "src/routes/AudioMixer.tsx:201-208"
+  ],
+  "claim": "`nudge` with ArrowDown (AudioMixer.tsx:201-208) makes React move the focused row's DOM node, so focus is lost after one step.",
+  "scenario": "A keyboard user presses ArrowDown on a source's grip to move it; after one move focus is lost and further presses do nothing.",
+  "fix": "Re-focus the grip after the move.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "disputed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/routes/AudioMixer.tsx:201-207 `const nudge = (id, delta) => { ... [sources[from], sources[to]] = [sources[to], sources[from]]; patchConfig({ sources }); }`; src/store.ts:362-364 `async patchConfig(patch) { const config = { ...get().config, ...patch }; set({ config });` (optimistic, synchronous re-render); AudioMixer.tsx:254-256 rows are `config.sources.map((source) => <Card key={source.id} ...>` and the grip is a child `<span role=\"button\" tabIndex={0} ... onKeyDown={... nudge(source.id, delta)}>` (AudioMixer.tsx:298-319). Nothing in the file calls focus() (grep 'focus' only hits class names at :322/:339). React is 19.2.8 (node_modules/react-dom/package.json) and react-dom-client contains no `moveBefore`, so keyed reorders use insertBefore/appendChild. For a swap [A,B,..] -> [B,A,..] React's reconcileChildrenArray keeps B (oldIndex 1 >= lastPlacedIndex) and re-places A (oldIndex 0 < lastPlacedIndex). ArrowDown on A therefore detaches and re-inserts the focused row's DOM node; Chromium/WebView2 resets document.activeElement to body when the focused subtree is removed, so the next ArrowDown goes to <body> and nudge is never called. ArrowUp on B leaves B's node in place, so focus survives, which matches the finding's ArrowDown-only scenario. useFlip (src/lib/useFlip.ts) only animates transforms and does not restore focus.",
+    "corrected_claim": "",
+    "reachable_by": "Ordinary use by the local user: a keyboard user who Tabs to a source's grip in the Audio mixer (shown when there are 2+ sources) and presses ArrowDown. It happens every time in the WebView2 (Chromium) runtime. ArrowUp is not affected. Workarounds exist: Tab back to the grip, or press ArrowUp on the row below to make the same swap with focus kept.",
+    "fix_assessment": "Correct and small. After patchConfig, re-focus the moved row's grip, for example with a ref map keyed by source.id plus a useLayoutEffect or requestAnimationFrame that focuses `[aria-label=\"Move <label>\"]` in the row with data-flip=id. Announcing the new position through an aria-live region would also help screen-reader users."
+   },
+   {
+    "lens": "code",
+    "verdict": "refuted",
+    "severity_suggestion": "info",
+    "evidence": "src/routes/AudioMixer.tsx:201-207 nudge swaps two entries and calls patchConfig, which sets config synchronously (src/store.ts:362-364 `set({ config })`). Rows are keyed `key={source.id}` (AudioMixer.tsx:256), so React keeps the same Card/grip DOM nodes and moves one with insertBefore. For a one-step swap React's lastPlacedIndex logic moves the row whose old index is lower, so on ArrowDown the focused row is the one moved and the claim's mechanism is right that far. But react-dom 19.2.8 saves and restores focus around every commit: node_modules/react-dom/cjs/react-dom-client.development.js:13791 `root = getActiveElementDeep(root)` -> `selectionInformation = { focusedElem: root, ... }` (13857) before mutation, and after commitMutationEffects (17980-17993): `if (curFocusedElem !== priorFocusedElem && priorFocusedElem && ... containsNode(priorFocusedElem.ownerDocument.documentElement, priorFocusedElem))` ... `priorFocusedElem.focus()` (18066-18067). The grip span is still in the document after the move, so React focuses it again in the same commit. useFlip (src/lib/useFlip.ts) only runs Web Animations transforms and does not touch focus; Card (src/components/ui/Card.tsx:8-21) is a plain div.",
+    "corrected_claim": "",
+    "reachable_by": "Keyboard user pressing ArrowUp/ArrowDown on a mixer row's grip; React restores focus, so the claimed loss does not occur.",
+    "fix_assessment": "Not needed: React already re-focuses the moved element after the commit. An explicit re-focus would do nothing (at most it could guard against a future change that remounts the row)."
+   }
+  ]
+ },
+ {
+  "id": "FC-4",
+  "title": "Clip gallery is unvirtualized and unmemoized; each tile pays for an uncached toLocaleDateString",
+  "severity": "medium",
+  "category": "perf",
+  "locations": [
+   "src/lib/format.ts:24",
+   "src/routes/Clips.tsx:625",
+   "src/routes/Clips.tsx:199-225",
+   "src/components/ui/Card.tsx:38",
+   "src/routes/Clips.tsx:557",
+   "src/routes/Clips.tsx:1180"
+  ],
+  "claim": "format.ts:24 does `new Date(ts).toLocaleDateString(\"en-US\", { day: \"numeric\", month: \"long\", year: \"numeric\" })` once per tile per render (Clips.tsx:625); measured in Node/V8 at 63-81 ms per 1000 calls versus about 1 ms with a cached `Intl.DateTimeFormat`. `visible` (Clips.tsx:199-225) and every tile are rebuilt inline on every render (each search keystroke, `clips-changed`, `links` change, rename or confirm-state change). Each tile carries 2-4 `Pill`s with `backdrop-blur-md` (Card.tsx:38) plus heart/action buttons with `backdrop-blur-md` (Clips.tsx:557, :1180), so hundreds of backdrop-filter surfaces re-blur while scrolling. On first visit every tile, including off-screen ones, gets `cb-tile-in`.",
+  "scenario": "With a large library (hundreds to 1000 clips), every keystroke in search or any clips-changed event re-renders all tiles and reformats every date, and scrolling re-blurs hundreds of surfaces, making the gallery sluggish.",
+  "fix": "Hoist `const DATE = new Intl.DateTimeFormat(...)` in format.ts; extract a `ClipTile` wrapped in `React.memo` with stable id-keyed callbacks and memoize `visible` with `useMemo([clips, query, filter])`; add `content-visibility:auto; contain-intrinsic-size:auto 300px` to tiles or virtualize rows (e.g. `@tanstack/react-virtual`), so `useFlip` animates only mounted rows; replace `backdrop-blur` on tile chrome with solid `bg-black/60`; pass `updateClip` into `NameField` instead of subscribing per tile.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "FC-5",
+  "title": "Mixer source label saves on every keystroke; a stale reply can drop typed characters",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "src/routes/AudioMixer.tsx:333-337",
+   "src/store.ts:418-423"
+  ],
+  "claim": "AudioMixer.tsx:333-337 has `onChange={(e) => upsertSource({ ...source, label: e.target.value })}`, and store.ts:418-423 then does `set({ config: await api.updateAudioSource(source) })` unconditionally (last reply wins, no version guard). The same last-reply-wins problem affects gain, mute and solo.",
+  "scenario": "Each keystroke means one IPC call, `replace_config`, a config file write and an audio-refresh thread. If a reply arrives after the next keystroke (main thread busy with a file dialog or slow disk), the store snaps the label back to the older value; the controlled input jumps and the next keystroke is appended to the stale text, losing characters. (Character loss under load is likely.)",
+  "fix": "Keep a draft label and commit on blur/Enter, as `NameField` already does (Clips.tsx:697-771). Add the version guard from FC-1 to `upsertSource`/`removeSource`.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "FC-6",
+  "title": "Mock data is the real store's initial config and its fallback in Tauri mode",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "src/store.ts:164",
+   "src/store.ts:263",
+   "src/store.ts:362-368",
+   "src-tauri/src/commands.rs:54-68",
+   "src/lib/mock.ts:86",
+   "src/lib/mock.ts:121"
+  ],
+  "claim": "store.ts:164 initialises the store with `config: mock.mockConfig`, and store.ts:263 loads with `load(\"Reading the settings\", api.getConfig, get().config)`, i.e. the mock config is the fallback if `get_config` fails, also in Tauri mode.",
+  "scenario": "Until `getConfig` returns, the Dashboard shows fake values (\"3 audio sources\", \"1080p60 · NVENC\"). If `get_config` fails, the app marks itself `ready` with the mock config; the next `patchConfig` writes fake PIDs as audio sources, clipDir `C:\\Users\\user\\Videos\\ClippiBoy`, the mock hotkeys and `token: \"mock-token\"` into the user's real config. The core keeps a token only if it arrives empty, so the Stream Deck stops working. (Code path confirmed; failure unlikely but damaging.)",
+  "fix": "Use `config: AppConfig | null` (or a `loaded` flag), don't render config-dependent routes until loaded, never fall back to mock in Tauri, and make `patchConfig` refuse to run before load.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "LS-13",
+    "slice": "05-local-surface",
+    "title": "UI starts from the mock config and `set_config` saves whatever whole config it is sent",
+    "claim": "store.ts:164 has `config: mock.mockConfig`, and the main UI is not gated on `ready`. `patchConfig` (store.ts:362-368) sends `{...get().config, ...patch}`. `set_config` (commands.rs:54-68) keeps the real token only when the incoming one is empty. The mock has `token: \"mock-token\"` and `clipDir: \"C:\\\\Users\\\\user\\\\…\"` (mock.ts:86, :121).",
+    "locations": [
+     "src/store.ts:164",
+     "src/store.ts:362-368",
+     "src-tauri/src/commands.rs:54-68",
+     "src/lib/mock.ts:86",
+     "src/lib/mock.ts:121"
+    ],
+    "fix": "Start the UI config as `null` and gate the UI on it. Better, make `set_config` accept a typed patch, or reject a config that does not match the current revision. Never accept `control.token` from the UI."
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "FC-7",
+  "title": "Errors only show at the bottom of Settings and are never cleared",
+  "severity": "medium",
+  "category": "ux",
+  "locations": [
+   "src/routes/settings/index.tsx:80-84",
+   "src/store.ts:188",
+   "src/components/ShotViewer.tsx:639-641",
+   "src/store.ts:598-609"
+  ],
+  "claim": "Every failing store action calls `set({ lastError })` (`updateClip`, `setFavorite`, `setClipTags`, `patchConfig`, `clearGame`, `toggleBuffer`, `refreshTargets` and others), but `lastError` is only displayed in settings/index.tsx:80-84, and nothing ever sets `lastError: null` after the initial state (store.ts:188).",
+  "scenario": "A failed rename or heart in the gallery gives no feedback at all. A startup error such as \"Reading applications failed\" sits under every Settings tab forever.",
+  "fix": "Add a store-level `notify(kind, msg)` that feeds `Toasts` (which should also get `role=\"status\"`/`aria-live`). Make `lastError` dismissible, or drop it.",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "EF-2",
+    "slice": "02-editor-features",
+    "title": "Screenshot save errors are silent",
+    "claim": "When saving a screenshot edit fails, the UI only resets the Save button. The error goes into `lastError` (store.ts:598-609), which is displayed solely on the Settings page (settings/index.tsx:80-84); nothing is emitted as a notice. This is despite the comment at ShotViewer.tsx:640 implying the error is surfaced.",
+    "locations": [
+     "src/components/ShotViewer.tsx:639-641",
+     "src/store.ts:598-609",
+     "src/routes/settings/index.tsx:80-84"
+    ],
+    "fix": "In `write_screenshot`, call `crate::notify(&app, \"error\", …)` on `Err`. Alternatively add a client-side toast to `Toasts.tsx`."
+   }
+  ],
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "FC-9",
+  "title": "Clearing a game makes one IPC write per clip and change events undo the optimistic update mid-loop",
+  "severity": "medium",
+  "category": "bug",
+  "locations": [
+   "src/store.ts:570-578",
+   "src-tauri/src/commands.rs:941",
+   "src/store.ts:302-310"
+  ],
+  "claim": "`clearGame` in store.ts:570-578 loops `await api.updateClip(...)` then `await get().fileClip(...)` per clip. Each `update_clip` runs `announce_change`, which emits `clips-changed` (commands.rs:941), and the listener at store.ts:302-310 re-reads the full clip list each time.",
+  "scenario": "Removing a game with 200 clips means 200 writes, 200 full-list IPC reads and gallery re-renders. The re-reads restore the game on clips not yet processed, so the chip comes back and counts down. A failure partway through leaves the UI out of sync with no rollback.",
+  "fix": "Add a single `clear_game(game)` core command that runs in one transaction and announces once.",
+  "reported_confidence": "likely",
+  "slice": "09-frontend-core",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "FC-41",
+  "title": "EngineStatus fields are dropped by the store and never shown",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src/store.ts:273-285"
+  ],
+  "claim": "The `EngineStatus` fields `droppedFrames`, `fps`, `freeBytes`, `gameSeconds` and `encoder` are dropped by store.ts:273-285 and never shown in the UI.",
+  "scenario": "Health data the core already sends (dropped frames, real encoder, free disk space, game session) is invisible to the user.",
+  "fix": "Keep these fields in the store and surface them (e.g. a health panel).",
+  "reported_confidence": "confirmed",
+  "slice": "09-frontend-core",
+  "status": "refuted",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "refuted",
+    "severity_suggestion": "info",
+    "evidence": "The store does pick only some fields: src/store.ts:273-285 sets bufferActive, recording, recordingSeconds, recordingBytes, bufferedSeconds, screenFallback, bufferBytes, rateControl, detectedGame, and leaves out droppedFrames/encoder/fps/gameSeconds/freeBytes. But the in-game console window (src-tauri/src/console.rs:59 `WebviewUrl::App(\"console.html\")`) listens to the same event and shows all five. src/console/Console.tsx:349 `listen<EngineStatus>(\"engine-status\", (e) => { setStatus(e.payload);`. Line 831 `<Stat label=\"FPS\" value={status.fps.toFixed(0)} .../>`. Lines 840-842 show `${status.droppedFrames} total`. Line 849 `value={(status.encoder ?? \"—\").toUpperCase()}`. Lines 576-578 build `sessionTime(status.gameSeconds)` and `${formatSize(status.freeBytes)} free`, rendered at 1047-1049. Trend.tsx:57-66 also uses fps and droppedFrames.",
+    "corrected_claim": "Only the main window's zustand store leaves these fields out, and the main window does not show them. The console overlay, which is part of the same UI, displays FPS, dropped frames, the encoder, game session time and free disk space live, so the data is not invisible to the user.",
+    "reachable_by": "Not a defect. At most a product choice about whether the main window should also show health stats.",
+    "fix_assessment": "No fix is needed. Showing the stats in the main window too would be a feature request, not a bug fix."
+   }
+  ]
+ }
+]

@@ -1,0 +1,899 @@
+[
+ {
+  "id": "EF-10",
+  "title": "Arrow shaft's round cap pokes past the head's tip",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotAnnotate.tsx:212-233",
+   "src/components/ShotAnnotate.tsx:214-231"
+  ],
+  "claim": "The arrow is a straight shaft with a filled triangular head of length `max(size*4, 10)` and round caps (ShotAnnotate.tsx:212-233). The shaft runs to the tip, so its round cap pokes out past the tip, blunting the point on thick arrows.",
+  "scenario": "User draws an arrow at a large thickness; the tip appears rounded/blunt because the shaft cap extends beyond the triangle.",
+  "fix": "Stop the shaft at the base of the head so the round cap doesn't poke past it.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "ShotAnnotate.tsx:174 `ctx.lineCap = \"round\"`, 180 `ctx.lineWidth = shape.size`. Arrow 215-231: `const head = Math.max(shape.size * 4, 10); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();`, then the triangle is filled with its apex at (x2, y2) and its sides at angle ± PI/7. The same paint() is used for the saved file (ShotViewer.tsx:1617).",
+    "corrected_claim": "",
+    "reachable_by": "Any user drawing an arrow, more visible at higher thickness, both in the preview and in the saved PNG.",
+    "fix_assessment": "Ending the shaft at the head's base (about head*cos(PI/7) back from the tip) works, because the base half-width (about 1.73*size) covers the cap. Short arrows whose length is less than the head depth need a clamp, so the shaft is not reversed."
+   }
+  ]
+ },
+ {
+  "id": "EF-14",
+  "title": "Saving exits draw mode and clears undo history",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotViewer.tsx:634-638",
+   "src/components/ShotViewer.tsx:267-272"
+  ],
+  "claim": "Undo history is cleared on every save (`resetShapes` at ShotViewer.tsx:267-272, called at 634), and saving exits draw mode (ShotViewer.tsx:638).",
+  "scenario": "User saves mid-edit to be safe, then wants to undo the last mark; history is gone and they have been kicked out of draw mode.",
+  "fix": "Stay in draw mode after saving (638). Optionally keep undo across the save.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "ShotViewer.tsx:632-638 in write(): `const loaded = await api.screenshotEdit(clip.id); setEdit(loaded); resetShapes(readMarks(loaded)); setUnsaved(false); setSelected(null); setSel(null); setMode(\"view\");` and resetShapes :267-272 `current.current = next; history.current = []; lastGesture.current = null; setShapes(next);`. The Undo button is gated on unsaved (:1073 `disabled={!unsaved}`) and undo() ties history to unsaved (:303 `setUnsaved(history.current.length > 0)`). Both are intentional: :249-250 'Empty means: as loaded or last saved.' and :266 'Marks from outside - loaded, saved, thrown away. Nothing to undo there.' Draw mode comes back with one click on a tool (pickTool :585-588 `setMode(\"draw\")`).",
+    "corrected_claim": "",
+    "reachable_by": "Any user who presses 'Save marks' (ShotViewer.tsx:1066) or Crop while editing.",
+    "fix_assessment": "Dropping setMode(\"view\") at :638 is enough to stay in draw mode, but the zoom still resets because `edit` changes (:372 `useEffect(() => setView(WHOLE), [mode, id, edit])`). Keeping undo across a save needs a 'saved at' marker in the history, because undo() and the Undo button currently assume empty history means saved."
+   }
+  ]
+ },
+ {
+  "id": "EF-15",
+  "title": "Zoom percentage is relative to fit; no 1:1 view or zoom keys",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotViewer.tsx:932",
+   "src/components/ShotViewer.tsx:921-934"
+  ],
+  "claim": "The zoom % badge (ShotViewer.tsx:921-934, 932) shows zoom relative to the \"fit\" size, not actual pixels. There is no \"1:1\" view and no keyboard zoom keys.",
+  "scenario": "User wants to inspect the picture at real pixel size; \"100%\" is fit size, and there is no way to get exact 1:1.",
+  "fix": "Ctrl+0 fit, Ctrl+1 actual pixels, Ctrl+= / Ctrl+- zoom (lockdown already cancels the browser's own handling).",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "pictureBox.ts:23 '`zoom` multiplies the fitting scale (1 = the whole picture fits)' and :49 `const scale = Math.min(stage.width / width, stage.height / height) * view.zoom;`. Badge: ShotViewer.tsx:921 `{view.zoom > 1.01 && (` ... :932 `{Math.round(view.zoom * 100)} %`. Zoom floor is fit: :481 `Math.min(Math.max(was.zoom * factor, 1), MAX_ZOOM_STEP)` and pictureBox.ts:69. Key handler :375-410 handles only Escape, Delete/Backspace, Ctrl+Z and ArrowLeft/Right; nothing else in src/ handles zoom keys. lockdown.ts:42-47,59 only preventDefault()s Ctrl+Equal/Minus/Digit0 (no stopPropagation, :8), so a viewer handler could use them.",
+    "corrected_claim": "Small detail: the badge is hidden at zoom <= 1.01, so it never actually reads '100 %'; the number shown is a multiple of the fit size. Also worse than stated: the fit scale is not capped at 1 (pictureBox.ts:49), so a picture smaller than the stage is shown enlarged, and zoom cannot go below fit, so such a picture can never be shown at 1:1.",
+    "reachable_by": "Any user viewing a screenshot in ShotViewer.",
+    "fix_assessment": "The proposed shortcuts fit the existing keydown handler (and Ctrl+0/=/- are already kept from the WebView). A 1:1 view needs the zoom floor at :481 and in clampView lowered for pictures smaller than the stage, and ideally devicePixelRatio taken into account; the badge could show the actual pixel ratio (box.scale) instead of view.zoom."
+   }
+  ]
+ },
+ {
+  "id": "EF-16",
+  "title": "No pan in draw mode without a middle button; wheel deltaX ignored",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotViewer.tsx:496-517",
+   "src/components/ShotViewer.tsx:771-779",
+   "src/components/ShotViewer.tsx:502-503"
+  ],
+  "claim": "The middle button pans in any mode but the left button pans only in view mode (ShotViewer.tsx:496-517, 502-503). The wheel only zooms (771-779) and horizontal scroll (`deltaX`) is ignored. There is no Space+drag. Touchpad users therefore cannot pan in draw mode.",
+  "scenario": "Laptop user zooms in while annotating and cannot move the view to another part of the picture.",
+  "fix": "Make the wheel without Ctrl pan and Ctrl or pinch zoom, and add Space+drag.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "ShotViewer.tsx:498-503 `if (event.button === 1) {...} if (view.zoom <= 1) return false; if (event.button !== 1 && !(event.button === 0 && mode === \"view\")) return false;` - left-drag pans only in view mode. Wheel :771-779 `if (event.deltaY === 0) return; ... zoomAt(event.clientX, event.clientY, Math.pow(1.0015, -pixels));` - deltaX is never read and ctrlKey is not checked, so a touchpad pinch (ctrl+wheel) and two-finger scroll both zoom. No Space/key handling for panning in onKey :375-410. The footer even says so: :1235 'wheel to zoom, middle button to move'. Switching to view mode to pan does not help: it resets the zoom (:372) and Discard drops unsaved marks (:552-557). Only workaround: zoom out and back in at another spot, because zoomAt keeps the point under the pointer fixed (:471-491).",
+    "corrected_claim": "",
+    "reachable_by": "Users without a middle mouse button (touchpad, pen) who zoom in while drawing or cropping.",
+    "fix_assessment": "Making the plain wheel pan would change the documented mouse-wheel zoom for mouse users. Less disruptive: Space+drag (the onKey INPUT/TEXTAREA guard already keeps typing safe) plus deltaX/Shift+wheel for panning, keeping the plain wheel and ctrl/pinch for zoom."
+   }
+  ]
+ },
+ {
+  "id": "EF-17",
+  "title": "Crop selection has corner handles only",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotViewer.tsx:1396-1405"
+  ],
+  "claim": "The crop selection can be drawn, moved or resized with 4 corner handles only (ShotViewer.tsx:1396-1405); there are no edge handles.",
+  "scenario": "User wants to adjust only the bottom edge of the crop; they must drag a corner and risk moving the side edge too.",
+  "fix": "Add edge handles (plus typed X/Y/W/H fields and pixel presets, see Better crop).",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "ShotViewer.tsx:1396-1405 `const corners: Array<[string, string, (r: Rect) => Rect]> = [ [\"topLeft\", ...], [\"topRight\", ...], [\"bottomLeft\", ...], [\"bottomRight\", ...] ];` rendered at :1440-1451. The only other targets are the selection body (:1429 `onDown(event, \"move\")`, a pure translate :1373-1377) and the backdrop (:1411 starts a new rectangle). A corner resize redraws from the opposite corner to the pointer (:1358-1361 and spanned() :1323-1347), so both x and y follow the hand; there is no edge drag, numeric input or keyboard nudge.",
+    "corrected_claim": "",
+    "reachable_by": "Any user cropping a screenshot.",
+    "fix_assessment": "Edge handles fit the existing anchor model: anchor the opposite edge, keep the other axis fixed, and decide how a locked ratio behaves (for example grow the other axis around its centre, using fitRatio). Typed X/Y/W/H fields are extra scope, not needed for this finding."
+   }
+  ]
+ },
+ {
+  "id": "EF-20",
+  "title": "TS watermark rectangle is a hand copy of Rust with no parity test",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [
+   "src/lib/watermark.ts:6-8",
+   "src-tauri/src/watermark.rs:94-125"
+  ],
+  "claim": "`lib/watermark.ts` `markRect` is a hand copy of Rust `watermark::rect_kept` (watermark.rs:94-125), linked only by a \"change one, change both\" comment (watermark.ts:6-8). A manual comparison found 0 mismatches today, but no test guards the parity.",
+  "scenario": "A future change to `rect_kept` without the matching TS change makes the editor preview the watermark in a different spot than the saved file.",
+  "fix": "A Rust test writes or compares `fixtures/watermark_rects.json`, and vitest asserts `markRect` against the same file.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/lib/watermark.ts:6-8 `A copy of watermark::rect_kept in the core ... Change one, change both.` with constants duplicated at :13-17 (535/152/0.07/0.015/14). Rust tests in watermark.rs:219-306 cover rect/rect_kept only internally. `grep -rl markRect|watermark_rects` outside node_modules/target hits only ShotViewer.tsx and watermark.ts; there is no frontend test runner at all (root package.json has no vitest/test script; the only *.test.ts files are server/src/*.test.ts). A port of both functions (f32 rounding for Rust, f64 Math.round for TS) over ~2.2M frame sizes found 0 mismatches, matching the reviewer's manual check.",
+    "corrected_claim": "",
+    "reachable_by": "A future maintainer who changes rect_kept/rect constants (or the asset size 535x152) without updating watermark.ts; the editor preview (ShotViewer.tsx:530, 906-915) would then sit elsewhere than the stamped mark.",
+    "fix_assessment": "The shared-fixture approach is sound, but it also requires adding vitest (or another runner) to the root app, which currently has none; the fixture should include PICTURE_WIDTH/HEIGHT so an asset change is caught too."
+   }
+  ]
+ },
+ {
+  "id": "EF-23",
+  "title": "Handles and drawing surface are unfocusable, unlabelled divs",
+  "severity": "low",
+  "category": "a11y",
+  "locations": [
+   "src/components/ShotAnnotate.tsx:917-943",
+   "src/components/ShotAnnotate.tsx:962-984"
+  ],
+  "claim": "The resize handles and the drawing surface are plain divs (lines 917-943 and 962-984; the report's table attributes 962-984 to ShotViewer.tsx, but the handle rendering via `handlesOf(chosen, measure).map(...)` is in ShotAnnotate.tsx). They cannot be focused and have no labels.",
+  "scenario": "Keyboard-only user cannot reach or operate mark handles or the drawing surface.",
+  "fix": "Handles become focusable buttons with labels; keyboard creation of marks (Enter places a default-size mark at view centre, arrow keys move it).",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "ShotAnnotate.tsx:917-942 drawing surface `<div className={cn(\"absolute touch-none\", ...)} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onDoubleClick=...>` -- no tabIndex/role/aria-label/onKeyDown. ShotAnnotate.tsx:962-985 `handlesOf(chosen, measure).map(([key, x, y]) => (<div key={key} className=\"absolute h-3 w-3 ... cursor-pointer\" onPointerDown=... onPointerMove={onMove} onPointerUp=... />))` -- same. grep for tabIndex|role=|aria-|onKeyDown in ShotAnnotate.tsx finds only the text textarea (995, 1001). ShotViewer's window keydown (374-411) offers only Delete/Backspace and Ctrl+Z for marks; no keyboard way to create, select, move or resize a mark.",
+    "corrected_claim": "",
+    "reachable_by": "Keyboard-only and screen-reader users of the screenshot annotation editor.",
+    "fix_assessment": "Making handles focusable buttons with labels and adding arrow-key move/resize is reasonable; keyboard creation of marks is a larger feature, and a canvas-style editor will likely remain pointer-first, so the fix should at least expose selection and nudging of existing marks."
+   }
+  ]
+ },
+ {
+  "id": "EF-25",
+  "title": "Segmented control has no radiogroup or pressed semantics",
+  "severity": "low",
+  "category": "a11y",
+  "locations": [
+   "src/components/ui/Controls.tsx:47-89"
+  ],
+  "claim": "`Segmented` (Controls.tsx:47-89) has no radiogroup or pressed semantics, so assistive technology cannot tell which option (e.g. Outline/Filled/Both) is active.",
+  "scenario": "Screen reader user cannot tell whether a box is set to Outline, Filled or Both.",
+  "fix": "`Segmented` as `radiogroup` with `aria-checked`.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Controls.tsx:62-87 container is a plain `<div className=...>` and each option is `<button key={key} {...{[SLIDE]: key}} onClick={() => onChange(key)} className={cn(..., value === key ? \"text-black\" : \"text-ink-muted ...\")}>` -- active state conveyed only by colour and the SlidingIndicator; no role=radiogroup/radio, aria-checked or aria-pressed. Contrast: Toggle in the same file uses `role=\"switch\" aria-checked={checked}` (17-19). Used for Look (Outline/Filled/Both, ShotViewer.tsx:1017 with LOOKS at ShotAnnotate.tsx:89-93) and Shape, plus settings (Banner, Colors, Console, Friends, index, Setup). Additionally, `disabled` is only `pointer-events-none opacity-40` on the wrapper (65); the buttons never get the disabled attribute, so keyboard users can still Tab to and activate a 'disabled' Segmented.",
+    "corrected_claim": "",
+    "reachable_by": "Screen-reader users anywhere a Segmented is used (editor Look/Shape, several settings pages).",
+    "fix_assessment": "role=radiogroup with role=radio + aria-checked (and roving tabindex/arrow keys), or simply aria-pressed on each button, fixes it; the same change should pass `disabled` through to the buttons and accept an aria-label for the group (the visible 'Look'/'Shape' span is not associated)."
+   }
+  ]
+ },
+ {
+  "id": "EF-26",
+  "title": "Colour swatch labels announce hex codes",
+  "severity": "low",
+  "category": "a11y",
+  "locations": [
+   "src/components/ui/ColorPicker.tsx"
+  ],
+  "claim": "Swatch labels in ColorPicker.tsx read out hex codes (e.g. \"Colour #ef4444\") instead of colour names.",
+  "scenario": "Screen reader announces \"Colour #ef4444\" rather than \"Red\".",
+  "fix": "Named swatches (\"Red\").",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ui/ColorPicker.tsx:118-122: `{swatches.map((swatch) => (<button ... aria-label={`Colour ${swatch}`} aria-pressed={value.toLowerCase() === swatch}`. Swatches are bare hex strings: src/components/ShotAnnotate.tsx:27-34 `export const COLORS = [\"#ef4444\", \"#f59e0b\", \"#34d399\", \"#a78bfa\", \"#ffffff\", \"#08080a\"]` (used at ShotViewer.tsx:971-986), and src/routes/settings/Colors.tsx:16 `const SWATCHES = [VIOLET, \"#3b82f6\", ...]`. No title or other text label on the buttons.",
+    "corrected_claim": "",
+    "reachable_by": "Any screen-reader user of the screenshot editor's colour row or the Settings > Colours accent picker; each swatch is read as 'Colour #ef4444' (or similar), not as a colour name.",
+    "fix_assessment": "Correct, but the picker only receives `string[]`, so both callers (COLORS and SWATCHES) need to pass names too (e.g. `{hex, name}` pairs or a lookup table). Without that the fix cannot be made in ColorPicker alone."
+   }
+  ]
+ },
+ {
+  "id": "EF-38",
+  "title": "Escape with a mark selected goes straight to the discard question",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotViewer.tsx:379-386",
+   "src/components/ShotViewer.tsx:385"
+  ],
+  "claim": "In the key handler, Escape leaves crop, then leaves draw mode (asking about unsaved marks), then closes the viewer (ShotViewer.tsx:379-386). With a mark selected it goes straight to \"discard all marks?\" (385) instead of deselecting first.",
+  "scenario": "User selects a mark and presses Escape to deselect; a discard-all-marks prompt appears instead.",
+  "fix": "Escape deselects first, then switches to Select, and only then leaves the editor.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "ShotViewer.tsx:379-386 `if (event.key === \"Escape\") { if (askingDelete || askingDiscard) return; ... if (mode === \"crop\") leaveCrop(); else if (mode !== \"view\") tryLeaveEditing(); else close(); }` -- `selected` is never consulted for Escape. tryLeaveEditing (:580-583) `if (unsaved) setAskingDiscard(true); else leaveEditing();`. A newly drawn mark is auto-selected and marks unsaved: ShotAnnotate.tsx:864-866 `onShapes([...shapes, draft]); onSelect(draft.id);` -> editShapes sets `setUnsaved(true)` (:291). Prompt text is ConfirmDelete question=\"Discard unsaved marks?\" (:1080). The text field's own Escape is swallowed by stopPropagation (ShotAnnotate.tsx:1005-1009) and the window handler skips TEXTAREA (:378), so that path does not deselect either.",
+    "corrected_claim": "Accurate in substance; two details: the prompt reads \"Discard unsaved marks?\" and only throws away changes since the last save (leaveEditing resets to readMarks(edit)), not all marks. And if a saved mark is selected with nothing unsaved, Escape skips the question entirely and leaves draw mode at once (leaveEditing). Neither case clears the selection first.",
+    "reachable_by": "Any user in draw mode who presses Escape with a mark selected (the usual state right after drawing a mark, since finished marks stay selected).",
+    "fix_assessment": "A sound fix: in the Escape branch add `if (mode === \"draw\" && selected !== null) { setSelected(null); return; }` before tryLeaveEditing. Optionally drop to the Select tool as a second step. No data is lost today because the discard path asks first."
+   }
+  ]
+ },
+ {
+  "id": "EF-39",
+  "title": "\"Save marks\" enabled when nothing changed",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "src/components/ShotViewer.tsx:1065"
+  ],
+  "claim": "The \"Save marks\" button's disabled condition is only `shapes.length === 0` (ShotViewer.tsx:1065), so it is enabled with nothing changed and rebuilds and rewrites a 4K file for nothing.",
+  "scenario": "User opens an already-annotated screenshot and clicks Save marks without changes; the full composite is re-rendered and rewritten.",
+  "fix": "Disable \"Save marks\" when nothing changed.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "ShotViewer.tsx:1063-1066 `<Button ... disabled={busy || shapes.length === 0} onClick={() => write(edit?.crop ?? null, shapes)}>` -- `unsaved` is not in the condition (Undo at :1073 does use `disabled={!unsaved}`). On open, shapes are loaded from the saved store with `resetShapes(readMarks(loaded)); setUnsaved(false);` (:346-347), so the button is live with no changes. write() (:607-629) renders every layer at the original's full size via layerBytes (canvas width×height, toBlob PNG, :1607-1622) and calls writeScreenshot. The Rust edit_screenshot (commands.rs:510-545, cf. the only early return at :532 which needs no crop, no steps and no marks) has no 'unchanged' short-circuit: it re-reads the original PNG, composites and rewrites the file.",
+    "corrected_claim": "",
+    "reachable_by": "Any user who opens an annotated screenshot, enters draw mode and clicks Save marks without changing anything.",
+    "fix_assessment": "Adding `|| !unsaved` to the disabled condition is correct and cheap. The case where every mark is deleted is still covered by `shapes.length === 0` / \"Remove all marks\"."
+   }
+  ]
+ },
+ {
+  "id": "EF-41",
+  "title": "\"Crop\" and \"Undo crop\" silently save unsaved marks",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotViewer.tsx:1150",
+   "src/components/ShotViewer.tsx:1174"
+  ],
+  "claim": "\"Crop\" (ShotViewer.tsx:1150) and \"Undo crop\" (1174) also save any unsaved marks without saying so.",
+  "scenario": "User draws exploratory marks, then crops intending to discard the marks later; the marks were silently written along with the crop.",
+  "fix": "Say so in the label (\"Crop & keep marks\") or ask; longer term unify crop and annotate into one session with one Save.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Crop: ShotViewer.tsx:1150 `onClick={() => sel && write(sel, shapes)}`; Undo crop: :1174 `onClick={() => write(null, shapes)}`. Unsaved marks survive the move into crop because pickPreset (:541-549) only sets ratio/sel/mode and leaves `shapes` and `unsaved` alone, and leaveCrop (:568-572) returns to draw `if unsaved`. 'Undo crop' renders whenever `mode !== \"crop\" && edit?.crop` (:1163-1176), including in draw mode with unsaved marks. write() saves `marks` then calls `resetShapes(readMarks(loaded)); setUnsaved(false)` (:633-636), which also clears the undo history. Neither button's label or helper text (:1152, :1159-1160) mentions marks.",
+    "corrected_claim": "",
+    "reachable_by": "A user who draws marks without saving, then opens Crop and clicks Crop, or clicks Undo crop on an already-cropped picture.",
+    "fix_assessment": "Relabelling or asking is the safe fix. Simply passing the saved marks (readMarks(edit)) instead of shapes would keep unsaved marks out of the file, but write() then resets shapes to the stored marks (:634), so the unsaved marks would be lost from the editor without a question, which is worse."
+   }
+  ]
+ },
+ {
+  "id": "EF-43",
+  "title": "Text scale handle responds only to vertical distance",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotAnnotate.tsx:818-828"
+  ],
+  "claim": "Text has one scale handle, and scaling uses only the vertical distance (ShotAnnotate.tsx:818-828); horizontal pulls do nothing.",
+  "scenario": "User drags a caption's scale handle sideways; the text size does not change.",
+  "fix": "No explicit fix proposed.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ShotAnnotate.tsx:818-826: `if (from.tool === \"text\") { // The distance from the anchor sets the size ... const lines = (from.text ?? \"\").split(\"\\n\").length; const grown = Math.max(6, point.y - from.y1); replace(state.id, { size: Math.max(6, Math.round(grown / (lines * LINE_HEIGHT))) }, ...)` - point.x is never read. The only text handle is placed at the bottom-right corner: handlesOf() line 460-462 `return [[\"scale\", box.x + box.width, box.y + box.height]];`. The comment says 'distance from the anchor', but the code uses only the vertical offset.",
+    "corrected_claim": "",
+    "reachable_by": "Any user who selects a text mark in the screenshot editor and drags its single corner handle horizontally. Diagonal drags work only through their vertical component.",
+    "fix_assessment": "No fix was proposed. Using the larger of the horizontal and vertical ratios (width taken from bounds(from, measure)), or the Euclidean distance from the anchor, would make the code match its own comment."
+   }
+  ]
+ },
+ {
+  "id": "EF-44",
+  "title": "Clicking an existing caption with the Text tool creates a new one",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotAnnotate.tsx:741-744"
+  ],
+  "claim": "With the Text tool active, clicking an existing caption creates a new caption instead of editing the existing one (ShotAnnotate.tsx:741-744); editing requires double-click.",
+  "scenario": "User clicks on a caption with the Text tool to fix a typo and gets a new empty text box on top.",
+  "fix": "No explicit fix proposed.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ShotAnnotate.tsx:741-744: `if (tool === \"text\") { setTyping({ x: point.x, y: point.y, id: null, value: \"\" }); return; }` runs without any hit() test, while the select branch above (725-739) does call hit(). Editing exists only in the overlay's onDoubleClick (926-941): `const under = hit(...); if (under?.tool === \"text\") { onSelect(under.id); setTyping({ ..., id: under.id, value: under.text ?? \"\" }); }`. The Text-tool hint (ShotViewer.tsx:1108) says only 'Click and write ...'. The 'double-click a text to rewrite it' hint appears for the other tools only.",
+    "corrected_claim": "Strictly, the click opens a new, empty text field at the click point on top of the caption. A new caption is created only if the user types into it; an empty field is dropped by commitText. The scenario describes this correctly. A further point weakens 'editing requires double-click' when the Text tool is active. The first click mounts the new <textarea> with its top-left corner at the pointer, and it is later in the DOM, so it sits above the overlay. The second click of the double-click is therefore likely to land on that textarea, and the overlay's onDoubleClick would never fire. Whether this happens depends on browser hit-testing at a sub-pixel position and cannot be checked from source.",
+    "reachable_by": "Any user who has the Text tool active and clicks on an existing caption, for example to fix a typo.",
+    "fix_assessment": "No fix was proposed. A hit() test in the text branch that opens the hit caption for editing (with id set, as the dblclick handler does) would fix both the single-click case and the possibly broken double-click."
+   }
+  ]
+ },
+ {
+  "id": "EF-45",
+  "title": "Picking a tool while cropping silently drops the crop selection",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotViewer.tsx:585-592"
+  ],
+  "claim": "`pickTool` (ShotViewer.tsx:585-592) switches to draw mode; when a crop selection is in progress it is silently dropped.",
+  "scenario": "User draws a careful crop rectangle, then clicks Arrow to add a mark first; the crop selection is lost.",
+  "fix": "No explicit fix proposed (unifying crop and annotate into one session addresses it).",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/components/ShotViewer.tsx:585-592: `const pickTool = (next: Tool) => { setTool(next); setMode(\"draw\"); setSel(null); ... }` throws away the in-progress crop rectangle `sel` (line 167) and asks nothing. The tool buttons stay enabled during a crop (953-958: `active={mode === \"draw\" && tool === key} disabled={!inTauri || broken} onClick={() => pickTool(key)}`). The Annotate disclosure is open by default (193: `useState({ annotate: true, crop: false })`), so the buttons are visible above the Crop panel. Re-entering the crop through pickPreset (541-549) starts from `edit?.crop ?? full`, because `sel` is already null, so the drawn rectangle cannot be recovered.",
+    "corrected_claim": "",
+    "reachable_by": "Any user who has drawn a crop rectangle and then clicks any Annotate tool button before pressing Crop.",
+    "fix_assessment": "No fix was proposed. Possible fixes: keep `sel` when switching to draw so a later preset click restores it, disable or warn on tool buttons while mode === 'crop', or merge crop and annotate into one session as the finding suggests."
+   }
+  ]
+ },
+ {
+  "id": "EF-48",
+  "title": "Gallery tiles crop non-16:9 screenshots",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/routes/Clips.tsx:466",
+   "src/routes/Clips.tsx:483"
+  ],
+  "claim": "Gallery tiles are `aspect-video object-cover` (Clips.tsx:466, 483), so screenshots cropped to 1:1 or 9:16 look cut off in the gallery.",
+  "scenario": "User crops a screenshot to 9:16 for a phone story; its gallery tile shows only the middle band.",
+  "fix": "No explicit fix proposed.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/routes/Clips.tsx:466: `className=\"relative block aspect-video w-full ...\"` and :483: `className=\"h-full w-full object-cover\"` on the thumbnail img. The thumbnail keeps the picture's own aspect ratio and has no padding: src-tauri/src/thumbs.rs:59 `.args([\"-frames:v\", \"1\", \"-vf\", \"scale=480:-1\", ...])`, and write_picture regenerates it after every edit (commands.rs:641 `crate::thumbs::make_still(&target, &clip.id)`). The crop presets include 9:16, 1:1 and 4:5 (ShotViewer.tsx:78-88). A 9:16 crop therefore gives a 480x853 thumbnail, and object-cover in a 16:9 box shows only about the middle third of it.",
+    "corrected_claim": "",
+    "reachable_by": "Any user who crops a screenshot to a non-16:9 preset (9:16, 1:1, 4:5, 4:3, 21:9) or captures one on a non-16:9 monitor (for example 16:10 or ultrawide). The latter is cropped less severely.",
+    "fix_assessment": "No fix was proposed. For screenshot tiles, object-contain on the gradient background, or a letterboxed thumbnail generated in thumbs.rs, would show the whole picture without changing the grid."
+   }
+  ]
+ },
+ {
+  "id": "EF-49",
+  "title": "Screenshot tiles have no \"edited\" marker",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/routes/Clips.tsx:466",
+   "src/routes/Clips.tsx:483"
+  ],
+  "claim": "Screenshot tiles in the gallery (Clips.tsx:466, 483) show no marker indicating the screenshot has been edited.",
+  "scenario": "User cannot tell from the gallery which screenshots carry crops or marks.",
+  "fix": "No explicit fix proposed.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src/routes/Clips.tsx:509-523: the only 'edited' pill is `{clip.original && (<Pill title=\"Trimmed — the original sits beside it\">...)}`, and for a still only `<Pill title=\"Screenshot\"><IconCamera/></Pill>` is shown. `original` and `originalAvailable` are never set for screenshots. edit_screenshot (commands.rs:510-591) keeps the original at shot::original_path = edit dir/'image.png' (shot.rs:287-289) and never calls lib.set_original (its only caller is commands.rs:1334, the video path). clips.rs:145 `original_available: crate::edit::has_original(&id)` checks note.json plus video.mp4 (edit.rs:97-99), which a screenshot never has.",
+    "corrected_claim": "There is no explicit marker. The gallery is not entirely silent, though. The thumbnail is rebuilt from the edited file (commands.rs:641), so baked-in marks are visible in it, and a crop changes the 'W × H' line under the tile (Clips.tsx:627-629). What the user cannot see is that a screenshot was edited and still has its untouched original kept for undo. For video trims that fact is shown with the scissors pill.",
+    "reachable_by": "Any user browsing the gallery after editing (cropping or marking) one or more screenshots.",
+    "fix_assessment": "No fix was proposed. Exposing shot::has_original (or an 'edited' flag) on Clip for screenshots, and reusing the existing scissors/pencil pill, would bring stills in line with trimmed clips."
+   }
+  ]
+ },
+ {
+  "id": "EF-9",
+  "title": "Ellipse blur: antialiased preview vs hard-edged oval mask in file",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src/components/ShotAnnotate.tsx:1062",
+   "src-tauri/src/shot.rs:199-208"
+  ],
+  "claim": "For an oval blur, the preview clips with an antialiased `border-radius:50%` (ShotAnnotate.tsx:1062), while Rust uses a hard in/out oval test (shot.rs:199-208). The preview's oval edge is smooth; the file's has a hard edge, so preview and file drift.",
+  "scenario": "User places an ellipse blur; the saved picture shows a jagged/hard oval border that the preview didn't show.",
+  "fix": "Feather the Rust oval mask by coverage; add parity tests.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/src/shot.rs:198-205: `let dx = (column as f32 + 0.5 - centre_x) / centre_x; let dy = ...; if dx * dx + dy * dy > 1.0 { continue; } ... copy_from_slice(&across[from..from + 3]);` decides each pixel as fully blurred or fully original from its centre, with no partial coverage. src/components/ShotAnnotate.tsx:1059-1062: `// The rounding clips the backdrop with it, so an oval here is an oval in the file — the core masks the same way.` `borderRadius: step.ellipse ? \"50%\" : undefined, backdropFilter: blur(...)`. The geometry matches: radii w/2 and h/2, centre taken from the requested rectangle (shot.rs:190-191). Only the edge treatment differs.",
+    "corrected_claim": "Correct as stated, but the size of the effect is small: the file gets a 1-pixel stair-stepped boundary between blurred and original pixels around the oval. The preview usually shows the picture downscaled (box.scale), so its edge looks smooth whatever mask is used, and the difference shows only when the saved file is viewed at 100% or more. That the preview's rounded clip is antialiased is Chromium/WebView2 behaviour, which cannot be checked from source here. The shape and position of the oval do match.",
+    "reachable_by": "Any user who places an ellipse blur in the screenshot editor and saves or copies the result.",
+    "fix_assessment": "Blending blurred and original pixels by the fraction of each edge pixel inside the oval (for example a 2x2 or 4x4 supersample, touching only the 1-pixel boundary band) is cheap, removes the stair-step and barely weakens the redaction. A true preview/file parity test needs a browser, so in practice the test would be a Rust unit test of the boundary coverage values; the comment at ShotAnnotate.tsx:1059-1060 should be reworded too."
+   }
+  ]
+ },
+ {
+  "id": "EF-12",
+  "title": "Pen marks cannot be resized",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotAnnotate.tsx:457"
+  ],
+  "claim": "`handlesOf` returns no handles for pen marks (ShotAnnotate.tsx:457), so a placed pen stroke can be moved but never resized.",
+  "scenario": "User selects a freehand pen stroke to scale it; no resize handles appear.",
+  "fix": "No explicit fix proposed beyond listing it as a gap.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "ShotAnnotate.tsx:457 `if (shape.tool === \"pen\") return [];` (docstring 441: 'Which corners a shape can be pulled by. `move` alone means: none.'). Moving works: 801 `points: from.points?.map(([x, y]) => [x + dx, y + dy])`. The handle-drag branch (806-834) has no pen case, and the generic branch rewrites only x1/y1/x2/y2, never points.",
+    "corrected_claim": "",
+    "reachable_by": "A user selecting a freehand pen mark with the Select tool.",
+    "fix_assessment": "This is a deliberate feature gap, not a bug. Adding it needs both corner handles in handlesOf and a pen branch in onMove that scales every point relative to the anchor."
+   }
+  ]
+ },
+ {
+  "id": "EF-29",
+  "title": "Comments claim export is the preview canvas, but export is redrawn",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src/components/ShotAnnotate.tsx:166-172",
+   "src/components/ShotAnnotate.tsx:607-610",
+   "src/components/ShotViewer.tsx:1600-1606"
+  ],
+  "claim": "Comments at ShotAnnotate.tsx:166-172 and 607-610 say \"the export is this very canvas\". In fact the export is drawn again on a fresh full-resolution canvas (`layerBytes`, ShotViewer.tsx:1600-1606). Harmless but misleading for anyone extending the code.",
+  "scenario": "A developer relies on the comment and assumes preview canvases are what get saved, introducing a preview-only change that never reaches the file.",
+  "fix": "Update the stale comments.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/components/ShotAnnotate.tsx:168-169 `the canvas over the picture *is* what gets sent, so what you see cannot drift from what is written`; :607-609 `the export is this very canvas, not a second rendering of it`. But the export is drawn again: ShotViewer.tsx:1600-1617 `Rendered afresh rather than read off the preview ... const canvas = document.createElement(\"canvas\"); canvas.width = width; ... paint(ctx, shapes);`, called at ShotViewer.tsx:615 `png: await layerBytes(step.shapes, full.width, full.height)`. The preview ShapeLayer canvas (ShotAnnotate.tsx:565-583) is sized to the ground (the crop in draw mode), while the export uses the original's size, so they cannot be the same canvas. Blur is also not exported from the preview; Rust redoes it (commands.rs:570-577).",
+    "corrected_claim": "",
+    "reachable_by": "Developers only. Runtime behaviour is unaffected because both paths call the same `paint()`. Only a change made outside `paint` (e.g. in ShapeLayer's effect) would show in the preview but not in the file.",
+    "fix_assessment": "Fixing the two comments to match layerBytes's own doc comment ('same paint routine, rendered afresh at the original's size') is all that is needed."
+   }
+  ]
+ },
+ {
+  "id": "EF-33",
+  "title": "IPC types are hand-copied between TypeScript and Rust",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src/lib/types.ts:511-547",
+   "src-tauri/src/commands.rs:400-444"
+  ],
+  "claim": "`ShotStep`, `ShotEdit` and `ShotRect` are written by hand in both languages (types.ts:511-547, commands.rs:400-444), so they can drift silently.",
+  "scenario": "A field is added to the Rust `Step` but not to `ShotStep` in TS; saves fail at deserialization or silently drop the field.",
+  "fix": "Generate the shared types with ts-rs or tauri-specta.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src/lib/types.ts:511-547 hand-writes `interface ShotRect`, `type ShotStep = (ShotRect & { kind: \"blur\"; radius: number; ellipse: boolean }) | { kind: \"layer\"; png: number[] }` and `interface ShotEdit {...}`. src-tauri/src/commands.rs:400-444 hand-writes `enum Step { Blur { x: u32, ... radius: u32, #[serde(default)] ellipse: bool }, Layer { png: Vec<u8> } }` and `struct ShotEdit`; shot.rs:322-329 holds `struct Rect`. No ts-rs or specta dependency in src-tauri/Cargo.toml or package.json, no contract test, and no `deny_unknown_fields` anywhere in src-tauri/src. The fields match today.",
+    "corrected_claim": "",
+    "reachable_by": "Developers who change one side only. A new required Rust field missing in TS makes `write_screenshot` fail to deserialize (loudly, as a toast). An extra TS field Rust does not declare is silently ignored by serde. The same hand-copying covers the whole IPC surface in types.ts (585 lines), not just these three types.",
+    "fix_assessment": "ts-rs or tauri-specta would remove the drift risk. It is a project-wide tooling change, though, and would make sense for the whole of types.ts rather than just these three types."
+   }
+  ]
+ },
+ {
+  "id": "EF-40",
+  "title": "\"Edited\" pill counts unsaved marks",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotViewer.tsx:532"
+  ],
+  "claim": "The \"Edited\" pill (ShotViewer.tsx:532) counts unsaved marks rather than reflecting what is saved.",
+  "scenario": "User draws a mark without saving; the pill shows the screenshot as edited even though nothing was written.",
+  "fix": "Make the pill reflect the saved state.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "ShotViewer.tsx:532 `const edited = Boolean(edit?.crop) || shapes.length > 0;` -- `shapes` is the live editing state that editShapes updates on every user change (:290 `setShapes(after)`), not the saved marks (`edit?.marks`). Pill at :740-747 `{edited && (<Pill title=\"Edited — the untouched picture sits beside it\">Edited</Pill>)}`.",
+    "corrected_claim": "Confirmed, and it also fails the other way: deleting every saved mark (without a crop) before saving makes shapes.length 0, so the pill disappears while the file on disk is still edited.",
+    "reachable_by": "Any user drawing (or deleting) marks in draw mode before saving.",
+    "fix_assessment": "Deriving it from saved state (`Boolean(edit?.crop) || Boolean(edit?.marks)`) is correct; if wanted, a separate 'unsaved' cue could show `unsaved`."
+   }
+  ]
+ },
+ {
+  "id": "EF-42",
+  "title": "Zoom resets on every mode change and save",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotViewer.tsx:372"
+  ],
+  "claim": "The zoom/pan view resets on every mode change and on every save (ShotViewer.tsx:372).",
+  "scenario": "User zooms into a detail, saves, and has to zoom back in to continue.",
+  "fix": "No explicit fix proposed beyond listing it (stay in draw mode after saving).",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "ShotViewer.tsx:372 `useEffect(() => setView(WHOLE), [mode, id, edit]);` (comment :369-371 says it is deliberate because each mode shows another picture). On save, write() runs `setEdit(loaded)` (a new object) and `setMode(\"view\")` (:633-638), so the view resets twice over and the user is also thrown out of draw mode. The other view effect (:453-459) only clamps the view on resize.",
+    "corrected_claim": "Behaviour confirmed, and it is an intended design decision (the code comment says so), not an oversight. Resetting between crop mode and the other modes is justified because the stage switches to the original's dimensions. Between view and draw, and across a save, the ground has the same size (the cropped picture), so keeping the zoom there would be safe.",
+    "reachable_by": "Any user who zooms in and then switches mode or saves.",
+    "fix_assessment": "Either keep draw mode after Save, or reset only when ground.width/height actually change; both are small changes. The finding gives no concrete fix of its own."
+   }
+  ]
+ },
+ {
+  "id": "EF-13",
+  "title": "Restyling a selected mark doesn't become the tool default",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotViewer.tsx:676-687",
+   "src/components/ShotViewer.tsx:651-687"
+  ],
+  "claim": "When a mark is selected, the panel edits that mark's style via `restyle` (ShotViewer.tsx:651-687, 676-687) but does not write `styles[chosen.tool]`, so the tool's default for the next mark is unchanged and the next mark reverts (e.g. the next arrow is red again).",
+  "scenario": "User changes the selected arrow to green, then draws a new arrow; it comes out red.",
+  "fix": "When a mark is selected, `restyle` should also write `styles[chosen.tool]`. Persist styles in `localStorage` as `{color, altColor, sizeFactor: size/baseStroke(width), fill, outline, round}` and rebuild sizes per picture in `defaultStyles` (1488-1509), wrapping storage access in try/catch.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "ShotViewer.tsx:676-686 `const restyle = (patch) => { if (chosen) { editShapes(... shape.id === chosen.id ? {...shape, ...patch} ...); return; } setStyles((all) => ({ ...all, [tool]: { ...style, ...patch } })); }` - styles[chosen.tool] is never written (true). BUT ShotViewer.tsx:663-674 `const style: Style = chosen ? { color: chosen.color, ... size: chosen.size, ... } : (styles[tool] ?? ...)` and :886 `style={style}` hand the SELECTED mark's style to AnnotateLayer, whose new-mark path uses it: ShotAnnotate.tsx:746-752 `onSelect(null); setDraft({ id: next.current++, tool, color: style.color, altColor: style.altColor, size: style.size, ...` (the closure still holds the chosen mark's style). And every finished mark becomes selected: ShotAnnotate.tsx:864-866 `if (moved) { onShapes([...shapes, draft]); onSelect(draft.id); }`. So draw arrow -> recolour it green -> draw again gives a GREEN arrow, and green carries on. It falls back to red only after the selection is cleared: pickTool (ShotViewer.tsx:591 `if (next !== \"select\") setSelected(null)`), undo (:306), Remove/Delete (:697), save (:636), or a click that drew nothing (ShotAnnotate.tsx:746 clears selection, :864 adds nothing). Text commit path (ShotAnnotate.tsx:882-887) uses the same `style`.",
+    "corrected_claim": "restyle() never updates styles[chosen.tool], but the next mark does not simply revert: AnnotateLayer builds new marks from `style`, which is the selected mark's style whenever one is selected (ShotViewer.tsx:663-674, 886; ShotAnnotate.tsx:746-752), and each new mark is auto-selected (ShotAnnotate.tsx:866). So in the common draw -> restyle -> draw flow the new arrow comes out green; it comes out red only once the selection has been cleared (picking the tool button again, Undo, Remove/Delete, save, a stray click that drew nothing, or a mark picked with Select before switching to Arrow). The real defect is that a new mark's style depends on what is selected at that moment, so the result is inconsistent. It can also leak between tools: a caption double-clicked while the Arrow tool is active stays selected, and the next arrow takes the caption's colour, rim and text-sized stroke (text default base*7 vs arrow base, ShotAnnotate.tsx:122-127).",
+    "reachable_by": "Any user annotating a screenshot in the ShotViewer draw mode (UI-only; no security impact).",
+    "fix_assessment": "Writing styles[chosen.tool] in restyle helps, but the root fix is to give AnnotateLayer the tool default (styles[tool]) for new marks and keep the selected mark's style only for the panel and the text field being edited (ShotAnnotate.tsx:1015-1025 needs it). The localStorage persistence is a separate feature, not needed to fix this."
+   }
+  ]
+ },
+ {
+  "id": "EF-21",
+  "title": "Copy picture is only reachable via right-click in view mode, not in the editor",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotViewer.tsx:767-770",
+   "src/components/clipMenu.tsx:161-180"
+  ],
+  "claim": "Copy picture (CF_DIB, read back from the edited file) and Copy file (CF_HDROP) exist only in the right-click menu, which is in the gallery and on the stage in view mode only (clipMenu.tsx:161-180, ShotViewer.tsx:767-770). There is nothing in the editor and no Ctrl+C.",
+  "scenario": "User finishes annotating and wants to copy the result to Discord; they must save, leave draw mode, and right-click.",
+  "fix": "Add a \"Copy\" button in the footer and \"Save & copy\" next to \"Save marks\" (`write()` then `api.copyClipImage`); Ctrl+C copies the picture.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "clipMenu.tsx:164-181 `Copy picture` -> api.copyClipImage, `Copy file` -> api.copyClipFile, used via ShotViewer.tsx:767-770 `onContextMenu={(event) => mode === \"view\" && clipMenu(event, clip, ...)}`; ShotViewer footer (1191-1265) has Favorite/Show in folder/Delete only; draw panel (1060-1100) has Save marks/Undo/Discard; key handler (374-411) handles Escape, Delete/Backspace, Ctrl+Z, arrows -- no Ctrl+C. However write() ends with `setMode(\"view\")` (ShotViewer.tsx:638), so saving already leaves draw mode; and the Console window offers `Copy to clipboard` -> api.copyClipFile for screenshots too (console/Console.tsx:707-716, 957-962). commands.rs:666 copy_clip_image reads clip.path, i.e. the edited file.",
+    "corrected_claim": "True that the main-window viewer/editor has no Copy button, no 'Save & copy' and no Ctrl+C; Copy picture (CF_DIB) is reachable only from the right-click menu, which ShotViewer enables only in view mode. Two details are off: Save marks itself returns to view mode (ShotViewer.tsx:638), so the path is Save -> right-click -> Copy picture, not an extra 'leave draw mode' step; and Copy file (CF_HDROP) is also reachable from the Console window's Copy-to-clipboard tool, not only the right-click menu.",
+    "reachable_by": "Any user annotating a screenshot in the main-window ShotViewer who wants the result on the clipboard.",
+    "fix_assessment": "A footer 'Copy picture' button plus Ctrl+C (in view mode, and 'Save & copy' in draw mode calling write() then api.copyClipImage) is straightforward; Ctrl+C must skip when focus is in the text textarea/inputs, as the existing handler already does for INPUT/TEXTAREA."
+   }
+  ]
+ },
+ {
+  "id": "EF-19",
+  "title": "Watermark is re-stamped on edits even after the user turned it off",
+  "severity": "low",
+  "category": "ux",
+  "locations": [
+   "src-tauri/src/commands.rs:585-587",
+   "src-tauri/src/watermark.rs:144-149",
+   "src-tauri/src/commands.rs:540-545"
+  ],
+  "claim": "Re-stamping the watermark during an edit depends on `under.png` existing, not on the current watermark setting (commands.rs:540-545, 585-587; watermark.rs:144-149). A user who has switched the watermark off still gets it re-stamped on older screenshots when editing them. The report calls this a product decision to make explicitly.",
+  "scenario": "User disables the watermark setting, then crops an older screenshot; the saved result still carries a freshly stamped watermark.",
+  "fix": "Decide explicitly; `under.png` would make it easy to honour the current setting.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "commands.rs:542-545 `let under = crate::shot::read_under(&clip.id, ...); if let Some((at, piece)) = &under { pristine.paste(...) }` and commands.rs:585-587 `if under.is_some() { crate::watermark::stamp_kept(&mut picture); }` -- no call to watermark::enabled(). But the behaviour is documented as deliberate: watermark.rs:143 `/// Lay the mark into an edited screenshot — always, see [rect_kept]`; watermark.rs:90-91 `cropping the mark away is exactly what it must not allow`; shot.rs:361-364 `so the mark can be neither painted over nor cropped away. A screenshot without one (taken with the mark switched off...) is edited as it is`; Banner.tsx:172 setting hint `ClippiBoy logo in the bottom-left corner of new clips and screenshots`; ShotViewer.tsx:910 preview title `The watermark stays on the picture`. under.png is only written when stamp() ran, i.e. the setting was on at capture (state.rs:915-927, watermark.rs:133-135).",
+    "corrected_claim": "The mechanism is as stated: re-stamping on edit is keyed on under.png/under.json being valid, not on the current setting. But it is not an unmade product decision: the code, the store docs and the settings hint ('new clips and screenshots') explicitly scope the toggle to new captures, and the editor preview shows the mark that will land. The old screenshot already carried the mark in its file; the edit preserves it rather than adding one that was not there. Honouring the current setting would turn 'switch off + edit' into a way to strip the mark from existing screenshots.",
+    "reachable_by": "Any user who captured a screenshot with the watermark on, later switched the setting off, and then crops/annotates that screenshot.",
+    "fix_assessment": "No code fix needed unless the product owner wants the toggle to apply retroactively; if so, gate commands.rs:585 on watermark::enabled() and drop the mark-preview in ShotViewer.tsx:906 accordingly, accepting that edits then remove the mark from old shots."
+   }
+  ]
+ },
+ {
+  "id": "EF-32",
+  "title": "Marks are an opaque, doubly-encoded string the core cannot use",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src-tauri/src/shot.rs:311-320",
+   "src-tauri/src/shot.rs:316-318"
+  ],
+  "claim": "In `shot.json`, `marks` is the `Shape[]` JSON encoded a second time as a string (shot.rs:311-320), and the core never reads it (316-318). So the core cannot validate marks, migrate them, render headlessly (presets or auto-redact at capture time), or export the current state; \"Copy what I see\" requires saving first.",
+  "scenario": "Implementing auto-redaction at capture time or copy-current-state is impossible without a save round trip through the WebView.",
+  "fix": "Sidecar v2 with `marks` as a real JSON array (`serde_json::Value`) and a reader that also accepts the old string.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/src/shot.rs:311-320 `pub struct Edit { #[serde(default)] pub crop: Option<Rect>, /// The marks exactly as the WebView keeps them. Opaque in here — it is handed back unread ... pub marks: String }`, serialized with serde_json at shot.rs:347, so shot.json holds `\"marks\":\"[{\\\"id\\\":...}]\"` (a JSON string with JSON inside it). The TS side produces it with `JSON.stringify(placed)` (ShotViewer.tsx:627) and parses it at ShotViewer.tsx:1467. In Rust the content is never parsed: it is passed through at commands.rs:466 and :597, and the only check is `marks.is_empty()` at commands.rs:532. However, nothing in the repo implements 'Copy what I see' or capture-time auto-redaction (grep finds no copy action in ShotViewer.tsx and no redact feature).",
+    "corrected_claim": "Marks are stored as an opaque JSON string inside shot.json, and the Rust core never interprets them; that much is true. The listed consequences are overstated. The string format does not stop the core from validating or migrating marks, since `serde_json::from_str(&edit.marks)` would do it; what is missing is a Rust `Shape` type. Rendering headlessly would need a Rust port of `paint()` (arrows, text, pen) whatever the encoding. Unsaved state lives only in WebView memory, so copying the current state would need a round trip even with a v2 sidecar. 'Copy what I see' and auto-redact do not exist in the codebase, so nothing is broken today. This is a design and extensibility note.",
+    "reachable_by": "No runtime trigger. It only matters to future features that want the core to understand marks.",
+    "fix_assessment": "A v2 sidecar with `marks: serde_json::Value` (plus a reader that accepts the old string) is cheap and harmless. On its own it does not enable headless rendering or exporting unsaved state; that also needs a Rust Shape model and painter."
+   }
+  ]
+ },
+ {
+  "id": "EF-35",
+  "title": "Blur step coordinates are u32, so one negative value fails the whole save",
+  "severity": "low",
+  "category": "robustness",
+  "locations": [
+   "src/components/ShotAnnotate.tsx:770-775",
+   "src-tauri/src/commands.rs"
+  ],
+  "claim": "Blur step coordinates are `u32` on the Rust side, so a single negative number fails the whole save at deserialization. The TS side works around this by clamping drags (ShotAnnotate.tsx:770-775).",
+  "scenario": "A blur rectangle ends up with a slightly negative x (e.g. via a code path that bypasses the drag clamp); the entire `edit_screenshot` call fails to deserialize.",
+  "fix": "Accept signed values and clamp in Rust.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/src/commands.rs:403-411 `Blur { x: u32, y: u32, width: u32, height: u32, radius: u32, ...}`. serde rejects a negative integer for u32, so the whole `write_screenshot` invoke would fail. No current path produces a negative blur coordinate, though. New marks start from `at()`, which clamps to [0,width]/[0,height] (ShotAnnotate.tsx:689-697 `clamp((event.clientX - ...) / box.scale, width)`). Moves are limited by `shift(raw, low, high) = Math.min(Math.max(raw, Math.min(-low, 0)), Math.max(high, 0))` (ShotAnnotate.tsx:792-795), so a mark never goes further left or up than it already is. Handle drags use the clamped point and an anchor taken from the existing bounds (ShotAnnotate.tsx:829-833). `bounds()` adds no padding (ShotAnnotate.tsx:325-330). Display coordinates are shifted back by the same `edit.crop` they were shifted by (ShotViewer.tsx:431, 608, 1468), so a mark shown past a crop edge is still >= 0 in the original's coordinates. toSteps rounds with Math.round (ShotAnnotate.tsx:513-520). Rust then clamps the upper bounds (shot.rs:148-151).",
+    "corrected_claim": "The fragility is real but latent. Blur coordinates (and the crop Rect) are u32, so one negative value would reject the whole save. No reachable code path produces one today: drawing, moving and handle-resizing all clamp, and the crop/origin shift round-trips. The cited lines 770-775 are the explanatory comment; the clamp itself is at ShotAnnotate.tsx:792-795. Only blur coordinates matter here, because other marks reach Rust as PNG layers plus the opaque marks string.",
+    "reachable_by": "Not reachable from the current UI. It would need a future code path (e.g. keyboard nudge, paste, or a mark migration) that writes a blur with a negative coordinate, or a hand-edited shot.json whose marks are reloaded and re-saved.",
+    "fix_assessment": "Taking i32/i64 in `Step::Blur` and clamping in Rust (intersecting with the picture before calling `blur`) is a cheap defence in depth and would make the TS clamp a UX choice rather than a correctness requirement. It is not urgent."
+   }
+  ]
+ },
+ {
+  "id": "EF-1",
+  "title": "Header close button discards unsaved marks without asking",
+  "severity": "medium",
+  "category": "data-loss",
+  "locations": [
+   "src/components/ShotViewer.tsx:749-758",
+   "src/components/ShotViewer.tsx:380-386",
+   "src/components/ShotViewer.tsx:580-583",
+   "src/components/ShotViewer.tsx:184-188"
+  ],
+  "claim": "In ShotViewer, the header close button (the ✕ at ShotViewer.tsx:749-758) calls `close` directly, so it closes the viewer without the unsaved-marks check that the Escape path performs (ShotViewer.tsx:380-386, 580-583). This contradicts the comment at ShotViewer.tsx:184-188.",
+  "scenario": "User enters draw mode, places several marks without saving, then clicks the header ✕: the viewer closes immediately with no discard prompt and the marks are silently lost.",
+  "fix": "Route the header ✕ through a `requestClose()` that does `if (editing && unsaved) setAskingDiscard(true) else close()`. Optionally keep a draft of `shapes` per clip id in `sessionStorage` so a crash or update restart can offer \"Restore unsaved marks?\".",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "EF-18",
+  "title": "Sidecar shot.json has no version and parse failures silently become \"no edit\"",
+  "severity": "medium",
+  "category": "data-loss",
+  "locations": [
+   "src-tauri/src/shot.rs:311-320",
+   "src-tauri/src/shot.rs:335-340",
+   "src/components/ShotAnnotate.tsx:192-194"
+  ],
+  "claim": "`shot.json` is `{crop: Rect|null, marks: string}` with no version field (shot.rs:311-320). Old marks are recognised only by missing fields, e.g. `outline !== false` (ShotAnnotate.tsx:192-194), with such rules scattered. `read_edit` turns any parse error into \"no edit\" via `unwrap_or_default` (shot.rs:335-340). If a newer version's file is opened by an older build, the editor would show `base.png` (cropped) as if it were uncropped and could wipe the edit on the next save.",
+  "scenario": "User downgrades ClippiBoy after editing with a newer build; the older build fails to parse shot.json, shows the cropped base.png as the uncropped original, and the next save destroys the stored edit.",
+  "fix": "Sidecar v2: Rust `#[serde(default)] version: u32` (missing means 1) and `marks: serde_json::Value` with a reader that also accepts the old string; refuse to edit when `version > SUPPORTED`, returning `readOnly: true` instead of `unwrap_or_default`. TS `readMarks` accepts a string or array, then one `normalizeShape()` fills defaults. Migrate lazily on next save.",
+  "reported_confidence": "likely",
+  "slice": "02-editor-features",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "EF-5",
+  "title": "Shortcuts stop working after a slider or colour field gets focus",
+  "severity": "medium",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotViewer.tsx:378",
+   "src/components/ShotAnnotate.tsx:713-718"
+  ],
+  "claim": "The global key handler skips every INPUT element, including `type=range` (ShotViewer.tsx:378). So once the thickness slider or the hex/RGB colour field has focus, Delete, Ctrl+Z and Escape are ignored. The drawing surface calls `preventDefault` on pointerdown (ShotAnnotate.tsx:713-718, line 718), which stops it from taking focus, so drawing on the picture does not take focus back and the slider keeps focus indefinitely.",
+  "scenario": "User drags the thickness slider, draws a box, then presses Delete or Ctrl+Z: nothing happens because focus is still on the slider.",
+  "fix": "Skip only text-entry fields (`input:not([type=range],[type=checkbox],[type=button])`, `textarea`, `[contenteditable]`). In `onDown`, blur `document.activeElement` when it is not the caption field.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "EF-6",
+  "title": "\"Remove all marks\" saves immediately with no confirmation or undo",
+  "severity": "medium",
+  "category": "data-loss",
+  "locations": [
+   "src/components/ShotViewer.tsx:1095-1104",
+   "src/components/ShotViewer.tsx:634"
+  ],
+  "claim": "The \"Remove all marks\" action (ShotViewer.tsx:1095-1104) writes the file at once without asking. Because undo history is reset on every save (`resetShapes` at ShotViewer.tsx:634), the marks are gone for good.",
+  "scenario": "User misclicks \"Remove all marks\" on a heavily annotated screenshot; all marks are written away immediately and cannot be undone.",
+  "fix": "Add a confirmation (reuse `ConfirmDelete`), or make it undoable by keeping the previous `marks` string.",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "EF-7",
+  "title": "Marks are invisible while cropping",
+  "severity": "medium",
+  "category": "ux",
+  "locations": [
+   "src/components/ShotViewer.tsx:439-441",
+   "src/components/ShotViewer.tsx:880-893"
+  ],
+  "claim": "In crop mode the crop ground is the untouched original (ShotViewer.tsx:439-441), and the marks layer is only mounted in draw mode (ShotViewer.tsx:880-892). The user therefore cannot see their marks while choosing a crop, even though the crop cuts through them.",
+  "scenario": "User has placed an arrow near the edge and then crops; the arrow is not shown in crop mode, so the crop cuts it off without the user noticing.",
+  "fix": "Mount read-only `ShapeLayer`s and `BlurPatch`es in crop mode at the original's coordinates (`shift` by +origin).",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "EF-11",
+  "title": "Text font names Inter but Inter is not bundled",
+  "severity": "info",
+  "category": "quality",
+  "locations": [
+   "src/components/ShotAnnotate.tsx:284-286"
+  ],
+  "claim": "Text marks use the font `600 {size}px Inter, \"Segoe UI\"` (ShotAnnotate.tsx:284-286), but Inter is not bundled (no `@font-face`), so in practice text renders as Segoe UI Semibold.",
+  "scenario": "Text marks never render in Inter as the code suggests; they render in Segoe UI Semibold.",
+  "fix": "No explicit fix proposed (the report notes it as a fact; option B mentions a bundled Inter).",
+  "reported_confidence": "confirmed",
+  "slice": "02-editor-features",
+  "status": "refuted",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "refuted",
+    "severity_suggestion": "info",
+    "evidence": "src/index.css:5-11: `@font-face { font-family: \"Inter\"; font-style: normal; font-weight: 100 900; font-display: swap; src: local(\"Inter\"), local(\"Inter Variable\"), local(\"Segoe UI Variable Display\"); }`. This file is imported by every entry (src/main.tsx:4, src/overlay/main.tsx:4, src/console/main.tsx:4), so it applies to the document whose canvas draws the text marks (ShotAnnotate.tsx:247 `ctx.font = textFont(shape.size)`; ShotAnnotate.tsx:284-286 `600 ${size}px Inter, \"Segoe UI\", sans-serif`). No Inter font file ships with the app (the only one is site/fonts/inter.woff2, which belongs to the website).",
+    "corrected_claim": "There is an @font-face for \"Inter\" (src/index.css:5-11); it just has no bundled file. The name \"Inter\" is a deliberate alias: a locally installed Inter is used first, otherwise Segoe UI Variable Display (present on Windows 11), and only when neither is present (for example Windows 10 without Inter) does the stack fall through to \"Segoe UI\" weight 600, i.e. Segoe UI Semibold. So the claim that text 'never renders in Inter' and 'in practice renders as Segoe UI Semibold' is wrong on systems with Inter installed and on Windows 11, if Chromium's local() matching on Windows accepts the name \"Segoe UI Variable Display\" (not checkable from source here). The face is the same one the rest of the UI uses (tokens.css:30 `--font-sans: \"Inter\", ...`), so the canvas text matches the app. The face can differ between machines, but that is a design choice, not a defect.",
+    "reachable_by": "Not a defect; the rendered face depends on which fonts the user's Windows installation has.",
+    "fix_assessment": "No fix needed. If text marks must look the same on every machine, bundle a woff2 (as the site already does) and wait on document.fonts.load before drawing to the canvas. Otherwise a comment at textFont naming the index.css alias would avoid this misreading."
+   }
+  ]
+ }
+]

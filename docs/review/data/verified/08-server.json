@@ -1,0 +1,1621 @@
+[
+ {
+  "id": "SV-1",
+  "title": "Suspension is not enforced on existing sessions, and a banned user can erase their own ban via DELETE /me",
+  "severity": "high",
+  "category": "security",
+  "locations": [
+   "server/src/db.ts:129-147",
+   "index.ts:198",
+   "links.ts:182",
+   "links.ts:139-144",
+   "index.ts:383-391",
+   "hub.ts:178"
+  ],
+  "claim": "authenticate() in server/src/db.ts:129-147 selects only `user_id, last_used` from `sessions` and never looks at `users.banned_at`. The only ban checks are at index.ts:198 (new sign-ins) and links.ts:182 (`createShare`). `live()` at links.ts:139-144 does not consider whether the share owner is banned, and `putPoster` has no ban check. `deleteAccount` at index.ts:383-391 runs `DELETE FROM users WHERE id = ?`, which removes `banned_at` along with the row, so the next Discord login creates a fresh account through `upsertDiscordUser`. `closeAll(reason)` at hub.ts:178 is only ever called from `deleteAccount`; there are no admin/moderation HTTP endpoints (moderation is done by hand with `wrangler d1 execute`), so nothing runs `Hub.closeAll` or deletes sessions when someone is suspended. A suspended user keeps a working session, presence, relays, friend requests, live share links/media and poster swaps; only `POST /shares` is refused.",
+  "scenario": "Repro with seeded user C (`banned_at` set, live session): `GET /me` -> 200; WebSocket hello -> C's presence ('Banned Game') reached friend A; a relay from C was delivered to A. On banned user B: the existing share page and media still return 200 and `PUT /shares/:id/poster` -> 200; only `POST /shares` -> 403. `DELETE /me` by C -> 200 and the users row (including `banned_at`) is gone. Scenario: someone shares abusive clips and the operator sets `banned_at`; their 180-day session keeps working, they keep using presence, sending clips to friends and sending friend requests, their live links stay up and they can swap a link's poster (the `og:image` Discord embeds show) to any JPEG; then they run `DELETE /me`, sign in again with the same Discord account and get a clean account with fresh quota. Capability needed: a suspended user who still holds a token (the normal case, because nothing deletes sessions on suspension).",
+  "fix": "In db.ts authenticate: `SELECT s.user_id, s.last_used, u.banned_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`; `if (!s || now - s.last_used > SESSION_IDLE_MS) throw new HttpError(401, ...)`; `if (s.banned_at !== null) throw new HttpError(403, \"This account is suspended.\")`. In links.ts live(): `... FROM shares s JOIN users u ON u.id = s.owner WHERE s.id = ? AND u.banned_at IS NULL`. Keep bans outside `users` (a `banned_discord_ids` table checked in `authCallback` before the upsert), or refuse `DELETE /me` while banned, or keep a minimal row. Add a cron 'suspension apply' step: find users with `banned_at` set and `suspended_applied_at IS NULL`, delete their sessions, take down their shares (R2 + tombstone), and call `HUB.getByName(id).closeAll(\"suspended\")` (avoids a new admin HTTP surface). Also check the ban in `putPoster`.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "high",
+    "evidence": "server/src/db.ts:136-139 `SELECT user_id, last_used FROM sessions WHERE token_hash = ?` (no join to users, no banned_at); index.ts:71 every authenticated route (/ws, /me, /friends/request, /shares/:id/poster, DELETE /me) goes only through authenticate(). The only banned_at reads are index.ts:198 (authCallback, after upsert) and links.ts:81-85/182 (createShare). links.ts:139-143 live() checks only pending/deleted_at/expires_at, used by sharePage:344, shareFile:380, reportShare:330. links.ts:273-288 putPoster: owned() + deleted_at only. hub.ts:241-263 relayFrom checks only areFriends; hub.ts:177 comment says closeAll is for 'gone or suspended' but grep shows its only caller is index.ts:389. index.ts:387 `DELETE FROM users WHERE id = ?` drops banned_at; sessions/shares cascade (0001_init.sql:20, 0002_shares.sql:5 ON DELETE CASCADE), so the weekly count also resets. db.ts:96-99 upsertDiscordUser looks up by discord_id; with the row gone it INSERTs a new row with banned_at NULL, so index.ts:198 passes. No moderation tooling or docs exist (server/README.md, server/scripts, tools/ have none); 0005_moderation.sql:1 states intent 'A suspended account can neither sign in nor share'. sessions idle out after 180 days, refreshed daily (db.ts:126-145), so an active user's token never expires.",
+    "corrected_claim": "",
+    "reachable_by": "Any suspended user, using the normal app. Their stored token keeps working for /ws presence and relays, friend requests and PUT /shares/:id/poster. Their existing links stay public to anyone on the internet. The Settings > Friends 'Delete account' button (src/routes/settings/Friends.tsx:150 -> friends_delete_account -> DELETE /me, src-tauri/src/friends.rs:276-278) wipes the ban, and signing in again with the same Discord account then creates a clean account. It works every time and needs no special skill, so the ban is the operator's only moderation tool and it is fully bypassable.",
+    "fix_assessment": "The proposed fix is sound. Joining users in authenticate() and returning 403 when banned_at is set closes the session gap. Keeping the ban outside the users row (e.g. a banned_discord_ids table checked in authCallback before the upsert) closes the delete-and-re-signup bypass. Filtering live() by the owner's ban, plus a cron step that deletes sessions and shares and calls Hub.closeAll, covers existing links and open sockets. Hub.relayFrom/friendPresence should also skip banned peers, or rely on the closeAll."
+   },
+   {
+    "lens": "impact",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "server/src/db.ts:135-140 `SELECT user_id, last_used FROM sessions WHERE token_hash = ?` with no look at users.banned_at. The only ban checks are index.ts:198-199 (inside authCallback, after upsertDiscordUser) and links.ts:182 (`if (standing.banned) throw new HttpError(403, ...)` in createShare). links.ts:139-143 live() is `SELECT * FROM shares WHERE id = ?` plus pending/deleted/expiry checks and nothing about the owner, and sharePage/shareFile/reportShare all go through it. links.ts:273-289 putPoster calls only owned() and checks size and JPEG magic. index.ts:383-391 deleteAccount runs `DELETE FROM users WHERE id = ?`. In migrations/0001_init.sql sessions.user_id has ON DELETE CASCADE, and so does shares.owner in 0002_shares.sql, so banned_at goes, and so do the share rows that count toward the weekly quota. upsertDiscordUser (db.ts:~99-119) then INSERTs a fresh row on the next Discord login. The only call to Hub.closeAll is index.ts:389. hub.ts:177 says `The account is gone or suspended: drop every connection`, so the suspension path was meant to exist but was never wired up. route() (index.ts:49-120) has no admin endpoint, and scheduled() only runs sweep and sweepUsage. 0005_moderation.sql:1 says 'A suspended account can neither sign in nor share', but only new sign-ins and new shares are actually blocked.",
+    "corrected_claim": "",
+    "reachable_by": "Any user the operator suspends by setting users.banned_at while the user still holds a session token. That is the normal case: sessions live 180 days idle and the operator has no runbook or tool that also deletes sessions or takes down shares. No other user's data is exposed.",
+    "fix_assessment": "The JOIN in authenticate is right and cheap, and it closes the DELETE /me path too, since auth runs before routing. Return 401, not 403: friends.rs:430 and links.rs:248 only sign out on 401. With a 403 the app would retry the WebSocket every 60 s forever (friends.rs:382-409), and links.rs:259 would show 'This link was made with another Discord account'. A 401 makes the app sign out, and the next login then shows the existing 'Account suspended' page. Open hibernated WebSockets keep presence and relays going no matter what authenticate does, so the hourly cron step is still needed: delete the sessions, tombstone and R2-delete the shares, then call HUB.getByName(id).closeAll('suspended'), whose close code 4001 already signs the client out at friends.rs:466. With that in place the live() JOIN and the putPoster check are optional extras. Keep the ban in a banned_discord_ids table checked in authCallback rather than refusing DELETE /me, so a suspended user can still erase their data and a ban outlives account deletion. Severity is medium rather than high: this is a bypass of manual moderation with no compromise of other users, the operator can work around it by also running `DELETE FROM sessions WHERE user_id=?` and tombstoning the shares, and a ban keyed on a Discord ID can be dodged with a second Discord account anyway."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "server/src/db.ts:135-138 `SELECT user_id, last_used FROM sessions WHERE token_hash = ?` with only an idle check at :140-142; no users/banned_at lookup. index.ts:71 `const me = await authenticate(request, env.DB);` gates every signed-in route (/ws :82-86, /me DELETE :100, /friends/request :102-105, /shares/:id/poster :78). Repo-wide grep for banned finds only index.ts:198 (authCallback, after upsertDiscordUser) and links.ts:81-85/182 (standingOf, used for refusal only in createShare). links.ts:139-143 live(): `SELECT * FROM shares WHERE id = ?` + pending/deleted/expiry checks, no owner join; sharePage :344, shareFile :380, reportShare :330 all go through it. links.ts:273-288 putPoster: owned() + size/JPEG checks, no standingOf. hub.ts:241-263 relayFrom checks only areFriends; publish :219-237 uses friendIds only. index.ts:383-391 deleteAccount: `DELETE FROM users WHERE id = ?` (row with banned_at gone; shares/sessions/friendships cascade per 0001_init.sql/0002_shares.sql `ON DELETE CASCADE`). db.ts upsertDiscordUser: `SELECT id FROM users WHERE discord_id = ?` -> none -> INSERT new row with no banned_at, so index.ts:198 passes on next login; new UUID means recentOf() counts no prior shares (fresh weekly quota). closeAll is called only at index.ts:389; hub.ts:177 comment says 'gone or suspended' but no suspension caller exists; scheduled() at index.ts:44-46 runs only sweep/sweepUsage; route() has no admin endpoints. The UI exposes deletion: src/routes/settings/Friends.tsx:150 -> src-tauri/src/friends.rs:277-278 DELETE /me.",
+    "corrected_claim": "",
+    "reachable_by": "A suspended user who still holds an unexpired session token (180-day idle window, nothing revokes it on suspension), using the stock app: staying signed in, presence/relays over /ws, friend requests, PUT poster on their own live shares, and Settings > Friends > Delete account followed by a fresh Discord sign-in. Viewers of their existing share links keep getting the media until expiry (max 5 days, shares.ts:19) unless the operator takes them down by hand.",
+    "fix_assessment": "Joining users in authenticate() and refusing banned accounts closes every route at once, including DELETE /me, which keeps the ban from being erased. But a 403 will not sign the app out, because friends.rs:768 only does that on 401, so either return 401 or teach the client about 403. Open WebSockets are only authenticated at upgrade time, so the cron step that deletes sessions and calls Hub.closeAll('suspended') is still needed. Keying bans by discord_id outside the users row and adding an owner-not-banned join in live() are sound. Severity is moderated because Discord accounts are free, so ban evasion is already cheap, and links expire within 5 days."
+   }
+  ]
+ },
+ {
+  "id": "SV-12",
+  "title": "A 60-second Hub alarm per online user burns the Free-plan Durable Object request quota",
+  "severity": "medium",
+  "category": "perf",
+  "locations": [
+   "hub.ts:33,76,135"
+  ],
+  "claim": "The Hub arms a 60-second alarm per online user (hub.ts:33,76,135). Alarm invocations count as Durable Object requests: 1,440 per day for each always-online user.",
+  "scenario": "Against the Free-plan 100k Durable Object requests per day, that caps the service at roughly 70 always-online users, before counting presence RPCs. Severity: Medium on Free plan.",
+  "fix": "Sweep every 5 minutes, or skip re-arming when every socket was auto-pinged recently.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "server/src/hub.ts:33 `const SWEEP_MS = 60_000;`. hub.ts:75-77 arms it on connect when no alarm is set: `if ((await this.ctx.storage.getAlarm()) === null) { await this.ctx.storage.setAlarm(Date.now() + SWEEP_MS); }`. hub.ts:135 re-arms it on every run while any socket is open: `if (this.open().length > 0) await this.ctx.storage.setAlarm(now + SWEEP_MS);`. Nothing skips re-arming when every socket pinged recently. hub.ts:126 only closes sockets idle for over STALE_MS (100 s). One Hub per user (index.ts:85 `env.HUB.getByName(me)`), so it is one alarm per online user, not per socket. The app holds the socket for the whole session and pings every 30 s (src-tauri/src/friends.rs:31-33, 452-488), so a user is 'online' whenever ClippiBoy runs. 86,400/60 = 1,440 alarm runs per day per always-online user, and 100,000/1,440 ≈ 69. The project targets free tiers elsewhere (shares.ts:4 'Everything lives in R2's free tier', shares.ts:13-14 'the free plan').",
+    "corrected_claim": "",
+    "reachable_by": "Ordinary use. Every signed-in app that stays connected keeps its user's Hub waking once a minute. The quota impact assumes the account is on the Workers Free plan.",
+    "fix_assessment": "A longer sweep interval (for example 5 minutes, and STALE_MS still decides what is stale) cuts alarm requests about 5x for a slower cleanup of half-open sockets. The fix is sound. Skipping the re-arm altogether would leave half-open sockets showing as online forever, so keep at least a slow sweep."
+   }
+  ]
+ },
+ {
+  "id": "SV-2",
+  "title": "POST /t/ping is unauthenticated and unthrottled; each fresh-UUID ping writes ~6 D1 rows kept 400 days, exhausting the shared daily write quota",
+  "severity": "high",
+  "category": "security",
+  "locations": [
+   "telemetry.ts:83-111"
+  ],
+  "claim": "`POST /t/ping` (telemetry.ts:83-111) has no rate limit; the only check is the body shape. Each ping with a fresh random UUIDv4 inserts into `installs` and `install_days`; counting their PK and secondary indexes, that is roughly 6 D1 'rows written' per request, and the rows are kept 400 days. The D1 database and its Free-plan daily limits (about 100k rows written, 5M rows read) are shared by the whole app.",
+  "scenario": "A script sends ~20k pings per day (about one every 4 s) and exhausts the free D1 write allowance. After that every D1 write fails until 00:00 UTC: sign-in, `sessions.last_used` touches, uploads and friend actions. On a paid plan, unbounded growth and billing take the place of the outage. No capability is needed. Confirmed in code; the platform limits (Free plan inferred from code comments) are a 'likely' assumption. Severity: High on Free plan, Medium on paid.",
+  "fix": "Add a rate-limit binding `PING_LIMIT` keyed by `CF-Connecting-IP` (for example 5/60 s), as `REPORT_LIMIT` already does without storing the address. Turn off `workers_dev`, or WAF rules can be bypassed through it. Optionally drop pings whose `version` is not a known release.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "impact",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "server/src/index.ts:68-69 `// Anonymous on purpose ... if (path === \"/t/ping\" && method === \"POST\") return handlePing(request, env);` is routed before `authenticate` (index.ts:71). telemetry.ts:83-111 handlePing checks only size/shape (cleanPing) and then always runs `env.DB.batch([INSERT INTO installs ... ON CONFLICT(id) DO UPDATE ..., INSERT INTO install_days ... ON CONFLICT(id, day) DO UPDATE ...])`, with no limiter. The only rate limit in the Worker is REPORT_LIMIT (wrangler.jsonc ratelimits; links.ts:319, used only by reportShare). migrations/0006_usage.sql:14-34: `installs(id TEXT PRIMARY KEY ...)` + `CREATE INDEX installs_source`, `install_days(... PRIMARY KEY (id, day))` + `CREATE INDEX install_days_day`, so a fresh id writes about 3+3 table/index rows. Rows are swept only after 400 days (telemetry.ts:18, 114-120). Plan context: shares.ts:4 and :14 ('R2's free tier', 'the 100 MB a Worker request on the free plan may carry') point to the Free plan. But ping is not the only open write path. index.ts:136-143 authStart, also unauthenticated and unthrottled, runs `DELETE FROM logins WHERE created_at < ?` and then `INSERT INTO logins ...` on every GET /auth/start that has any 43-char challenge. Upserts with a repeated id also count as writes, so fresh UUIDs matter for storage growth and stats pollution, not for using up the quota. git history: a9013a6 (move to api.clippiboy.com) is an ancestor of e30de21 (pings added), so every build that pings uses api.clippiboy.com (friends.rs:31).",
+    "corrected_claim": "The code claim holds. POST /t/ping is unauthenticated and has no rate limit. Each accepted ping writes D1 rows: about 6 with indexes for a new id, fewer for a repeated id. A new id's rows stay up to 400 days. On the Free D1 plan, roughly 17k scripted pings a day could use up the daily write allowance. The online features (sign-in, share links, friends) would then fail until 00:00 UTC, and the analytics tables can be filled with fake installs. Severity is overstated, though. Local recording, the core product, is not affected. The outage resets every day and loses no data. Ping is also not the only open write path: GET /auth/start (index.ts:136-143) writes to `logins` on every call with no throttle. And on the Workers Free plan, 100k requests a day to any endpoint already take the API down, so ping only makes a DoS that is already cheap about 6x cheaper. That makes this Medium (a DoS of secondary online features plus statistics pollution), not High.",
+    "reachable_by": "Any unauthenticated internet client that can POST JSON to api.clippiboy.com/t/ping or the workers.dev host. No account, token or capability is needed, and fresh UUIDv4s are trivial to generate. The same open write path exists through GET /auth/start.",
+    "fix_assessment": "A per-IP `PING_LIMIT` rate-limit binding is correct and cheap, and it caps D1 writes from one address. On its own it is not enough. Blocked requests still count toward the Workers Free daily request quota, distributed sources get around a per-IP key, and /auth/start stays an open write path, so it needs the same limiter (or a shared `ANON_WRITE_LIMIT`). Turning off workers_dev would break the friends feature for old builds that still use the workers.dev host (wrangler comment). A smaller fix: in the Worker, refuse /t/ping unless the host is api.clippiboy.com, which is safe because every pinging build uses that domain. Then add a zone WAF rate-limit rule on api.clippiboy.com for /t/ping and /auth/start, which stops requests before the Worker runs. Optionally accept only known `version` strings and cap new installs rows per day."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "server/src/index.ts:68-71 routes the ping before any auth: `// Anonymous on purpose ...` / `if (path === \"/t/ping\" && method === \"POST\") return handlePing(request, env);` / `const me = await authenticate(...)`. server/src/telemetry.ts:83-109: the only checks are body size (MAX_BODY 1024) and cleanPing's shape check (UUID_V4 at :14/:41); then `env.DB.batch([INSERT INTO installs ... ON CONFLICT(id) DO UPDATE ..., INSERT INTO install_days ... ON CONFLICT(id, day) DO UPDATE ...])`. There is no limiter: grep shows the only rate-limit binding is REPORT_LIMIT (wrangler.jsonc `\"ratelimits\": [{ \"name\": \"REPORT_LIMIT\", ... }]`, used only at links.ts:319). migrations/0006_usage.sql:14-34: `installs (id TEXT PRIMARY KEY ...)` + `CREATE INDEX installs_source`; `install_days (... PRIMARY KEY (id, day))` + `CREATE INDEX install_days_day`. So a fresh-UUID ping writes the table row, PK autoindex and secondary index for each table, about 6 D1 rows written. telemetry.ts:18 KEEP_DAYS = 400; sweepUsage at :114-120 deletes only rows older than that. The database is shared: wrangler.jsonc d1 database_id 67470f4b... is the same one site-proxy/wrangler.jsonc binds. Write failure hits every authenticated route: db.ts:143-144 `if (now - session.last_used > TOUCH_EVERY_MS) await db.prepare(\"UPDATE sessions SET last_used ...\").run();`, so a rejected write throws and index.ts:41 answers 500. Free-plan inference: shares.ts:4 and :13-14 (\"R2's free tier\", \"the 100 MB a Worker request on the free plan may carry\"). The route is live on api.clippiboy.com and on workers.dev (`workers_dev: true`).",
+    "corrected_claim": "",
+    "reachable_by": "Any internet user. A curl loop with random UUIDv4 bodies to https://api.clippiboy.com/t/ping (or the workers.dev host) is enough: no account, no token, one IP. Even a repeated UUID costs at least about 2 rows per request through the DO UPDATE branch. About 17k requests a day (roughly 1 every 5 s) passes D1 Free's 100k rows written per day. That is far below anything Cloudflare's DDoS layer would flag. In practice this happens only if someone deliberately targets the service; ordinary clients send one ping a day (src-tauri/src/telemetry.rs).",
+    "fix_assessment": "A REPORT_LIMIT-style binding (PING_LIMIT keyed on CF-Connecting-IP) stops cheap single-IP abuse. It is per-colo and bypassable by a distributed sender, but that raises the bar enough. It does not close the class: /auth/start (index.ts:134-143) also INSERTs an unthrottled row into logins (PK and UNIQUE(code) autoindexes, about 3 rows, plus the delete later), so it needs the same limiter. On Workers Free the 100k requests per day cap is also exhaustible through any route, so the ping is an amplifier (about 6x) on an outage that already exists, not the only path. That, plus the low paid-plan cost (about $6 per million pings), is why Medium fits better than High."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "high",
+    "evidence": "server/src/index.ts:68-69 routes `/t/ping` POST straight to handlePing, before `authenticate` (line 71), with no limiter: `if (path === \"/t/ping\" && method === \"POST\") return handlePing(request, env);`. server/src/telemetry.ts:83-109 checks only size (MAX_BODY=1024) and shape (cleanPing: UUID_V4 regex, version 1-32 chars, counts in range), then always runs `env.DB.batch([INSERT INTO installs ... ON CONFLICT(id) DO UPDATE ..., INSERT INTO install_days ... ON CONFLICT(id, day) DO UPDATE ...])`. The only rate limit in server/wrangler.jsonc is `REPORT_LIMIT` (used for share reports); no binding covers pings. migrations/0006_usage.sql: installs has `id TEXT PRIMARY KEY` (implicit autoindex) plus `CREATE INDEX installs_source`, and install_days has `PRIMARY KEY (id, day)` plus `CREATE INDEX install_days_day`, so a fresh id writes 2 table rows and 4 index entries, about 6. Retention: telemetry.ts:18 `KEEP_DAYS = 400`, and sweepUsage deletes only rows older than that. Shared impact: db.ts:143-144 `authenticate` runs `UPDATE sessions SET last_used` once a day per session, and that write throws when D1 is out of quota. authStart (index.ts) DELETEs and INSERTs into `logins`, and createShare and friend actions also write to the same `DB` binding. The site-proxy writes to the same DB too (site-proxy/index.ts:69-70). Hints that this is the Free plan: shares.ts:4 and shares.ts:13-14 ('R2's free tier', 'Worker request on the free plan').",
+    "corrected_claim": "",
+    "reachable_by": "Any anonymous internet client that can POST JSON to api.clippiboy.com/t/ping or to the workers.dev hostname. It needs no token, and random UUIDv4s pass validation. The same UUID also works, because the ON CONFLICT updates still count as written rows, so fresh ids only add storage growth.",
+    "fix_assessment": "A rate-limit binding inside the Worker keyed by CF-Connecting-IP is the right first step. It applies on both hostnames, unlike WAF rules. Its limit can be far below 5/60s, since a real install pings once a day. It is per-location and per-IP, so a distributed sender still gets past it. To protect auth, telemetry writes also need a global daily cap (e.g. a counter in a DO) or a move to Analytics Engine: the D1 Free-plan limits are per account, so a separate D1 database alone would not isolate them."
+   }
+  ]
+ },
+ {
+  "id": "SV-3",
+  "title": "GET /auth/start is unthrottled and runs a full-table DELETE on logins (no created_at index), so D1 reads grow quadratically",
+  "severity": "high",
+  "category": "security",
+  "locations": [
+   "index.ts:139-143"
+  ],
+  "claim": "Each unauthenticated `GET /auth/start` (index.ts:139-143) runs `DELETE FROM logins WHERE created_at < ?`, and `logins` has no index on `created_at`, so every request scans the whole table. It then runs an INSERT that touches the table plus 2 unique indexes. There is no rate limit. R requests inside 10 minutes cost about R^2/2 rows read.",
+  "scenario": "3,000 requests inside 10 minutes cost about 4.5M rows read, which is close to the whole Free-plan daily D1 read allowance (5M) shared by the entire app. No capability is needed. Severity: High on Free plan, Medium on paid.",
+  "fix": "Add an `AUTH_LIMIT` rate-limit binding keyed by `CF-Connecting-IP`. `CREATE INDEX logins_created ON logins(created_at)`, and move the logins cleanup into the cron. Turn off `workers_dev` so WAF rules cannot be bypassed.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "impact",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "server/src/index.ts:58 `if (path === \"/auth/start\" && method === \"GET\") return authStart(url, env);` is routed before `authenticate` (index.ts:72). index.ts:134-143: the only gate is `/^[A-Za-z0-9_-]{43}$/.test(challenge)` (any string works), then `DELETE FROM logins WHERE created_at < ?` and `INSERT INTO logins (state, challenge, created_at)`. migrations/0001_init.sql:28-34: `CREATE TABLE logins (state TEXT PRIMARY KEY, challenge TEXT NOT NULL, code TEXT UNIQUE, user_id TEXT, created_at INTEGER NOT NULL);`. No migration adds an index on created_at (grep for `logins` in migrations/ matches only 0001). wrangler.jsonc:32 has only `REPORT_LIMIT`, which is used only in links.ts:319 (reportShare). The hourly cron (index.ts:46) runs sweep/sweepUsage, and neither touches logins. So each request scans every row created in the last 10 minutes, giving R^2/2 rows read for R requests (3,000 requests is about 4.5M). A sustained rate r per second keeps 600r rows, so reads grow as 600r^2 per second. wrangler.jsonc:12 `\"workers_dev\": true` leaves a second hostname that zone WAF rules do not cover.",
+    "corrected_claim": "The code claim and the arithmetic are right. The severity framing overstates the impact. In normal use the table holds a handful of rows, so this matters only under deliberate abuse, and abuse only takes down the online features: sign-in, friends/presence and share links. Local recording is untouched. On the Workers Free plan the same outage class can already be reached without this bug: 100k requests/day is the Worker request cap, and every authenticated route also reads D1. This bug makes the attack about 30x cheaper (around 3k requests instead of around 100k), but it does not open a new capability. On a paid plan it is a cost and overload amplifier: at about 100 requests/s the table holds about 60k rows, and the full scans overload the single D1 database or bill heavily for rows read. Medium, not high.",
+    "reachable_by": "Any unauthenticated internet client that loops GET https://api.clippiboy.com/auth/start?challenge=<any 43 base64url chars>, or the same path on the workers.dev hostname. No account, cookie or Discord interaction is needed.",
+    "fix_assessment": "Adding an index on logins(created_at) in a new migration, or moving the DELETE to the hourly cron, removes the quadratic term on its own; either one is the minimal sufficient fix. authCallback (index.ts:173) and authExchange (index.ts:219) already re-check LOGIN_TTL_MS, so rows that expire but linger until the cron are harmless. A per-IP AUTH_LIMIT binding is useful defence in depth against linear flooding, but it is not sufficient alone, because attackers can rotate IPs and the binding is counted per location. Turning off workers_dev would break pre-domain builds that README.md:7 says still use it, so it should wait until those builds are retired, or the workers.dev route should get its own limit instead."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "server/src/index.ts:54 `if (path === \"/auth/start\" && method === \"GET\") return authStart(url, env);` is routed before `authenticate` (line 70). authStart (index.ts:135-145): the only gates are `/^[A-Za-z0-9_-]{43}$/.test(challenge)` (any 43 base64url chars pass) and `env.DISCORD_CLIENT_ID`, which is set in wrangler.jsonc vars. After that it runs `DELETE FROM logins WHERE created_at < ?` (line 139), then `INSERT INTO logins (state, challenge, created_at) ...` (141-143). migrations/0001_init.sql:28-34 `CREATE TABLE logins (state TEXT PRIMARY KEY, challenge TEXT NOT NULL, code TEXT UNIQUE, user_id TEXT, created_at INTEGER NOT NULL);`. No migration creates an index on logins (grep of migrations/*.sql: only users, sessions, friendships, blocks, shares, reports, installs, install_days indexes). So the DELETE is a full-table scan, and the table keeps every row from the last 10 minutes (LOGIN_TTL_MS = 10*60*1000, line 31). The k-th request scans k-1 rows, so R requests scan about R(R-1)/2 rows (3,000 requests is about 4.5M). wrangler.jsonc has only `REPORT_LIMIT` in `ratelimits`, used only in links.ts:319 for reports. `workers_dev: true` is on. The cron (`sweep`, `sweepUsage`) never touches logins, so authStart is the only cleanup.",
+    "corrected_claim": "The code facts are exactly as stated. Some context belongs with the severity. (1) The D1 counting rules (a full scan bills every scanned row) and the Free-plan quotas (5M rows read and 100k rows written per day, with queries failing until 00:00 UTC once a quota runs out) are documented Cloudflare platform behaviour and cannot be checked from source. Which plan the account is on also cannot be checked. (2) Writes grow linearly as well: each request writes about 3 rows (the row plus the state and code autoindex entries), and the later delete writes about 3 more. That is an outage path of its own on the Free plan, at roughly 16k-33k requests. (3) On the Workers Free plan, flooding any endpoint with about 100k requests per day already takes the service down. The quadratic D1 read cost cuts that to about 3k requests, which makes the attack about 30 times cheaper but does not create a new class of attack. On a paid plan the cost becomes significant only under a sustained high rate (for example ~100 req/s keeps ~60k rows and reads ~6M rows/s).",
+    "reachable_by": "Any unauthenticated internet client that sends GET /auth/start?challenge=<any 43 base64url chars>, at api.clippiboy.com or the workers.dev host. It needs no cookie, does not have to follow the redirect, and needs no Discord account.",
+    "fix_assessment": "Rate-limiting /auth/start per CF-Connecting-IP is the fix that matters, because it also caps the linear write cost. Moving the logins cleanup into the hourly cron makes reads per request O(1) even without an index; callback and exchange already enforce the TTL themselves (index.ts:173, 219). With that move a created_at index is optional, and it would add one index write per insert and delete."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "server/src/index.ts:55 `if (path === \"/auth/start\" && method === \"GET\") return authStart(url, env);` is routed before `authenticate` (index.ts:71). The only guards are index.ts:136 `if (!/^[A-Za-z0-9_-]{43}$/.test(challenge))`, which any 43-character string passes (e2e.mjs:151 uses \"a\".repeat(43)), and index.ts:137, the DISCORD_CLIENT_ID check, which passes because the ID is set in wrangler.jsonc vars. Then index.ts:139 `DELETE FROM logins WHERE created_at < ?` and index.ts:141 `INSERT INTO logins (state, challenge, created_at)`. migrations/0001_init.sql defines `logins(state TEXT PRIMARY KEY, challenge, code TEXT UNIQUE, user_id, created_at INTEGER NOT NULL)` with no index on created_at, so the DELETE scans the whole table. Rows younger than 10 minutes (LOGIN_TTL_MS, index.ts:31) survive. Nothing else cleans them: the cron runs only sweep/sweepUsage (index.ts:46), and neither touches logins. The project's only rate limit is REPORT_LIMIT, used once at links.ts:319. wrangler.jsonc has `\"workers_dev\": true`. Comments in shares.ts:4 and :14 show the app is sized for the Free plan.",
+    "corrected_claim": "",
+    "reachable_by": "Any internet user, with no account and no Discord login. A plain loop of GET https://api.clippiboy.com/auth/start?challenge=<43 base64url chars> (or the workers.dev host) is enough, sent with redirect following off. Each request does its D1 work before the 302. Ordinary use never triggers it, because the logins table stays tiny. It takes deliberate abuse, but the cost is trivial: about 3,000 requests, roughly one minute at 50 rps. Each request reads about 600*r rows, so sustaining r requests/s for a day costs about 51.8M*r^2 rows. On the Free plan's 5M rows-read/day, D1 then fails for the rest of the UTC day. That breaks sign-in, `authenticate` for every authenticated route including /ws presence, shares and telemetry. Context: the Free plan's 100k Worker requests/day can already be exhausted by flooding any route, so this cuts the cost of a whole-app outage by roughly 30x rather than adding a new kind of attack. Inserts also write about 3 rows each (table row plus the state and code autoindexes), so about 33k requests would also use up the 100k rows-written/day limit.",
+    "fix_assessment": "`CREATE INDEX logins_created ON logins(created_at)` alone removes the quadratic term, because the DELETE then reads only expired rows. Moving the cleanup into the hourly cron is also fine. Each insert still costs linear writes, so a CF-Connecting-IP rate-limit binding on /auth/start is still worthwhile, though many IPs can get around it. Turning off workers_dev would break the old builds that README.md says still use the workers.dev host, so that part needs a migration plan; it is not just a config flip."
+   }
+  ]
+ },
+ {
+  "id": "SV-38",
+  "title": "Privacy page: suspension promise ('signed out ... links are taken down') is not implemented",
+  "severity": "high",
+  "category": "privacy",
+  "locations": [],
+  "claim": "The privacy page says: \"A suspended account is signed out, cannot sign in or share links, and its links are taken down.\" Only 'cannot sign in again' and 'cannot create links' are implemented. Existing sessions, sockets, relays, live links and poster swaps keep working, and the ban disappears on `DELETE /me` (same root cause as SV-1).",
+  "scenario": "Repro: a banned user's session, presence, relays, live links and poster PUT all kept working, and `DELETE /me` removed the ban.",
+  "fix": "Implement the promise (see SV-1 fix) or change the wording.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "site/privacy.html:101 \"A suspended account is signed out, cannot sign in or share links, and its links are taken down.\" (added in 6b3fc2d together with the ban code). The only checks of banned_at are server/src/index.ts:198-199 (authCallback, new sign-ins) and server/src/links.ts:182 `if (standing.banned) throw new HttpError(403, ...)` (createShare). Signed out: no. db.ts:134-136 authenticate runs `SELECT user_id, last_used FROM sessions WHERE token_hash = ?` with no users join, and index.ts:71 sends every authenticated route through it, including /ws (index.ts:81-85 -> Hub), /friends/request, PUT /shares/:id/poster and DELETE /me. Hub.closeAll (hub.ts:177-178, whose doc comment says \"gone or suspended\") is called only from deleteAccount (index.ts:389). Links taken down: no. links.ts:139-143 live() checks only pending/deleted_at/expires_at, never the owner's ban, so sharePage (342-344) and shareFile (378-380) keep serving. putPoster (273-289) checks only ownership and deleted_at. The hourly scheduled() (index.ts:44-45) runs sweep/sweepUsage, which handle only expiry. Ban erased: deleteAccount does `DELETE FROM users WHERE id = ?` (index.ts:386), and upsertDiscordUser (db.ts:93-107) then finds no row for that discord_id and creates a new one with banned_at NULL. Across the repo (outside node_modules), banned_at/suspend shows up only in hub.ts, index.ts, links.ts, migration 0005 and privacy.html. There is no admin route, script or runbook.",
+    "corrected_claim": "",
+    "reachable_by": "Every suspension. The operator sets users.banned_at by hand (wrangler d1 execute), and from then on the suspended user just keeps using the app. Their existing 180-day token keeps /ws presence and relays, friend requests and poster PUTs working, their live /c/<id> pages and media stay up for any internet viewer until they expire (up to 5 days), and they can call DELETE /me and then sign in fresh. The operator could partly keep the promise with hand-written SQL: delete the user's sessions, which ends HTTP access and blocks DELETE /me, and tombstone their shares, which makes live() return null. That procedure is not documented anywhere, it leaves the R2 objects orphaned, and nothing short of code can close the hibernated Hub WebSockets that are already open. Out of the box, the published statement is false for every suspended account.",
+    "fix_assessment": "Either fix works. Implement the promise as in SV-1: join users in authenticate, check the owner's ban in live() and putPoster, add a cron or one-shot step that deletes the user's sessions, tombstones and deletes their R2 shares and calls HUB.getByName(id).closeAll(\"suspended\"), and keep the ban outside the users row so DELETE /me cannot clear it. Or reword privacy.html:101 to say only what is enforced. Implementing it is better, since the page promises third parties that abusive links come down."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "site/privacy.html:101 promises: \"A suspended account is signed out, cannot sign in or share links, and its links are taken down.\" The code checks banned_at in two places only: index.ts:198-199 in authCallback (`SELECT 1 FROM users WHERE id = ? AND banned_at IS NOT NULL` -> page(\"Account suspended\")) and links.ts:182 in createShare (`if (standing.banned) throw new HttpError(403, ...)`). The migration's own comment, migrations/0005_moderation.sql:1, promises only that much: \"A suspended account can neither sign in nor share\". Nothing signs the account out: db.ts:135-137 authenticate runs `SELECT user_id, last_used FROM sessions WHERE token_hash = ?` with no join to users and no banned_at check, so every authenticated route at index.ts:71 onward (/ws, relays, /friends/request, PUT /shares/:id/poster, DELETE /me) keeps working for 180 idle days (db.ts:125). Hub.closeAll (hub.ts:178) has a single caller, deleteAccount (index.ts:389), and hub.ts makes no DB queries, so it never checks a ban. Nothing takes the links down: links.ts:139-143 live() checks only pending/deleted_at/expires_at, never the owner's ban, and sharePage/shareFile (links.ts:342, 378) serve through it. putPoster (links.ts:273-289) checks only owned() and deleted_at. The hourly sweep (links.ts:419+) and scheduled() (index.ts:44-45) never look at banned_at. The ban can be erased: deleteAccount runs `DELETE FROM users WHERE id = ?` (index.ts:387), which drops banned_at along with the row, and on the next sign-in upsertDiscordUser (db.ts:~94-117) finds no row for that discord_id and inserts a fresh one, so the check at index.ts:198 passes. No admin endpoint, script or README step does the promised sign-out or takedown. server/scripts holds only e2e.mjs.",
+    "corrected_claim": "",
+    "reachable_by": "Any suspended user who still holds a session token (nothing revokes tokens on suspension), and anyone who opens that user's share links (they stay live). Self-unbanning needs only the user's own token and DELETE /me.",
+    "fix_assessment": "Either fix works. Enforcing the promise (ban check in authenticate and live(), and a cron step that deletes the user's sessions, tombstones their shares in R2 and D1, and calls Hub.closeAll(\"suspended\"), with the ban kept outside the users row) fixes SV-1 as well. If the fix is deferred, the page wording should shrink to what the code does. An operator running SQL by hand could delete sessions and tombstone shares, but that cannot close open WebSockets in the Hub DO or remove the R2 objects, so a code change is still needed for 'signed out'. This is the same root cause as SV-1; grade the enforcement gap there and treat this as the policy-text mismatch."
+   },
+   {
+    "lens": "impact",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "site/privacy.html:101: \"A suspended account is signed out, cannot sign in or share links, and its links are taken down.\" Only two checks exist: server/src/index.ts:198-199 (authCallback: `SELECT 1 FROM users WHERE id = ? AND banned_at IS NOT NULL` -> 'Account suspended' page) and server/src/links.ts:182 (createShare: `if (standing.banned) throw new HttpError(403, ...)`). server/src/db.ts:134-136 authenticate selects only `user_id, last_used FROM sessions` and never reads banned_at, so existing tokens keep working (180-day idle window, db.ts:125). links.ts:139-142 live() checks only pending/deleted_at/expires_at, not the owner's ban; putPoster (links.ts:273-289) has no ban check. The /ws upgrade is authenticated once (index.ts:71,82), so open sockets keep presence and relays. The only closeAll caller is deleteAccount (index.ts:389); the scheduled handler (index.ts:44-45) runs only sweep/sweepUsage, and sweep (links.ts:419-448) takes down only expired or stale-pending shares. No admin endpoint, cron step or runbook (server/README.md has none) deletes a banned user's sessions or shares. deleteAccount (index.ts:383-391) runs `DELETE FROM users WHERE id = ?`, which erases banned_at, so a later Discord sign-in creates a clean account. Migration 0005_moderation.sql:1 itself promises less: 'A suspended account can neither sign in nor share'.",
+    "corrected_claim": "",
+    "reachable_by": "Any user the operator suspends by setting users.banned_at by hand (wrangler d1 execute). They keep a working session, WebSocket presence, relays and poster swaps, and their live links stay up until they expire (at most 5 days) unless the operator also runs SQL and R2 deletes by hand. The suspended user can then erase the ban with DELETE /me. The mismatch is visible to anyone who reads the privacy page.",
+    "fix_assessment": "Either fix works. This is the same root cause as SV-1 and should be merged with it, so the code fix lands once: check banned_at in authenticate, filter live() by owner ban, check the ban in putPoster, add an hourly cron step that, for newly banned users, deletes their sessions, takes their shares down (R2 delete plus TOMBSTONE) and calls HUB.getByName(id).closeAll('suspended'), and keep bans outside the deletable users row (or refuse DELETE /me while banned). If the code fix is not ready, a minimal stopgap is to reword privacy.html:101 to match what is enforced ('cannot sign in again or create new links; its links may be removed') and to document the manual SQL/R2 takedown steps for the operator."
+   }
+  ]
+ },
+ {
+  "id": "SV-10",
+  "title": "Share pages reveal the uploader's Discord user ID via the avatar URL",
+  "severity": "medium",
+  "category": "privacy",
+  "locations": [
+   "db.ts:88",
+   "page.ts:116"
+  ],
+  "claim": "db.ts:88 builds the avatar URL as `https://cdn.discordapp.com/avatars/${user.id}/${hash}.png`, and page.ts:116 puts it into the public share page whenever `show_name` is set (the default, which users opt out of), exposing the Discord snowflake user ID. The privacy page only says 'display name and avatar'. Also, `show_name` is frozen at upload time, so turning the setting off later does not hide the name on links that are already live.",
+  "scenario": "Anyone who has the link can read the snowflake ID from the HTML and look up the exact Discord account.",
+  "fix": "Proxy the avatar through a route such as `/c/:id/avatar`, or use the default avatar, or disclose it.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/src/db.ts:88 `if (user.avatar) return `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=128`;` vs db.ts:89 default avatar `https://cdn.discordapp.com/embed/avatars/${...% 6n}.png` (no ID). links.ts:207 `const showName = url.searchParams.get(\"name\") === \"1\" ? 1 : 0;` is stored per share at insert (links.ts:209-224). links.ts:346-349 `row.show_name ? SELECT display_name, avatar FROM users ...` then page.ts:116 `<img src=\"${escapeHtml(d.uploader.avatar)}\" ...>`. Public route index.ts:60-63 `/c/<id>` GET with no auth. Client default src-tauri/src/model.rs:357 `name_on_links: true`; links.rs:549-550 sends `name=1`. UI hint Friends.tsx:43 'Your Discord name and picture under clips you share as a link'; site/privacy.html:100 says the page shows 'your Discord display name and avatar', nothing about the Discord ID. No route updates show_name on an existing share (index.ts:75-80 has only PUT poster and DELETE).",
+    "corrected_claim": "The Discord snowflake is exposed only for uploaders who have a custom Discord avatar. A default avatar uses the embed/avatars/N.png URL, which contains no ID. For everyone else the claim holds: the default-on 'Show my name on share links' setting puts cdn.discordapp.com/avatars/<discord_id>/... into the public /c/<id> page HTML. The privacy page and the setting hint promise only name and picture. The 'frozen at upload' part is real but limited: show_name is stored per share, and no endpoint changes it later. Links live at most 5 days, though, and the user can delete one at any time. The name and avatar themselves are read live from users, so they do follow Discord renames.",
+    "reachable_by": "Any internet user who has, or is forwarded, a share link. No auth is needed: index.ts:60-63 serves /c/<id> publicly. This happens in ordinary use with default settings whenever the uploader has a custom Discord avatar, which most Discord users do. The link IDs themselves are random (10 chars of crypto randomness, shares.ts:82-91), so a viewer has to be given the link.",
+    "fix_assessment": "Proxying the avatar through the worker (e.g. /c/<id>/avatar fetched server-side) removes the ID from the HTML and also stops viewer IPs going to Discord. A cheaper fix is to disclose the ID in the privacy page and the setting hint. Discord IDs are semi-public by Discord's own design (visible through developer mode in any shared server), so this is a disclosure or proxy fix, not an urgent one."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/src/db.ts:88 `if (user.avatar) return `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=128`;` (stored in users.avatar on every login, db.ts:95-103). server/src/links.ts:346-349 `const uploader = row.show_name ? await env.DB.prepare(\"SELECT display_name, avatar FROM users WHERE id = ?\")...` -> page.ts:115-116 `<img src=\"${escapeHtml(d.uploader.avatar)}\" ...>` in the public HTML of clippiboy.com/c/<id>. Default on: src-tauri/src/model.rs:357 `name_on_links: true`; client sends `name=1` (src-tauri/src/links.rs:549-550). show_name is written only at INSERT (links.ts:207-224) and cleared only by TOMBSTONE on delete (links.ts:159); no route updates it (index.ts:73-79 has only POST /shares, PUT poster, DELETE). Disclosure: site/privacy.html:100 'the page also shows your Discord display name and avatar' and Friends.tsx:43 hint 'Your Discord name and picture' -- neither mentions the Discord ID.",
+    "corrected_claim": "Accurate, with one scope detail: the ID is exposed only for users with a custom Discord avatar. Without one, db.ts:89 uses `cdn.discordapp.com/embed/avatars/<(id>>22)%6>.png`, which does not carry the ID. The name and avatar themselves are read live from users at page render, so only the per-link show_name flag is frozen at upload; already-live links (max 5 days) keep showing the uploader after the setting is turned off, unless deleted.",
+    "reachable_by": "Anyone who opens or is sent a share link (public, no auth) for a clip uploaded by a user with a custom Discord avatar and the default 'Show my name on share links' setting.",
+    "fix_assessment": "Proxying the avatar through the Worker (e.g. /c/:id/avatar fetching the stored URL server-side) removes the snowflake from the HTML and also stops Discord seeing viewers' IPs; alternatively disclose the ID in the privacy page and setting hint. Optionally apply the current setting at render time or offer a server call to clear show_name on live links."
+   }
+  ]
+ },
+ {
+  "id": "SV-11",
+  "title": "The e2e script seeds known bearer tokens into the production database",
+  "severity": "medium",
+  "category": "security",
+  "locations": [
+   "scripts/e2e.mjs:11-21",
+   "server/scripts/e2e.mjs:4-6",
+   "server/scripts/e2e.mjs:16-21",
+   "server/scripts/e2e.mjs:11"
+  ],
+  "claim": "scripts/e2e.mjs:11-21 defaults `BASE` to the production workers.dev address and seeds fixed tokens `tok-a-test-only` / `tok-b-test-only` and friend codes `AAAAAAAA` / `BBBBBBBB`, all in a public repo. Cleanup relies on a comment ('Remove the accounts afterwards').",
+  "scenario": "If the seed is ever applied and not removed, anyone can act as those accounts, including uploading 3 public links per week each. Speculative as to the current state; check with `SELECT * FROM users WHERE discord_id LIKE 'test-%'`. Severity: Medium, if left seeded.",
+  "fix": "Generate random tokens at seed time and print them; default to a local `wrangler dev`; give the seeded rows a short `last_used` expiry or a cleanup cron.",
+  "reported_confidence": "speculative",
+  "slice": "08-server",
+  "severity_reported": "medium",
+  "also": [
+   {
+    "id": "SC-9",
+    "slice": "11-supply-chain",
+    "title": "server/scripts/e2e.mjs seeds production with accounts whose bearer tokens are public",
+    "claim": "server/scripts/e2e.mjs:4-6 documents `node scripts/e2e.mjs --seed | npx wrangler d1 execute clippiboy-friends --remote ...`; `:16-21` inserts sessions for `hash(\"tok-a-test-only\")` and `hash(\"tok-b-test-only\")`, tokens that are visible in the public repo; `:11` defaults to the production workers.dev URL. Confirmed by reading; unverified whether any such accounts exist right now.",
+    "locations": [
+     "server/scripts/e2e.mjs:4-6",
+     "server/scripts/e2e.mjs:16-21",
+     "server/scripts/e2e.mjs:11"
+    ],
+    "fix": "Run e2e against `wrangler dev --local` or a staging D1; or generate random tokens per run and expire them; and put the cleanup in a `finally` block."
+   }
+  ],
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/scripts/e2e.mjs:4 `node scripts/e2e.mjs --seed | npx wrangler d1 execute clippiboy-friends --remote --file /dev/stdin`; :6 cleanup is a manual `DELETE FROM users WHERE discord_id LIKE 'test-%'`; :8 'Remove the accounts afterwards'; :11 `const BASE = process.env.FRIENDS_SERVER ?? \"https://clippiboy-friends.fabian081964.workers.dev\";`; :16-21 inserts users with friend codes 'AAAAAAAA'/'BBBBBBBB' and sessions for `hash(\"tok-a-test-only\")`/`hash(\"tok-b-test-only\")`. The script has no finally/cleanup step. server/src/db.ts:139 `if (!session || now - session.last_used > SESSION_IDLE_MS)` with SESSION_IDLE_MS = 180 days (db.ts:125), and db.ts:143-144 refreshes last_used on use, so an attacker's use keeps the session alive indefinitely. Mitigations: server/README.md:44-51 documents a --local seed plus `wrangler dev` path. The test accounts get no special standing: standingOf links.ts:80-88 uses the default unlimited_links, and shares.ts:11 sets WEEKLY_LIMIT = 3. Moderation through banned_at (links.ts:85) applies to them like any account. There is no root-level scripts/e2e.mjs; the file is server/scripts/e2e.mjs.",
+    "corrected_claim": "The script really does document seeding the production D1 (--remote) with sessions whose bearer tokens are in the public repo, and it relies on a manual cleanup command. The README offers a local alternative, but the script header and the BASE default point at production. This is a hazard only after the server operator runs the seed against production and skips the cleanup. Nothing in the code path makes that happen on its own, and the current state of production cannot be checked from source. If the accounts were left in place, an attacker would gain only what anyone can get by signing in with a fresh Discord account: 3 links a week, friend requests by code or username, and relay only to accepted friends. The one extra is that the abuse is not tied to any Discord identity. The accounts also remain bannable. The location 'scripts/e2e.mjs' means server/scripts/e2e.mjs.",
+    "reachable_by": "Only the server operator can create the precondition, by running `--seed ... --remote` with Cloudflare credentials and not running the DELETE. After that, any internet user who reads the public repo can send `Authorization: Bearer tok-a-test-only` to api.clippiboy.com or the workers.dev host. In practice this is unlikely but plausible, since the documented workflow is production-first.",
+    "fix_assessment": "Generating random tokens per run (printed to stdout or held in memory) removes the public-credential problem completely. Defaulting BASE and the header instructions to the local wrangler dev path from the README, and deleting the rows in a finally block, closes the forgotten-cleanup window. Either change is cheap."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/scripts/e2e.mjs:4 `node scripts/e2e.mjs --seed | npx wrangler d1 execute clippiboy-friends --remote --file /dev/stdin`; :8 `Remove the accounts afterwards: their codes are easy to guess.`; :11 `const BASE = process.env.FRIENDS_SERVER ?? \"https://clippiboy-friends.fabian081964.workers.dev\";`; :17-18 friend codes 'AAAAAAAA'/'BBBBBBBB'; :19-21 sessions for `hash(\"tok-a-test-only\")`/`hash(\"tok-b-test-only\")` with last_used = now. db.ts:129-146 authenticate() accepts any token whose sha256 matches a sessions row and refreshes last_used daily, so use keeps them alive past the 180-day idle limit. No guard excludes discord_id 'test-%' accounts anywhere. Cleanup is a separate manual command (:6); it does work fully because sessions/friendships/blocks/shares all have `REFERENCES users(id) ON DELETE CASCADE` (migrations/0001_init.sql:20,38-39,49-50; 0002_shares.sql:5). server/README.md:43-51 documents a --local alternative but the script's own default and header comment target production.",
+    "corrected_claim": "The file is server/scripts/e2e.mjs (there is no scripts/e2e.mjs at the repo root). The code is as described; whether such rows currently exist in the production D1 cannot be verified from source. Impact if left seeded: two ordinary accounts with no special privileges (3 links/week each, friend requests, relay to accepted friends), i.e. little beyond what any Discord login gives, except that the abuse is unattributable and survives bans of real accounts. It is worse only if the operator also listed these ids in QUICK_LINKS_FOR or set unlimited_links.",
+    "reachable_by": "Anyone reading the public repository, but only while an operator has run the documented --remote seed and not yet run the cleanup command.",
+    "fix_assessment": "Sound: default FRIENDS_SERVER to a local wrangler dev, generate random tokens per seed and print them, and either delete the rows in the script's exit path or give the seeded sessions a short last_used so they lapse quickly."
+   }
+  ]
+ },
+ {
+  "id": "SV-16",
+  "title": "Two users sending each other friend requests at the same moment get a 500",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "index.ts:326-342"
+  ],
+  "claim": "In the friend-request handler (index.ts:326-342), both concurrent requests pass the `existing` check, and the second INSERT into `friendships` hits the (ordered pair) primary key, returning 500.",
+  "scenario": "A and B send each other friend requests simultaneously; one of them receives a 500 instead of the pair being accepted.",
+  "fix": "`INSERT ... ON CONFLICT(user_a, user_b) DO UPDATE SET status='accepted' WHERE requester <> excluded.requester`, then re-read the row.",
+  "reported_confidence": "likely",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/src/index.ts:326-328 `SELECT status, requester FROM friendships WHERE user_a = ? AND user_b = ?` -> null for both concurrent requests; :331 `if (existing)` skipped; :338-342 plain `INSERT INTO friendships (...) VALUES (?, ?, ?, 'pending', ?)` with no ON CONFLICT. Schema server/migrations/0001_init.sql: `PRIMARY KEY (user_a, user_b), CHECK (user_a < user_b)` and pair() orders ids, so A->B and B->A target the same key. The second INSERT throws a D1 UNIQUE constraint error, which is not an HttpError, so index.ts:40-41 returns 500. No transaction or retry wraps the SELECT/INSERT.",
+    "corrected_claim": "",
+    "reachable_by": "Two signed-in users who send each other a request within one D1 round-trip of each other. Two concurrent requests from the same user hit it too, but the UI's busy guard (src/routes/Friends.tsx:231) makes that unlikely. The window is small, so it is rare.",
+    "fix_assessment": "An upsert `ON CONFLICT(user_a, user_b) DO UPDATE SET status='accepted' WHERE status='pending' AND requester <> excluded.requester`, then re-reading the row to choose sent, accepted or 409, closes the race. Catching the constraint error and re-running the existing-row logic would also work."
+   }
+  ]
+ },
+ {
+  "id": "SV-17",
+  "title": "Presence can arrive at friends out of order",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "hub.ts:219-237"
+  ],
+  "claim": "`publish` at hub.ts:219-237 awaits D1 and RPCs, which opens the Durable Object's input gate, so two quick hello/presence messages can interleave. Friends may receive the older presence last and keep showing it.",
+  "scenario": "A user changes presence twice in quick succession; the two publishes interleave and friends end up displaying the stale first presence. Likely.",
+  "fix": "Add a sequence number or `at` to `friendPresence` and have receivers drop older ones; or serialize `publish` through a promise chain.",
+  "reported_confidence": "likely",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/src/hub.ts:219-237 publish(): `const next = this.current(exclude);` ... `await this.ctx.storage.put(PUBLISHED, next);` then `const friends = await friendIds(this.env.DB, user);` (D1, server/src/db.ts:61-69) and `await Promise.all(friends.map(id => this.env.HUB.getByName(id).friendPresence(user, next, lastSeen)...))`. Nothing serializes publish, and webSocketMessage (hub.ts:81-99) awaits it. A DO input gate only holds events during storage operations, so a second message can run during the D1/RPC awaits, compute its own `next` and race to send. A new stub is made per call (`getByName(id)`), so there is no per-stub ordering. The receiver (hub.ts:150-152) broadcasts as it arrives, and the client (src-tauri/src/friends.rs ServerMessage::Presence) does `view.presence.insert(id, presence.clone())` with no sequence or timestamp check.",
+    "corrected_claim": "The mechanism is right, but a stale result needs the second publish's D1 friendIds query or RPC to overtake the first one's, which is a timing race and not likely. The hello path cannot cause it: hello awaits sendSnapshot before publish, and current() re-reads the attachment, so a later presence message's publish wins and hello's publish then returns early on the equality check (hub.ts:222). Realistic triggers: a quick busy/invisible toggle (src/routes/Friends.tsx:186), a game change, or close-then-reconnect (offline vs online). The sender's stored PUBLISHED is always the newest, so the friend's next snapshot (reconnect or friendsChanged) corrects the stale view.",
+    "reachable_by": "Any signed-in user whose presence changes twice within a few tens of ms (toggle double-click, a game change landing alongside a config change, a socket close racing a reconnect). Whether the RPCs reorder depends on Cloudflare runtime timing.",
+    "fix_assessment": "Chaining publish calls through a per-object promise (`this.publishing = this.publishing.then(...)`) removes the interleaving at source. A monotonic sequence number or `at` in friendPresence, with receivers dropping older values, also works and survives cross-stub reordering."
+   }
+  ]
+ },
+ {
+  "id": "SV-19",
+  "title": "Media is publicly cacheable for up to an hour after deletion, and not marked noindex",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [
+   "links.ts:395"
+  ],
+  "claim": "links.ts:395 sends `public, max-age=min(left, 3600)` on media, so a deleted, moderated or account-deleted clip stays in browser and intermediary caches for up to an hour, although the page promises it is 'removed immediately'. Media responses have no `X-Robots-Tag: noindex`, and `api.clippiboy.com/robots.txt` returns 401.",
+  "scenario": "A user deletes a clip or their account; browsers and intermediary caches keep serving the media for up to an hour. Media can be indexed by search engines.",
+  "fix": "`private, max-age=300` or `no-cache` with an ETag, and `X-Robots-Tag: noindex` on media and on the gone page.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/src/links.ts:394-395 `const left = ...; headers.set(\"Cache-Control\", `public, max-age=${Math.min(left, 3600)}`);` on every media response. The X-* headers set at :386-393 include no X-Robots-Tag. Delete paths (links.ts:291-298 deleteShare, :301-306 deleteSharesOf) remove the R2 objects and tombstone the row, and links.ts:380-381 then returns 410, but a cached copy is never revalidated before max-age runs out. site/privacy.html:104 says share links are 'removed immediately' on account deletion. /robots.txt on api.clippiboy.com matches no public route in server/src/index.ts:54-69, so it reaches `authenticate` (db.ts:132 `throw new HttpError(401, \"Not signed in.\")`) and returns 401. The share page and the gone page already carry `<meta name=\"robots\" content=\"noindex\">` (server/src/page.ts:75, through head()).",
+    "corrected_claim": "",
+    "reachable_by": "Any viewer or shared proxy that has fetched the media before deletion keeps a copy for up to 1 h. Cloudflare's own edge does not cache this custom-domain Worker's responses without the Cache API, so 'intermediary' means third-party shared caches or unfurl proxies. Crawlers can reach media only through links posted elsewhere.",
+    "fix_assessment": "`private, max-age=300` or `no-cache` (the ETag is already set) shortens the window, and `X-Robots-Tag: noindex` on media plus a public robots.txt route deal with indexing. Adding noindex to the gone page is redundant, since it already has the meta tag."
+   }
+  ]
+ },
+ {
+  "id": "SV-23",
+  "title": "No 'sign out everywhere'",
+  "severity": "low",
+  "category": "security",
+  "locations": [],
+  "claim": "Session lifecycle gap: there is no way to revoke all of a user's sessions ('sign out everywhere'); only `POST /auth/logout` for the current session exists.",
+  "scenario": "A user whose token leaked or whose device was lost cannot revoke other sessions.",
+  "fix": "Add `DELETE /sessions`.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/src/index.ts:49-122 route(): the only session-revoking route is `/auth/logout`, at index.ts:87-90, which runs `DELETE FROM sessions WHERE token_hash = ?` for the caller's own token. No route lists or bulk-deletes a user's sessions (grep: the only other sessions statements are the INSERT at index.ts:227 and the SELECT/UPDATE in db.ts:135,144). The app has only friends_sign_out (friends.rs:215-220) and friends_delete_account.",
+    "corrected_claim": "Accurate. The only ways to revoke other sessions are DELETE /me, whose cascade drops all sessions (index.ts:383-387) but also destroys the account, friendships and links, and waiting out the 180-day idle expiry, which a token in active use never reaches.",
+    "reachable_by": "A user whose token leaked or whose signed-in device was lost or stolen.",
+    "fix_assessment": "Adding `DELETE /sessions` (all of the user's sessions, optionally keeping the current one) is right. It also has to close the hub sockets (closeAll, or per-session closing as in SV-24), otherwise already-open sockets from the revoked sessions keep working."
+   }
+  ]
+ },
+ {
+  "id": "SV-26",
+  "title": "sweep runs its cleanup steps in sequence, so one R2 error skips the rest including the 30-day report deletion",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "links.ts:419-448"
+  ],
+  "claim": "Within `sweep` (links.ts:419-448) the steps run in sequence without per-step error handling, so an R2 error skips the stale-upload cleanup, the tombstone purge, and the 30-day report deletion (a privacy-page promise).",
+  "scenario": "A transient R2 failure in the expiry step means stale pending uploads, tombstones and old reports are not purged that hour (or repeatedly, if the failure persists).",
+  "fix": "Wrap each step on its own.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/src/links.ts:426-447: `await env.CLIPS.delete(results.flatMap(...))` (428) and `await env.DB.batch(...)` (429) for expired shares, then stale pending cleanup (435-441), then `DELETE FROM shares WHERE deleted_at IS NOT NULL AND created_at < ?` (443-445), then `DELETE FROM reports WHERE created_at < ?` with REPORT_KEEP_MS = 30*DAY_MS (447; shares.ts:141). No try/catch anywhere in sweep; a throw at 428/429 skips everything after. site/privacy.html:101 promises reports are 'deleted after 30 days'.",
+    "corrected_claim": "Accurate as stated. Note the impact of a transient failure is only a one-hour delay (the next hourly run retries everything; the bucket lifecycle rule backs up the R2 objects). The privacy-page promise is only at risk from a persistent failure in an earlier step, and a D1 error (not only R2) in the expiry step has the same effect.",
+    "reachable_by": "Transient or persistent R2/D1 errors during the hourly cron; not user-triggerable.",
+    "fix_assessment": "Wrapping each step in its own try/catch with logging is correct; also cheap to move the D1-only retention deletes (tombstone purge, 30-day reports) first so they never depend on R2."
+   }
+  ]
+ },
+ {
+  "id": "SV-31",
+  "title": "Usernames are only synced at login, so two users rows can share a username after a Discord rename",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "db.ts:93-119"
+  ],
+  "claim": "Usernames are only synced at login (db.ts:93-119) and `username` is not unique, so after a Discord rename two rows can share a username.",
+  "scenario": "User X renames on Discord and user Y takes X's old name; until X logs in again, both rows hold the same username, so a friend request by Discord username can match the wrong account.",
+  "fix": "Make `username` unique and sync it on use.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/migrations/0001_init.sql:7,15 `username TEXT NOT NULL COLLATE NOCASE,` / `CREATE INDEX users_username ON users(username);` (not UNIQUE). server/src/db.ts:100-104 the only sync: `UPDATE users SET username = ?, display_name = ?, avatar = ? WHERE id = ?` inside upsertDiscordUser, whose only caller is the OAuth callback (server/src/index.ts:193-197, after `fetch(\"https://discord.com/api/users/@me\")`); the Discord access_token is used once and not stored. server/src/db.ts:45-46 `SELECT * FROM users WHERE username = ?` ... `.first<UserRow>()` returns one arbitrary match. server/src/index.ts:317 `|| (await userByName(env.DB, text.toLowerCase()))` in sendRequest. Sessions last 180 idle days (db.ts:125), so a stale name can persist a long time.",
+    "corrected_claim": "",
+    "reachable_by": "Any two ClippiBoy users where one renamed on Discord and the other later took (and signed in with) the freed name; anyone sending a friend request by that Discord name then may hit the stale row. Impact is bounded: the request is only pending, the response returns the target's display name and avatar (index.ts:335,344 `user: toUser(target)`), and the wrong person must accept.",
+    "fix_assessment": "A UNIQUE constraint alone would make the new holder's login fail (UPDATE/INSERT conflict) while the stale row keeps the name, and 'sync on use' is not possible because the server keeps no Discord token. Better: in upsertDiscordUser, in one batch, clear the username on any other row that holds the incoming name before writing it (then a unique index becomes safe)."
+   }
+  ]
+ },
+ {
+  "id": "SV-32",
+  "title": "Posters can be swapped any number of times",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "links.ts:273-289"
+  ],
+  "claim": "`PUT /shares/:id/poster` (links.ts:273-289) lets the owner replace the poster (the `og:image` in Discord and Twitter embeds) with any JPEG, any number of times, with no limit.",
+  "scenario": "Costs R2 Class A operations and allows bait-and-switch previews: a link is posted with a harmless preview, then the poster is swapped.",
+  "fix": "Allow one poster PUT per share, or a few at most.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/src/links.ts:273-289 putPoster: `const row = await owned(env, me, id); if (row.deleted_at !== null) throw ...` then size/JPEG-magic checks and `await env.CLIPS.put(poster(id), data, ...)` with no count, no 'already has poster' check and no rate limit; routed for any authenticated owner at server/src/index.ts:75-78. server/src/page.ts:127 `<meta property=\"og:image\" content=\"${d.poster}\">`. The legit app PUTs once (src-tauri/src/links.rs:486-497). It also accepts PUTs on pending and on expired-but-unswept shares, since only deleted_at is checked.",
+    "corrected_claim": "",
+    "reachable_by": "Any signed-in user, on their own shares only (owned() 403s others). The bait-and-switch gain is modest: the first PUT can already be any JPEG (only magic bytes are checked), so the real extra is swapping a reported poster back to something harmless before review; whether Discord/Twitter show a swapped image depends on their embed caching (not checkable here), and shareFile serves the jpg with public max-age up to 3600 s (links.ts:394-395).",
+    "fix_assessment": "Refusing a second PUT (e.g. a `poster_at` column set with a conditional UPDATE, or R2 `onlyIf` etagDoesNotMatch '*') fits the client, which only PUTs once; also refuse when the share has expired."
+   }
+  ]
+ },
+ {
+  "id": "SV-39",
+  "title": "Privacy page: usage stats called 'anonymous' are actually pseudonymous",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [],
+  "claim": "The privacy page says usage stats are 'anonymous', with an installation number 'not linked to you'. In practice it is pseudonymous: a persistent installation ID with a per-day profile kept up to 400 days. A unique `/get/<ref>` handed to a single person would identify them.",
+  "scenario": "An operator hands a unique download ref to one person; their downloads and the resulting installation's daily profile are then attributable to them.",
+  "fix": "Either commit to never issuing per-person refs, or say 'pseudonymous'.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/migrations/0006_usage.sql: `CREATE TABLE installs (id TEXT PRIMARY KEY, source TEXT, heard TEXT, first_day, last_day, version)` and `CREATE TABLE install_days (id, day, clips, shots, recordings, features, PRIMARY KEY (id, day))`. server/src/telemetry.ts:100-108 upserts both, keyed by the app's persistent UUID; source is the download ref and is kept with COALESCE (first value wins). telemetry.ts:114-120 sweeps after 400 days. telemetry.ts:9 REF_PATTERN `^[a-z0-9-]{1,32}$` accepts any ref name, and site-proxy/index.ts:26-27 counts any /get/<ref>. site/privacy.html:32 says \"one anonymous usage count a day\", :68 \"a random installation number ... which is not linked to you\", :75 \"Send anonymous usage stats\".",
+    "corrected_claim": "",
+    "reachable_by": "The operator, or anyone who hands one person a unique /get/<ref> link. That person's installation row (source = ref) and its per-day activity for up to 400 days can then be tied to them. Even without that, the data is a persistent per-device ID with a daily history, which is pseudonymous rather than anonymous under GDPR Recital 26.",
+    "fix_assessment": "Changing 'anonymous' to 'pseudonymous' (or 'without your name or account') on privacy.html:32/:68/:75 and in the settings label, and/or committing to campaign-level refs only, both work. The page already gives an Art. 6(1)(f) legal basis, which is consistent with treating this as personal data."
+   }
+  ]
+ },
+ {
+  "id": "SV-46",
+  "title": "Spec: 'no public counting route anyone could call' contradicted by /get/<ref>",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [],
+  "claim": "The spec says there is 'no public counting route anyone could call'. `/get/<ref>` is itself that route, and its counts can be forged freely. The spec accepts fake pings but not fake downloads.",
+  "scenario": "Anyone with a browser User-Agent inflates download counts for any ref.",
+  "fix": "Rate-limit or otherwise protect `/get` counting (see SV-4), or update the spec.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "docs/superpowers/specs/2026-10-11-usage-stats-design.md:35-36 'The proxy writes to the friends database through its own D1 binding, so there is no public counting route anyone could call.' (repeated in server/site-proxy/wrangler.jsonc:17-19). Yet site-proxy/index.ts:26-27 routes any GET /get... to download(), and :67-75 'if (request.method === \"GET\" && !isBot(request.headers.get(\"User-Agent\"))) { ctx.waitUntil(env.DB.prepare(\"INSERT INTO downloads ... DO UPDATE SET count = count + 1\")...' with no rate limit. telemetry.ts:74-75 'return userAgent !== null && /bot|crawler|spider|.../i.test(userAgent);' means a missing User-Agent or 'curl/x' also counts. The write is queued before the body is returned (index.ts:68-83), so a client can abort after the headers. The spec accepts forgery only for pings (spec line 142 'Faked pings cannot be prevented entirely; for statistics that is acceptable.').",
+    "corrected_claim": "Reach is wider than 'anyone with a browser User-Agent': any GET without bot/crawler/spider/preview-like words in the UA counts, including requests with no UA at all or curl's default one. Each request needs the release.json and GitHub setup fetches to succeed (site-proxy/index.ts:56-66), but the client does not have to download the body. The spec sentence is meant as 'no separate count-only endpoint', which is literally true, but it wrongly suggests download counts cannot be driven from outside.",
+    "reachable_by": "Any unauthenticated internet client, by repeated GET https://clippiboy.com/get/<ref> with any non-bot User-Agent or none.",
+    "fix_assessment": "Either state in the spec that download counts are forgeable like pings, or add a per-IP rate limit binding (as REPORT_LIMIT does) to /get counting, as in SV-4. The rate limit also bounds D1 writes and row growth."
+   }
+  ]
+ },
+ {
+  "id": "SV-47",
+  "title": "Missing tests: auth flow (state mismatch, code reuse, expiry, verifier, bans)",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [],
+  "claim": "Today's 25 tests only cover pure functions. There are no integration tests (e.g. @cloudflare/vitest-pool-workers or Miniflare with real D1, R2 and Durable Objects) for the auth flow: cookie/state mismatch, code reuse, expired login, wrong verifier, banned user at callback and on every authenticated route, and `DELETE /me` while banned.",
+  "scenario": "The suspension bypass (SV-1) and any regression in login CSRF/verifier checks ship undetected.",
+  "fix": "Add these tests with @cloudflare/vitest-pool-workers or Miniflare.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/package.json 'test': 'node --test src/*.test.ts'; grep finds exactly 25 test() calls in src/shares.test.ts and src/telemetry.test.ts. They import only pure helpers: shares.ts:1-2 says 'The rules for share links, without anything of the Worker in them', and telemetry.test.ts:3 imports cleanPing, cutoffDay, downloadName, isBot, refFromPath, utcDay. The auth logic is inline in index.ts:134-231 (authStart/authCallback/authExchange) and db.ts:129-147 (authenticate) and has no test. There is a manual integration script, server/scripts/e2e.mjs, run against the deployed worker or wrangler dev with seeded sessions. Its only auth checks are at :150 'exchange with junk refused' and :151-152 '/auth/start ... 302 to discord'. Nothing covers cookie/state mismatch (index.ts:167), code reuse (:218), expiry (:173, :219), wrong verifier (:222), or bans at the callback (:198) or on authenticated routes. No .github/workflows file runs any server tests (ffmpeg.yml, pages.yml, release.yml only).",
+    "corrected_claim": "Strictly, there is one integration test: the manual scripts/e2e.mjs, which the README describes as running 'the whole flow' (README.md:41). Its auth coverage is limited to a junk-code exchange and the /auth/start redirect, and it bypasses Discord by seeding sessions, so none of the listed auth cases are covered. CI also runs no server tests at all, not even the 25 unit tests.",
+    "reachable_by": "Development process: any regression in the login CSRF/state, verifier or ban checks (for example SV-1) ships without a failing test.",
+    "fix_assessment": "@cloudflare/vitest-pool-workers (miniflare is already in node_modules through wrangler) with local D1 lets the callback and exchange be tested with a mocked Discord fetch. Wiring 'npm test' into a CI workflow is a cheap first step."
+   }
+  ]
+ },
+ {
+  "id": "SV-49",
+  "title": "Missing tests: upload quota race and upload edge cases",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [],
+  "claim": "No test covers the upload quota race (N parallel uploads), abandoned pending uploads, a body shorter or longer than its Content-Length, or that a non-MP4 gives 415 and leaves no R2 object behind.",
+  "scenario": "Regressions in the atomic quota INSERT…SELECT or upload cleanup would not be caught.",
+  "fix": "Add integration tests for these cases.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "No test reaches createShare: shares.test.ts only unit-tests the pure precheck `canUpload`/`quota` (shares.test.ts:23-53), and scripts/e2e.mjs never calls /shares. The untested paths exist as described: links.ts:208-211 atomic `INSERT INTO shares ... SELECT ... WHERE (${RECENT}) < ? AND (${LIVE_BYTES}) + ? <= ?`; links.ts:243 `new FixedLengthStream(bytes)` (shorter/longer body vs Content-Length); links.ts:250-253 on failure `env.CLIPS.delete(video(id))`, `DELETE FROM shares`, `if (mp4.refused()) throw new HttpError(415, ...)`; links.ts:435-441 sweep of `pending = 1 AND created_at <= now - PENDING_MS`; links.ts:261-269 finish-or-410. No CI workflow runs server tests at all.",
+    "corrected_claim": "",
+    "reachable_by": "Not a runtime defect; regressions in the quota INSERT...SELECT, upload cleanup or the 415 path would ship unnoticed.",
+    "fix_assessment": "These need a Workers runtime (D1, R2, FixedLengthStream), so a @cloudflare/vitest-pool-workers or Miniflare suite is required; plain `node --test` cannot cover them. The parallel-upload race test is the most valuable one."
+   }
+  ]
+ },
+ {
+  "id": "SV-5",
+  "title": "Hourly sweepUsage does a full scan of installs because installs.last_day has no index",
+  "severity": "high",
+  "category": "perf",
+  "locations": [
+   "telemetry.ts:119"
+  ],
+  "claim": "The hourly cron `sweepUsage` (telemetry.ts:119) runs `DELETE FROM installs WHERE last_day < ?`. `installs.last_day` has no index, so this is a full table scan every hour (rows read = install count x 24 per day). Fake pings via the unthrottled `/t/ping` inflate it further.",
+  "scenario": "As `installs` grows (including from fake pings), the hourly full scans consume an increasing share of the Free-plan daily D1 rows-read allowance shared by the whole app. Reported under the 'High on Free plan, Medium on paid' D1-quota finding.",
+  "fix": "`CREATE INDEX installs_last_day ON installs(last_day)`, and run `sweepUsage` once a day.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "server/src/telemetry.ts:113-119 `/** Run by the hourly cron. */ export async function sweepUsage(...) { ... env.DB.prepare(\"DELETE FROM installs WHERE last_day < ?\").bind(cutoff)`; called from server/src/index.ts:44-45 `scheduled(...) { ctx.waitUntil(Promise.all([sweep(env), sweepUsage(env)])) }`; server/wrangler.jsonc:29 `\"triggers\": { \"crons\": [\"17 * * * *\"] }` (hourly). server/migrations/0006_usage.sql:14-22 creates installs with only `id TEXT PRIMARY KEY` and `CREATE INDEX installs_source ON installs(source)`; no other migration indexes last_day (grep INDEX over migrations). Running 0006 in an in-memory SQLite: EXPLAIN QUERY PLAN gives `SCAN installs` for the installs delete, while the install_days and downloads deletes use `SEARCH ... USING INDEX install_days_day (day<?)` / `sqlite_autoindex_downloads_1 (day<?)`. server/src/index.ts:68-69 routes `/t/ping` to handlePing before authenticate, and the only ratelimit binding (wrangler.jsonc:32) is REPORT_LIMIT, so pings have no throttle; each new random UUIDv4 id inserts an installs row that is kept for 400 days (telemetry.ts:18 KEEP_DAYS).",
+    "corrected_claim": "Accurate as stated: an hourly full scan of installs, 24 x install-count rows read per day, and fake pings add rows that each stay for 400 days. 'High' overstates the severity, though. On D1 Free (5M rows read/day), real installs alone would need about 200k rows before this scan used up the read allowance, and on Free each fake ping spends several rows-written (table plus PK autoindex plus index entries) against a 100k/day write allowance, which runs out long before the read side does. The fake-ping effect is real but comes downstream of the unthrottled /t/ping. Note also that the proposed index is not free: D1 bills an extra row written for each index entry touched, and every ping assigns last_day.",
+    "reachable_by": "Automatically by the hourly Cloudflare cron for any install base, and grown by anyone who POSTs valid-looking pings with fresh UUIDv4 ids to the anonymous, unthrottled /t/ping.",
+    "fix_assessment": "Running sweepUsage once a day (for example a guard on the controller's cron or scheduledTime hour, or a separate daily cron) cuts the reads 24x and costs no writes, so it should come first. The index on last_day removes the scan, but every ping then writes one more index row, and on Free the write allowance is the scarcer one. Rate-limiting /t/ping deals with the amplification at its source."
+   },
+   {
+    "lens": "impact",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/migrations/0006_usage.sql:14-22: `CREATE TABLE installs (id TEXT PRIMARY KEY, ... last_day TEXT NOT NULL, ...); CREATE INDEX installs_source ON installs(source);` (no index on last_day). server/src/telemetry.ts:119: `env.DB.prepare(\"DELETE FROM installs WHERE last_day < ?\").bind(cutoff)`. server/src/index.ts:44-45: `async scheduled(...) { ctx.waitUntil(Promise.all([sweep(env), sweepUsage(env)])); }`. server/wrangler.jsonc: `\"triggers\": { \"crons\": [\"17 * * * *\"] }` (hourly). server/src/telemetry.ts:64-66: cutoffDay() has day granularity, so 23 of the 24 hourly sweeps each day delete nothing yet still scan the table. server/src/index.ts:70: `if (path === \"/t/ping\" && method === \"POST\") return handlePing(request, env);` comes before authentication and has no rate limiter, and every new UUID adds an installs row (telemetry.ts:100). The other two DELETEs are fine: install_days uses install_days_day (0006_usage.sql:34), and downloads is covered by PK(day, ref).",
+    "corrected_claim": "The code claim is accurate, but the severity is overstated. The scan costs about 24 x (installs seen in the last 400 days) D1 rows read per day. That is about 2.4% of the 5M/day Free-plan read allowance at 5k installs, and only becomes significant at around 100k+ installs. On the paid plan (25B reads/month) it does not matter. Fake pings can inflate the table, but that comes from the separate unthrottled /t/ping issue, and those pings use up the much smaller Free-plan write allowance (100k rows/day) first. This finding is an efficiency issue and an amplifier, not a high-severity defect.",
+    "reachable_by": "The hourly cron, always. The cost grows with the number of real installs. Anyone on the internet can make it worse by POSTing fake pings with fresh UUIDs to the unauthenticated, unthrottled /t/ping endpoint.",
+    "fix_assessment": "Both parts are correct, but running the sweep once a day is the better minimal fix: the cutoff only changes once per UTC day, so gating sweepUsage on `new Date(controller.scheduledTime).getUTCHours() === 0` (or a separate daily cron) cuts the reads 24x at no cost. The index makes the sweep cheap, but last_day is in the upsert's SET clause, so D1 bills one extra row written per ping per active install. On the Free plan writes are about 50x scarcer than reads, so after the move to a daily sweep the index only pays off if total installs far exceed daily active ones. Rate-limiting /t/ping (a separate issue) is what actually stops the table from being inflated."
+   },
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "server/wrangler.jsonc: \"triggers\": { \"crons\": [\"17 * * * *\"] } (hourly). server/src/index.ts:44-45: scheduled(...) { ctx.waitUntil(Promise.all([sweep(env), sweepUsage(env)])); }. server/src/telemetry.ts:119: env.DB.prepare(\"DELETE FROM installs WHERE last_day < ?\").bind(cutoff). server/migrations/0006_usage.sql:14-22: installs(id TEXT PRIMARY KEY, ..., last_day TEXT NOT NULL, ...); CREATE INDEX installs_source ON installs(source); -- no index on last_day in any migration (grep of migrations/ finds only installs_source). The other two sweep DELETEs are indexed: downloads PRIMARY KEY (day, ref) (0006:10) and install_days_day ON install_days(day) (0006:34). server/src/index.ts:69: if (path === \"/t/ping\" && method === \"POST\") return handlePing(request, env); -- before authenticate(), no rate limiter (only REPORT_LIMIT exists, used in links.ts:319). telemetry.ts:100-103: each ping with a fresh UUID inserts a new installs row; rows live until last_day is 400 days old (KEEP_DAYS, telemetry.ts:18).",
+    "corrected_claim": "Mechanism is correct: the hourly cron's DELETE FROM installs WHERE last_day < ? is a full scan, ~24*N rows read per day for N installs, about 12x what the pings themselves read (one PK upsert per table per install per day). The 'high' severity is overstated for this item alone. On D1 Free (5M rows read/day) real installs alone only matter at about 100-200k installs, far beyond a v0.8.3 app. On the paid plan (25B reads/month) it does not matter. The real exposure is amplification: any internet user can POST /t/ping with random v4 UUIDs, with no auth and no rate limit. Each fake row then gets scanned 24 times a day for up to 400 days. About 200k fake rows, roughly 10-20 days of pings while staying under the 100k/day write quota, would use up the whole Free read quota every day for over a year. But the same attacker can block D1 at once by using up the write quota, which is the larger umbrella D1-quota finding. So this is a secondary, medium-severity amplifier, not a separate high.",
+    "reachable_by": "The hourly Cloudflare cron (17 * * * *) runs it on its own, every hour, with no input. The table it scans grows through ordinary app pings: one a day per install from src-tauri/src/telemetry.rs:264. It also grows through any internet user who sends forged anonymous POST /t/ping requests with random UUIDs. Nothing upstream throttles or authenticates the route.",
+    "fix_assessment": "Running sweepUsage once a day is the real fix. The cutoff only has day granularity, so you could gate it on one UTC hour inside the hourly cron. That alone cuts sweep reads 24x. Adding an index on installs(last_day) by itself can hurt on the Free plan: last_day changes on almost every daily ping, so each ping writes an extra index row (about N more writes/day against a 100k/day quota) to save 24N reads against a 5M/day quota. In quota terms that is roughly a wash or worse. Rate-limiting /t/ping per address is what actually limits the fake-row inflation."
+   }
+  ]
+ },
+ {
+  "id": "SV-51",
+  "title": "Missing tests: share page rendering and response headers",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [],
+  "claim": "No snapshot test of `renderPage` with hostile title, game, tags and uploader name, plus the response headers (`nosniff`, cache, CSP once added).",
+  "scenario": "An escaping or header regression on the public share page would not be caught.",
+  "fix": "Add a snapshot test with hostile inputs and header assertions.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "renderPage/renderGone are referenced only in page.ts and links.ts (grep over the repo); no test imports page.ts. page.ts:105-118 escape title, game, tags, uploader name/avatar with escapeHtml (util.ts:60-62); page.ts:107/124 `description` (contains unescaped `by ${d.uploader.name}`) is escaped once at output. Headers: sharePage links.ts:372-374 sets only `Content-Type` and `Cache-Control: no-store`; `X-Content-Type-Options: nosniff` is set only on media in shareFile links.ts:391. page.ts cannot even be loaded by the current runner: importing it under node v22 fails `ERR_MODULE_NOT_FOUND Cannot find module '.../server/src/util' imported from .../page.ts` (extensionless `import ... from \"./util\"`, page.ts:10; util.ts:1 `from \"./shares\"`).",
+    "corrected_claim": "Accurate as a test gap. Detail: the HTML share page response carries no nosniff today (only the .mp4/.jpg responses do, links.ts:391), so a header assertion for the page would cover Content-Type and Cache-Control, and nosniff belongs to the shareFile test.",
+    "reachable_by": "Not a runtime defect; an escaping regression in page.ts would reach any visitor of a public /c/<id> link, since title, game, tags and display name are user-controlled.",
+    "fix_assessment": "A snapshot test with hostile strings is cheap, but page.ts/util.ts must switch to `./util.ts`/`./shares.ts` specifiers (with allowImportingTsExtensions) or the suite must move to a bundling runner before `node --test` can import renderPage."
+   }
+  ]
+ },
+ {
+  "id": "SV-54",
+  "title": "Missing tests: sweep",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [],
+  "claim": "No test covers the sweep: expired, stale-pending and tombstone purge; partial R2 failure; reports past 30 days; the usage cutoff boundary.",
+  "scenario": "Cron robustness failures (SV-25, SV-26) and retention-promise regressions go undetected.",
+  "fix": "Add integration tests for the sweep steps.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "sweep() (links.ts:419-448) and sweepUsage() (telemetry.ts:114-121) are not imported by any test. shares.test.ts imports only pure helpers, and telemetry.test.ts:3 imports `cleanPing, cutoffDay, downloadName, isBot, refFromPath, utcDay`. Nothing tests the expired-share delete or tombstone (links.ts:421-431), the stale-pending delete (435-441), the tombstone purge `deleted_at IS NOT NULL AND created_at < now-2*WEEK_MS` (443-445), the report delete `created_at < now - REPORT_KEEP_MS` (447), or what happens when R2 fails partway. There are no D1 or R2 mocks anywhere. The one partial exception is that the cutoff date itself is unit-tested (telemetry.test.ts:44: `cutoffDay(Date.UTC(2026, 9, 11), 400) === \"2025-09-06\"`). The SQL edge (`day < ?`, keeping the cutoff day) is not tested.",
+    "corrected_claim": "Small refinement: the 400-day cutoff calculation (cutoffDay) is unit-tested. Only how the delete treats rows on that boundary is untested.",
+    "reachable_by": "Developers changing the cron or retention code; a regression would quietly break the retention promises (30-day reports, 400-day usage rows).",
+    "fix_assessment": "Integration tests with Miniflare D1 and R2 would cover the SQL steps and a failing CLIPS.delete. A plain unit test would not detect SV-25 (Promise.all in waitUntil), because that depends on the Workers runtime ending the invocation early."
+   }
+  ]
+ },
+ {
+  "id": "SV-20",
+  "title": "Missing CSP, frame-ancestors, Referrer-Policy and no-store headers on share and sign-in pages",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "links.ts:372",
+   "index.ts:242"
+  ],
+  "claim": "The share page (links.ts:372) and the auth pages (index.ts:242) send no Content-Security-Policy, `frame-ancestors` or `Referrer-Policy`. The callback page carries the one-time code but has no `Cache-Control: no-store`. Escaping is correct, so this is defence in depth only.",
+  "scenario": "If an escaping regression is ever introduced there is no CSP to stop script execution; the pages can be framed; the callback page with the one-time code may be cached.",
+  "fix": "`Content-Security-Policy: default-src 'none'; script-src 'sha256-…'; style-src 'unsafe-inline'; img-src https://api.clippiboy.com https://cdn.discordapp.com; media-src https://api.clippiboy.com; font-src https://clippiboy.com; connect-src https://api.clippiboy.com; frame-ancestors 'none'`, plus `Cache-Control: no-store` on the callback page.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "server/src/links.ts:372-374 sharePage returns only `{ \"Content-Type\": \"text/html; charset=utf-8\", \"Cache-Control\": \"no-store\" }` (no CSP / frame-ancestors / X-Frame-Options / Referrer-Policy). server/src/index.ts:242-247 page() returns only Content-Type and the clearing Set-Cookie, no Cache-Control, although authCallback (index.ts:203-208) embeds `clippiboy://auth?code=${oneTime}` in both an <a href> and an inline `<script>location.href=...`. A grep of server/src and server/site-proxy finds no CSP/frame/referrer header anywhere; site-proxy/index.ts:23-25 passes the /c/<id> response through unchanged. Mitigations: escapeHtml (util.ts:207-209) is used on every interpolated field in page.ts; the Discord avatar <img> already has referrerpolicy=\"no-referrer\" (page.ts:116); the one-time code is single-use and useless without the PKCE verifier (index.ts:214-224); a framed /auth/callback gets no SameSite=Lax cb_login cookie (index.ts:154, 167-169) and only shows 'Sign-in expired'.",
+    "corrected_claim": "Accurate as stated: the headers are missing, and only the callback page lacks no-store (the share page already sends Cache-Control: no-store). In practice, no stated scenario can be exploited. Escaping is correct. A framed sign-in flow fails because of the SameSite=Lax state cookie. A cached one-time code is spent on first use and needs the verifier. Framing the share page would at most expose a rate-limited Report button to clickjacking. Referrer leakage is already limited by the browser's default strict-origin-when-cross-origin and by the per-image no-referrer on the avatar.",
+    "reachable_by": "Only together with a future escaping regression (CSP), or a third-party site framing clippiboy.com/c/<id> (clickjacking the report button, which REPORT_LIMIT limits to 5 per minute per IP).",
+    "fix_assessment": "Adding frame-ancestors 'none' and no-store on page() is cheap and correct. The proposed `script-src 'sha256-…'` cannot work as written: both inline scripts change with every response (page.ts:274 interpolates the per-share report URL, index.ts:235 the random one-time code), so it needs a per-response nonce or the values moved into data attributes. img-src would also need https://clippiboy.com for the favicon."
+   }
+  ]
+ },
+ {
+  "id": "SV-21",
+  "title": "Idle sessions are rejected after 180 days but never deleted",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [],
+  "claim": "Session lifecycle gap: idle sessions are rejected after 180 days but the `sessions` rows are never deleted (no sweep); they are kept until the account is deleted.",
+  "scenario": "Stale session rows (token hashes linked to user IDs) accumulate indefinitely for inactive users.",
+  "fix": "Have the cron delete stale sessions.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "server/src/db.ts:139-141 `if (!session || now - session.last_used > SESSION_IDLE_MS) { throw new HttpError(401, ...) }`: it rejects the session and never deletes it. The only DELETEs on sessions are index.ts:89 (logout of the presented token) and the ON DELETE CASCADE from users (migrations/0001_init.sql:18-22; deleteAccount index.ts:383-387). The cron (index.ts:44-46) runs sweep (links.ts:419-448: shares and reports only) and sweepUsage (telemetry.ts:114-121: install_days, downloads, installs only). Nothing removes stale sessions.",
+    "corrected_claim": "Accurate. For context, retention matches what the project publishes: privacy.html:88 says 'Signing out deletes it' and privacy.html:104 says data 'stays stored until you delete your account'. The users row for the same person is also kept indefinitely, so stale session rows add only token hashes and timestamps. Those hashes cannot log anyone in, because authenticate rejects them after 180 idle days. Rows pile up only for sessions abandoned without logout: an uninstall, a lost device, or a local sign-out after a 401 (friends.rs:325-333).",
+    "reachable_by": "Time passing: any user who stops using a device without signing out.",
+    "fix_assessment": "A one-line `DELETE FROM sessions WHERE last_used < ?` (now - SESSION_IDLE_MS) in the hourly sweep fixes it; sessions_user is the only index, so this scans the table, which is fine at this size."
+   }
+  ]
+ },
+ {
+  "id": "SV-22",
+  "title": "logins rows (user_id + one-time code) are only cleaned up on the next /auth/start",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [
+   "index.ts:139-143"
+  ],
+  "claim": "Session lifecycle gap: `logins` rows, which hold `user_id` and the one-time code, are only cleaned up when someone next calls `/auth/start` (the `DELETE FROM logins WHERE created_at < ?` there); there is no cron cleanup.",
+  "scenario": "With no further sign-in starts, login rows containing user IDs and one-time codes persist indefinitely, including after account deletion.",
+  "fix": "Have the cron delete stale logins.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "server/src/index.ts:139 `DELETE FROM logins WHERE created_at < ?` (now - LOGIN_TTL_MS) runs only in authStart. index.ts:218 deletes only the row being exchanged. index.ts:202 writes `code` and `user_id` on a successful callback. The logins table has no FK to users (migrations/0001_init.sql:28-34), so deleteAccount's cascade (index.ts:386-387) does not reach it. Neither sweep (links.ts:419-448) nor sweepUsage (telemetry.ts:114-121) touches logins.",
+    "corrected_claim": "Accurate, but the window is smaller than 'indefinitely' suggests. The DELETE at index.ts:139 is global, not per user, so ANY user's next sign-in start removes every stale row. On a live service that is usually within minutes or hours. Only rows whose callback finished but whose exchange never happened carry user_id and code. Rows abandoned at Discord carry neither. After 10 minutes the code cannot be redeemed (TTL check index.ts:219), and it never works without the verifier.",
+    "reachable_by": "Any sign-in where Discord's callback succeeds but the clippiboy:// hand-off never reaches the app; the leftover rows then live until any user's next /auth/start.",
+    "fix_assessment": "Moving (or copying) the `DELETE FROM logins WHERE created_at < ?` into the hourly sweep is trivial and correct. Deleting a user's logins rows in deleteAccount would close the post-deletion gap too."
+   }
+  ]
+ },
+ {
+  "id": "SV-25",
+  "title": "Cron uses Promise.all inside waitUntil, so a sweep rejection can cut sweepUsage short",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "index.ts:45"
+  ],
+  "claim": "The scheduled handler at index.ts:45 runs `sweep` and `sweepUsage` with `Promise.all` inside `waitUntil`: if `sweep` rejects, the invocation may end while `sweepUsage` is still running.",
+  "scenario": "An R2 error makes `sweep` reject; the cron invocation ends early and `sweepUsage` does not finish.",
+  "fix": "Use `Promise.allSettled`.",
+  "reported_confidence": "likely",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "server/src/index.ts:45 `ctx.waitUntil(Promise.all([sweep(env), sweepUsage(env)]));` - both are started eagerly and only the combined Promise.all is registered; Promise.all rejects as soon as either rejects, so nothing else in waitUntil keeps the other promise alive. sweep (links.ts:419-448) awaits a D1 SELECT then R2 delete(s); sweepUsage (telemetry.ts:114-121) is a single D1 batch. No try/catch in either.",
+    "corrected_claim": "Mechanism is right, but the stated direction is the less likely race: an R2 failure in sweep comes only after a D1 SELECT plus an R2 round trip, by which time sweepUsage's single concurrently-issued D1 batch has usually finished. The more consequential case is the reverse - sweepUsage rejecting early (D1 error) settles the waitUntil promise and can cut the multi-step sweep short. Whether in-flight work is actually cancelled once the waitUntil promise settles is workerd runtime behaviour (documented by Cloudflare; workerd ships only as a binary here, so not checkable from source), and whether an already-dispatched D1 batch still commits server-side is unverifiable. Both jobs are idempotent and rerun hourly, so the effect self-heals.",
+    "reachable_by": "Any transient D1/R2 error during the hourly cron (17 * * * *); not attacker-triggerable.",
+    "fix_assessment": "Promise.allSettled (or a separate ctx.waitUntil per job) fixes it, but rejected results should then be logged (and ideally rethrown after both finish) so failures still show up in observability instead of being silently swallowed."
+   }
+  ]
+ },
+ {
+  "id": "SV-27",
+  "title": "Account deletion fails for accounts with more than 500 live links",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "links.ts:305"
+  ],
+  "claim": "At links.ts:305 account deletion removes all live shares' R2 objects in one R2 `delete` call. More than 500 live shares means more than 1,000 keys in one call, which throws, so `DELETE /me` returns 500. Only reachable for accounts with `unlimited_links` or `QUICK_LINKS_FOR`.",
+  "scenario": "An `unlimited_links` account with 501+ live shares calls `DELETE /me` and gets a 500; the account cannot be deleted.",
+  "fix": "Delete in chunks of 1,000 keys.",
+  "reported_confidence": "likely",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "server/src/links.ts:301-305: `SELECT id FROM shares WHERE owner = ? AND deleted_at IS NULL` (no LIMIT) then `if (results.length > 0) await env.CLIPS.delete(results.flatMap((row) => [video(row.id), poster(row.id)]));` - two keys per row in one call. The author's own comment at links.ts:427 ('R2 takes up to a thousand keys at once; two per clip') is why sweep uses LIMIT 400. index.ts:383-391 deleteAccount calls deleteSharesOf before `DELETE FROM users`, so a throw surfaces as the generic 500 (index.ts:39-42) and the account is not deleted. Normal accounts are capped by WEEKLY_LIMIT = 3 (shares.ts:11); unlimited comes only from unlimited_links (migration 0005) or QUICK_LINKS_FOR (links.ts:66-69,86).",
+    "corrected_claim": "Correct; only nuance: the selected rows also include expired-but-unswept and stale pending rows (deleted_at IS NULL), and the condition is temporary - once uploads stop, rows expire after 5 days and sweep tombstones them (400/hour), after which deletion succeeds. That R2 throws (rather than truncates) on >1000 keys is Cloudflare R2 runtime behaviour; miniflare's local R2 (node_modules/miniflare/dist/src/workers/r2/bucket.worker.js #delete) does not enforce the limit, so it cannot be confirmed from local source.",
+    "reachable_by": "Only operator-granted accounts (users.unlimited_links = 1 or listed in the QUICK_LINKS_FOR secret) holding more than 500 non-tombstoned shares, calling DELETE /me.",
+    "fix_assessment": "Chunking the key list into batches of at most 1000 (500 shares) is the right, minimal fix."
+   }
+  ]
+ },
+ {
+  "id": "SV-33",
+  "title": "Expiry rounding overstates the time left",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "shares.ts:98"
+  ],
+  "claim": "shares.ts:98 computes the expiry text with `Math.round(left / DAY_MS)`, which rounds up partial days.",
+  "scenario": "With 12 hours left the page says 'in 1 day'; with 4.5 days left it says 'in 5 days'.",
+  "fix": "Use `Math.floor` for days, and show hours below 2 days.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "server/src/shares.ts:95-105 `const left = expiresAt - now; // Rounded, not cut: a link made a minute ago has five days, not four. const days = Math.round(left / DAY_MS); if (days >= 2) return `in ${days} days`; if (days === 1) return \"in 1 day\";`. At left = 12 h, Math.round(0.5) = 1 -> 'in 1 day'; at 4.5 days -> 'in 5 days'. Shown on the page and in og:description (page.ts:107,204,206). The rounding is deliberate and tested: server/src/shares.test.ts:64 `assert.equal(expiresIn(now + 5 * day - 60_000, now), \"in 5 days\");`.",
+    "corrected_claim": "",
+    "reachable_by": "Any viewer of a share page in the last 12-36 h of a link (or at any .5-day mark); cosmetic only, it overstates by at most 12 h.",
+    "fix_assessment": "Plain Math.floor goes against the documented intent and breaks shares.test.ts:64 ('in 4 days' for a fresh link). Keeping Math.round for days >= 2 but showing hours when left < 36 h, or using Math.floor only below 2 days, fixes the 12 h case and keeps the test."
+   }
+  ]
+ },
+ {
+  "id": "SV-36",
+  "title": "The site proxy is not covered by npm run check",
+  "severity": "low",
+  "category": "dx",
+  "locations": [],
+  "claim": "The site proxy is not type-checked by `npm run check`, because the tsconfig only includes `src`.",
+  "scenario": "Type errors in site-proxy code ship without being caught by the check script.",
+  "fix": "Not stated explicitly; implied: include the site proxy in the type check.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "server/package.json: \"check\": \"tsc --noEmit\"; server/tsconfig.json: \"include\": [\"src\"], \"exclude\": [\"src/**/*.test.ts\"]. site-proxy/index.ts lives in server/site-proxy/, outside src. `tsc --noEmit --listFiles` in server/ lists only src/*.ts, src/secrets.d.ts and worker-configuration.d.ts, no site-proxy file. No CI workflow runs tsc for the server (.github/workflows has only ffmpeg.yml, pages.yml, release.yml), and wrangler deploy bundles with esbuild without type checking. docs/superpowers/plans/2026-10-11-usage-stats.md:105 even names `npx tsc --noEmit` in server/ as the check for the site-proxy change, which it does not cover. Checked separately (scratch tsconfig with site-proxy/index.ts + src/secrets.d.ts): exits 0, so there is no type error hidden today.",
+    "corrected_claim": "",
+    "reachable_by": "Any developer who edits server/site-proxy/index.ts and relies on `npm run check` in server/. No runtime impact today, because the file currently type-checks cleanly.",
+    "fix_assessment": "Adding \"site-proxy\" to include in server/tsconfig.json works: the file's own `interface Env` is module-scoped and does not clash with the global Env, and it passes strict today. A separate tsconfig in site-proxy/ chained into the check script would also work."
+   }
+  ]
+ },
+ {
+  "id": "SV-42",
+  "title": "Privacy page: 'No cookies' while api.clippiboy.com sets cb_login",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [],
+  "claim": "The privacy page says 'No cookies.', but `api.clippiboy.com` sets the `cb_login` cookie during sign-in. It is strictly necessary, so this is a wording issue.",
+  "scenario": "A reader of the privacy page is told no cookies are set, but the sign-in flow sets one.",
+  "fix": "Reword the privacy page to mention the strictly necessary sign-in cookie.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "site/privacy.html:32 '<li>No ads, no cookies, no tracking across sites. ...</li>' (a blanket statement in 'In short'; line 49 'The site sets no cookies' is scoped to clippiboy.com and is fine). server/src/index.ts:32 'const STATE_COOKIE = \"cb_login\";' and :154 '\"Set-Cookie\": `${STATE_COOKIE}=${state}; Path=/auth; Max-Age=600; HttpOnly; Secure; SameSite=Lax`' on /auth/start, which the app opens in the user's real browser (src-tauri/src/friends.rs:201-202 'app.opener().open_url(format!(\"{SERVER}/auth/start?challenge={challenge}\"), ...)'). It is cleared at index.ts:245 (Max-Age=0) on every callback result page. No other Set-Cookie exists in server/src or server/site-proxy.",
+    "corrected_claim": "",
+    "reachable_by": "Every user who signs in to the friends feature: their browser receives the cb_login cookie from api.clippiboy.com for up to 10 minutes.",
+    "fix_assessment": "Rewording the 'In short' bullet is right, for example 'no tracking cookies; signing in sets one short-lived cookie that only ties the sign-in to your browser'. The cookie is strictly necessary under ePrivacy Art. 5(3), so it needs no consent banner and no code change."
+   }
+  ]
+ },
+ {
+  "id": "SV-57",
+  "title": "Missing tests: expiresIn boundaries",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [],
+  "claim": "No test covers `expiresIn` at 12 h, 36 h and 4.5 days.",
+  "scenario": "The rounding bug that overstates time left (SV-33) went undetected.",
+  "fix": "Add unit tests at these boundaries.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "shares.test.ts:61-68 tests expiresIn only at 5 days, 5 days minus 1 minute, 1 day + 5 ms, 3 hours and 1 minute. Nothing tests 12 h, 36 h or 4.5 days. The code rounds on purpose (shares.ts:97-98: `// Rounded, not cut: a link made a minute ago has five days, not four.` / `const days = Math.round(left / DAY_MS);`). As a result, 12 h left gives round(0.5) = 1, so \"in 1 day\". 36 h gives 2, so \"in 2 days\". 4.5 days gives \"in 5 days\". The existing line 64 (5 days minus 1 minute is \"in 5 days\") already pins the round-up near 5 days.",
+    "corrected_claim": "",
+    "reachable_by": "Developers changing expiresIn; anyone viewing a share page sees the text.",
+    "fix_assessment": "Adding boundary assertions is cheap and sensible. The author has to decide first whether 12 h should read \"in 1 day\": the rounding is deliberate, so a test alone would not count it as a bug."
+   }
+  ]
+ },
+ {
+  "id": "SV-13",
+  "title": "Report handling: reports never surfaced, owner can destroy evidence, clips expire unreviewed, reports forgeable cross-site",
+  "severity": "medium",
+  "category": "security",
+  "locations": [],
+  "claim": "(1) Reports filed via `POST /c/:id/report` are never surfaced to anyone; the operator has to poll D1. (2) The owner can delete a reported clip (`deleteShare` wipes it from R2 and blanks the title), which destroys the evidence. (3) Clips expire after 5 days whether or not anyone reviewed them. (4) Any website can make its visitors' browsers file reports (no-cors `text/plain` POST); the rate limit (`REPORT_LIMIT`, 5/min) is per IP and per Cloudflare location, and IPv6 rotation gets around it.",
+  "scenario": "An abusive clip is reported but nobody is notified; the owner deletes it (destroying the evidence) or it expires after 5 days unreviewed. A malicious website silently makes its visitors' browsers file reports, and IPv6 rotation bypasses the per-IP limit. Severity: Low-Medium.",
+  "fix": "Hide a clip automatically after N distinct-IP reports, notify the operator (webhook or email), and move reported objects to a quarantine prefix instead of deleting them.",
+  "reported_confidence": "likely",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "(1) server/src/links.ts:331-337 is the only writer of `reports`: `INSERT INTO reports (id, share_id, reason, note, created_at) SELECT ... WHERE (SELECT COUNT(*) FROM reports WHERE share_id = ? AND status = 'open') < ?`. The only other access is links.ts:447 `DELETE FROM reports WHERE created_at < ?` (30 days, shares.ts:141). No code sets status 'removed'/'dismissed' (migrations/0005_moderation.sql:16) and nothing notifies anyone. (2) links.ts:291-298 deleteShare, owner-only via owned() (links.ts:153), never looks at reports: `await env.CLIPS.delete([video(id), poster(id)]); await env.DB.prepare(TOMBSTONE)...`. TOMBSTONE (links.ts:159) blanks title, game and tags but keeps `owner`. That row is purged only at links.ts:443-445 (`deleted_at IS NOT NULL AND created_at < now - 2*WEEK_MS`). The reviewer missed a worse path: DELETE /me (index.ts:383-387) runs deleteSharesOf (wipes R2) and then `DELETE FROM users`, and that cascades to the shares rows (migrations/0002_shares.sql:5 `ON DELETE CASCADE`), so the uploader's identity is gone too. (3) sweep, links.ts:421-431, tombstones every `expires_at <= now` share and deletes its R2 objects without checking open reports. LIFETIME_MS is 5 days (shares.ts:19). (4) reportShare (links.ts:315-340) has no Origin or Referer check. `Access-Control-Allow-Origin: PAGE_ORIGIN` only controls who can read the response. The page posts `Content-Type: text/plain` (page.ts:274), which is a CORS-simple request with no preflight, so any site can make the request. The limit is keyed on the full address: links.ts:318-319 `request.headers.get(\"CF-Connecting-IP\")` → `REPORT_LIMIT.limit({ key: address })`, 5/60 s (wrangler.jsonc ratelimits). Each IPv6 address in a /64 therefore gets its own budget. Bounds: an attacker must know the 10-character clip id (shares.ts:80), at most 20 open reports per clip are stored (shares.ts:139, links.ts:334), and a report has no automatic effect.",
+    "corrected_claim": "Points (1) and (3) are accurate. Reports go into D1 and nothing reads, surfaces or resolves them. Expired clips are swept after 5 days whatever their report status. Point (2) overstates the single-delete path. DELETE /shares/:id destroys the video, poster, title, game and tags, but the shares row keeps `owner`, so the uploader can still be identified for about 14 days after the clip was created. The worse case, which the reviewer missed, is DELETE /me: it wipes the R2 objects and cascades away the shares rows, so neither the content nor the uploader identity survives, while the report row stays for 30 days pointing at nothing. The same orphaning happens to any report reviewed more than 14 days after upload. Point (4) is real but low-impact. Cross-site report POSTs are possible and the limit is per full IP address (rotatable inside an IPv6 /64), but an attacker can just as well send reports directly. Forged reports trigger nothing and are capped at 20 open reports per clip. The real harm is that a flood can fill that cap, after which genuine reports are dropped silently while still answered `{ok:true}`.",
+    "reachable_by": "(1)(3): any reported clip, by design of the current pipeline. (2): the clip's owner via DELETE /shares/:id, or any account holder via DELETE /me. (4): anyone who knows a clip's id, directly or through other people's browsers on a page they control.",
+    "fix_assessment": "Operator notification (a webhook or email on the first open report), quarantining reported objects instead of deleting them, and blocking owner and account deletion and sweep from destroying objects with open reports all address real gaps. Auto-hiding after N distinct-IP reports is the risky part: it is exactly what point (4) lets a malicious site trigger, so it would need an Origin check, a /64-keyed limit and a high threshold before it is safe."
+   }
+  ]
+ },
+ {
+  "id": "SV-15",
+  "title": "A null or non-object JSON body gives a 500",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "util.ts:16-22",
+   "index.ts:212"
+  ],
+  "claim": "`body()` at util.ts:16-22 casts the parsed JSON without validating that it is an object, and callers destructure the result (for example index.ts:212), so a `null` or non-object body throws and returns 500.",
+  "scenario": "Repro: `/auth/exchange` and `/me` PATCH with body `null` -> 500.",
+  "fix": "Have `body()` reject anything that is not an object; check `typeof code === \"string\"`.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/src/util.ts:16-21 `return (await request.json()) as T;` only a parse failure becomes HttpError(400); JSON `null` parses fine. server/src/index.ts:212 `const { code, verifier } = await body<...>(request);` (also :94 `const { allowRequests } = ...` and :103 `const { query } = ...`) -> destructuring null throws TypeError, which index.ts:38-41 turns into `json({ error: \"Something went wrong on the server.\" }, 500)`. Primitive bodies do not throw: `const {code, verifier} = 5` yields undefined, so index.ts:213 answers 400 `Missing code or verifier.`; /me PATCH with `5` falls through the `typeof allowRequests === \"boolean\"` guard and returns 200. Missed case: `{\"code\":{},\"verifier\":\"x\"}` passes `!code` and reaches `.bind(code)` at index.ts:215; workerd's D1 binding throws `D1_TYPE_ERROR: Type 'object' not supported` for a plain object -> 500.",
+    "corrected_claim": "Only a literal JSON `null` body makes the destructuring throw (500) on /auth/exchange (unauthenticated), /me PATCH and /friends/request (both after authenticate). Other non-object bodies (numbers, strings, booleans, arrays) do not throw and get 400 or 200. Separately, an object-valued `code` on /auth/exchange reaches D1 `.bind()` and also gives 500. The only effect is a wrong status code plus a console.error line; no state changes.",
+    "reachable_by": "Any unauthenticated client POSTing `null` (or `{\"code\":{}...}`) to /auth/exchange; any signed-in client for /me PATCH and /friends/request.",
+    "fix_assessment": "Making body() reject anything that is not a non-null plain object fixes the null case for all three callers. The `typeof code === \"string\" && typeof verifier === \"string\"` check is also needed, to close the object-valued-code path to D1."
+   }
+  ]
+ },
+ {
+  "id": "SV-18",
+  "title": "Media Range and conditional request handling is wrong (bad ranges return 206 full body, If-None-Match ignored, HEAD reads body)",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "links.ts:383-406"
+  ],
+  "claim": "Media serving at links.ts:383-406 passes Range through without validation: `bytes=999999-`, `bytes=garbage`, `bytes=10-5` and multi-range requests return 206 with the whole object instead of 416 or 200 (production R2 may throw instead, surfacing as the generic 500). `If-None-Match` is ignored (always 200), and HEAD downloads the object body (an R2 Class B operation).",
+  "scenario": "Repro (local R2 emulator): `bytes=999999-`, `bytes=garbage`, `bytes=10-5` and multi-range requests all returned 206 with the whole object.",
+  "fix": "Parse `Range` yourself; return 416 if `start >= size` and 200 when the range is unparseable; pass `onlyIf: request.headers` and return 304; use `CLIPS.head()` for HEAD.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/src/links.ts:383 `env.CLIPS.get(key, { range: request.headers })` with no `onlyIf`; :397 `const ranged = request.headers.has(\"Range\") && object.range !== undefined;` :406 `status: ranged ? 206 : 200`. workerd sends the raw header to the R2 backend as `rangeHeader` (string found in the workerd binary). In the local emulator, miniflare r2/bucket.worker.js:520-524 keeps the range only when `parseRanges(...)?.length === 1`, otherwise it falls back to :955-956 `r2Range = defaultR2Range` ({offset:0,length:size}). parseRanges (shared/index.worker.js:582-615) returns undefined for `bytes=garbage`, `bytes=10-5` and `bytes=999999-` (start >= length), and multi-range gives length > 1. So object.range is always set, and the Worker answers 206 with `Content-Range: bytes 0-(size-1)/size` and the full body. :405 does use `CLIPS.get` for HEAD and only drops the body afterwards. If-None-Match is never passed, so the response is never 304.",
+    "corrected_claim": "The Range mislabelling is real for the local emulator: for a malformed, inverted, unsatisfiable or multi range, the Worker sends 206 with the whole object instead of 200 (ignore the Range) or 416. What production R2 does with such a rangeHeader (ignore it as miniflare does, or throw so the request becomes a 500) cannot be checked from source. Ignoring If-None-Match is allowed by HTTP and only wastes transfer once max-age expires. For HEAD, R2 bills head() as a Class B operation just like get(), so switching saves only the unread body stream, not an operation class.",
+    "reachable_by": "Anyone with a share link, sending a hand-crafted or unusual Range header. Normal browser video players send valid single ranges (`bytes=0-`, `bytes=N-`) and are unaffected.",
+    "fix_assessment": "Parsing Range in the Worker (one range; 416 with `Content-Range: bytes */size` when start >= size; ignore it and send 200 when it is malformed or multi), then passing an explicit {offset,length} to R2, fixes the status codes. Adding `onlyIf: request.headers` with a 304 path and `CLIPS.head()` for HEAD are optional optimizations."
+   }
+  ]
+ },
+ {
+  "id": "SV-24",
+  "title": "Logout and suspension do not close an already-open WebSocket",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "index.ts:82-91"
+  ],
+  "claim": "Session lifecycle gap: the bearer token is only checked when the `/ws` socket connects (index.ts:82-91), so logout and suspension do not close a socket that is already open.",
+  "scenario": "A user logs out (or is suspended) while connected; their existing WebSocket keeps receiving presence and relays.",
+  "fix": "Call `closeAll` on logout of the last session or on suspension.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/src/index.ts:71 authenticate runs once per request; index.ts:82-85 forwards /ws to the Hub with only `X-User`. index.ts:87-90 logout deletes the session row and never contacts the Hub. hub.ts:67-73: the socket attachment stores {user, ready, invisible, presence, at}, with no session or token. hub.ts:119-136: the alarm closes only sockets that stopped pinging (STALE_MS), and pings are auto-answered (hub.ts:56), so a live socket stays open indefinitely while it keeps receiving presence (hub.ts:150-152) and relays (hub.ts:158-163) and can send relays (hub.ts:241-264, which checks only areFriends). Suspension: db.ts:129-147 authenticate never checks banned_at. banned_at is read only at sign-in (index.ts:198-199) and share creation (links.ts:181-182), and no server code ever sets banned_at or calls closeAll on suspension (closeAll's only caller is deleteAccount, index.ts:389). Client side: friends.rs:325-333 sign_out_locally drops the outbox, and the serve loop then runs `sink.close()` (friends.rs:478-482).",
+    "corrected_claim": "Logout: confirmed, but narrower than the scenario says. The honest app closes its own socket when signing out (friends.rs:325-333, 478-482). What survives is a socket opened by another holder of the same token, such as a thief, because the Hub has no record of which session opened which socket. Suspension: worse than claimed. Setting banned_at does not stop the token from working at connect either, since authenticate ignores it (db.ts:129-147). A suspended account with an existing session can keep using /ws, /me, /friends and the relay, and can open new sockets. The server has no suspension routine at all; it happens by hand in D1. That contradicts privacy.html:101 ('A suspended account is signed out').",
+    "reachable_by": "Logout: someone else holding the user's token with an open /ws (stolen token). Suspension: any suspended user with an unexpired session, unless the operator also deletes their sessions by hand, and even then the open sockets remain.",
+    "fix_assessment": "'closeAll on logout of the last session' does not cover the multi-device or leaked-token case. closeAll's code 4001 also makes the app sign out locally (friends.rs:467-468). Better: pass the session hash to the Hub, store it in the attachment, and on logout close only that session's sockets. Have authenticate reject banned users, and add a real suspension path that deletes the user's sessions and calls closeAll."
+   }
+  ]
+ },
+ {
+  "id": "SV-28",
+  "title": "The MP4 checker has no cap on box count (CPU exhaustion)",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "shares.ts:173-216"
+  ],
+  "claim": "The MP4 box checker at shares.ts:173-216 iterates boxes with no limit on how many top-level boxes a file may contain.",
+  "scenario": "Bench: a 50 MB file made of 6.5M 8-byte boxes takes about 1.1 s of CPU in V8 (a normal file takes 0.2 ms). It passes the check, and on the Free plan it runs past the CPU limit and stalls the isolate.",
+  "fix": "Refuse files with more than about 100k top-level boxes.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/src/shares.ts:173-216: push() appends header bytes one at a time (`this.header.push(chunk[i++]); this.readHeader();`), and readHeader accepts any box with size >= header length (`size < h.length || size > MAX_BYTES` -> bad), so 8-byte boxes are legal and `this.boxes` is counted but never capped. Reproduced with a copy of the class in node v22 (scratchpad bench/mp4bench.mjs): 50 MB of ftyp + 8-byte boxes = 6,553,598 boxes, accepted (end() true), 1189 ms wall / 1217 ms CPU, ~1.5 ms per 64 KB chunk; a normal ftyp/moov/mdat file takes 0.28 ms. links.ts:250-253: a refused upload deletes its row (`DELETE FROM shares WHERE id = ?`), so a variant without moov fails at flush after the full CPU cost without consuming the weekly quota.",
+    "corrected_claim": "The CPU amplification is real (~1.2 s CPU per 50 MB vs <1 ms), but the scenario's details are wrong: the work is spread over transform() callbacks of ~1.5 ms per chunk, so it does not stall the isolate continuously; and on the Free plan's 10 ms CPU limit such a request would be terminated (the upload fails) rather than 'pass the check and run past the limit' - it passes only under the Paid plan's 30 s default. The real lever is that rejected uploads (e.g. no moov) leave no row, so one authenticated account can repeat it indefinitely (up to 3 concurrent, bounded by the INSERT's RECENT < WEEKLY_LIMIT on pending rows), each costing the attacker 50 MB of upload bandwidth.",
+    "reachable_by": "Any signed-in (Discord) account via POST /shares with a crafted body up to 50 MB.",
+    "fix_assessment": "A cap of ~100k top-level boxes is safe even for fragmented MP4 and removes the amplification; parsing the 8/16-byte header without per-byte array pushes would also cut the constant factor."
+   }
+  ]
+ },
+ {
+  "id": "SV-30",
+  "title": "Friend requests: no rate limit or pending cap, and 404 vs 403 responses enable user enumeration",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "index.ts:313-345"
+  ],
+  "claim": "`POST /friends/request` (index.ts:313-345) has no rate limit and no cap on outgoing pending requests, and Discord usernames can be guessed. The response distinguishes 404 (no such user, or they blocked you) from 403 (allow_requests is off), which reveals which Discord accounts use ClippiBoy.",
+  "scenario": "A script spams friend requests by guessed Discord usernames and uses the 403/404 distinction to learn which Discord accounts use ClippiBoy.",
+  "fix": "Rate-limit; cap outgoing pending requests at around 20; return the same answer for 403 and 404.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/src/index.ts:102-105 routes POST /friends/request straight to sendRequest with no limiter (the only ratelimit binding is REPORT_LIMIT, wrangler.jsonc:32, used only in links.ts:319). sendRequest (index.ts:313-345): 404 when `!target || isBlocked(target, me)` (318-321); `if (target.allow_requests !== 1) throw new HttpError(403, ...)` (337); otherwise INSERT pending with no count condition (338-342) and `return { status: \"sent\", user: toUser(target) }` (344). userByName is an exact match on users.username (db.ts:45-47). allow_requests defaults to 1 (migrations/0001_init.sql:12).",
+    "corrected_claim": "No rate limit and no cap on outgoing pending requests are true. But the 403/404 split is the minor oracle: since allow_requests defaults to 1, the main enumeration channel is the 200 'sent' response, which returns the target's id, username, display name and avatar; an attacker can then withdraw it with DELETE /friends/<id> (index.ts:107-111, removeFriend at index.ts:360-365), leaving the target only a brief flash. Making 403 look like 404 would hide only users who turned requests off, so it does not prevent enumeration; per-account rate limiting is the effective mitigation. Re-requesting after a decline is also unbounded until the target blocks.",
+    "reachable_by": "Any signed-in (Discord-authenticated) account with a script, guessing Discord usernames or 8-character friend codes.",
+    "fix_assessment": "Rate-limiting per account (e.g. a Workers ratelimit binding keyed by user id) and capping outgoing pending requests address the spam and slow enumeration; unifying 403/404 is cosmetic on its own because the success path still confirms existence."
+   }
+  ]
+ },
+ {
+  "id": "SV-4",
+  "title": "Site proxy GET /get/<ref> lets any browser-UA client add D1 writes to the shared database, with unbounded new refs kept 400 days",
+  "severity": "high",
+  "category": "security",
+  "locations": [
+   "site-proxy/index.ts:67-75"
+  ],
+  "claim": "In the site proxy, `/get[/ref]` (site-proxy/index.ts:67-75) adds +1 to `downloads(day, ref)` in the same D1 database whenever the request is a GET from a non-bot User-Agent, with no rate limit. `ref` is any `[a-z0-9-]{1,32}`, so every new ref creates a row kept 400 days. The count happens even if the client aborts right after the headers.",
+  "scenario": "Any client with a browser User-Agent repeatedly requests `/get/<new-ref>`, adding D1 writes to the database shared with the friends Worker (contributing to the app-wide daily write-quota outage) and creating 400-day rows; download counts can be forged freely. Severity: High on Free plan, Medium on paid.",
+  "fix": "Add a rate-limit binding or a WAF rule for `/get` in the site proxy; optionally cap distinct refs per day.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "server/site-proxy/index.ts:26-27 `if (/^\\/get(\\/|$)/.test(url.pathname)) return download(request, env, ctx, refFromPath(url.pathname));` (no auth, no limiter). index.ts:67-74 `if (request.method === \"GET\" && !isBot(request.headers.get(\"User-Agent\"))) { ctx.waitUntil(env.DB.prepare(\"INSERT INTO downloads (day, ref, count) VALUES (?, ?, 1) ON CONFLICT(day, ref) DO UPDATE SET count = count + 1\").bind(utcDay(Date.now()), ref).run()); }`. The write is started before the Response is built (index.ts:76-83), so aborting after headers does not undo it. The only precondition is that release.json and the GitHub setup fetch succeed (index.ts:56-62). server/src/telemetry.ts:9 `REF_PATTERN = /^[a-z0-9-]{1,32}$/`; :69-71 refFromPath keeps any matching ref (anything else becomes \"site\"); :74-75 `isBot(userAgent) { return userAgent !== null && /bot|crawler|spider|.../i.test(userAgent); }`, so a missing UA or `curl/8.x` counts as a real download. Retention: telemetry.ts:18 `KEEP_DAYS = 400`; :118 `DELETE FROM downloads WHERE day < ?`, run by the hourly cron (server/wrangler.jsonc:29, src/index.ts:44-45). Same DB: site-proxy/wrangler.jsonc:20-26 binds database_id 67470f4b-... `clippiboy-friends`, the same one as server/wrangler.jsonc. Its comment (site-proxy/wrangler.jsonc:17-19, `Written here directly, so there is no public route anyone could call to count`) misses that /get itself is that public route. No `ratelimits` binding in site-proxy/wrangler.jsonc; the friends Worker has one (server/wrangler.jsonc:32, REPORT_LIMIT) but only for reports.",
+    "corrected_claim": "The mechanism is accurate. A few details: the file is server/site-proxy/index.ts, not site-proxy/index.ts. No browser UA is needed: any UA that misses the bot regex counts, and so does no UA at all (isBot(null) === false), so a plain curl loop works. A new (day, ref) row also writes the implicit primary-key index (probably about 2 D1 rows written, but that rests on D1 billing and cannot be seen in source). /get is not the only unauthenticated, unthrottled writer to this shared DB: POST /t/ping (server/src/index.ts:68, telemetry.ts:83-110) takes a fresh random UUID per request and writes two upserts (installs and install_days, each with secondary indexes), so it is an equal or stronger quota-burning vector. 'High on Free plan' rests on plan and limits that are not in source. Also, on Workers Free the same request volume (~50-100k/day) against any route already reaches the account's daily Workers request cap, so /get adds only a modest amount on top.",
+    "reachable_by": "Any unauthenticated internet client sending GET https://clippiboy.com/get/<any [a-z0-9-]{1,32}> with a non-bot or missing User-Agent; it can abort after headers.",
+    "fix_assessment": "A Workers rate-limit binding (like the existing REPORT_LIMIT) or a WAF rate rule on /get is the right fix, and the abuse goes away if counting is skipped when over the limit. Capping distinct refs, e.g. counting only refs from an allow-list or KV list and mapping unknown ones to 'site', would stop unbounded 400-day rows and forged per-ref stats. /t/ping needs the same treatment, or the shared-DB quota exposure stays."
+   },
+   {
+    "lens": "reach",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "server/site-proxy/index.ts:26-27 `if (/^\\/get(\\/|$)/.test(url.pathname)) return download(..., refFromPath(url.pathname));` (public, no auth). index.ts:61-62 the count only follows a successful GitHub fetch of the setup (`file = await fetch(release.setup.url, ...); if (!file.ok) throw`). index.ts:67-74 `if (request.method === \"GET\" && !isBot(request.headers.get(\"User-Agent\"))) { ctx.waitUntil(env.DB.prepare(\"INSERT INTO downloads ... ON CONFLICT(day, ref) DO UPDATE SET count = count + 1\")...run()) }`, queued before the body streams, so aborting after the headers still counts. server/src/telemetry.ts:9 `REF_PATTERN = /^[a-z0-9-]{1,32}$/`, :74-75 `isBot(userAgent) { return userAgent !== null && /bot|crawler|spider|.../i.test(userAgent) }`, so a missing UA or `curl/8.x` also counts. telemetry.ts:18 `KEEP_DAYS = 400`, :118 sweep `DELETE FROM downloads WHERE day < ?`. server/site-proxy/wrangler.jsonc:20-26 and server/wrangler.jsonc:18-24 use the same database_id 67470f4b-..., so the DB is shared. The site-proxy wrangler has no `ratelimits` binding, while the friends worker has one only for reports (server/wrangler.jsonc:32). The friends worker has a cheaper unauthenticated write path to the same DB: server/src/index.ts:69 `if (path === \"/t/ping\" && method === \"POST\") return handlePing(request, env);` takes any random UUID with no rate limit, and telemetry.ts:98-107 batches 2 upserts (installs + install_days, plus their indexes) into new 400-day rows. index.ts:55 `/auth/start` also writes on each anonymous GET.",
+    "corrected_claim": "The mechanism is right: anyone on the internet can call GET clippiboy.com/get/<ref> with no rate limit and add a D1 upsert to the database shared with the friends Worker. Each new [a-z0-9-]{1,32} ref per day creates a row kept 400 days, and download counts can be forged freely. Two details are wrong or overstated. (1) No browser User-Agent is needed: isBot(null) is false and curl's default UA passes, so any client counts. The one real precondition is that the Worker's GitHub fetch of the setup file succeeds, since only then is the write queued. (2) This is not a unique or strongest way to exhaust the daily write quota. The friends Worker's anonymous POST /t/ping (server/src/index.ts:69) is cheaper for an attacker: there is no GitHub subrequest or installer stream, it writes about 2 or more rows per request, and each random UUID creates new 400-day rows. /auth/start also writes per anonymous GET. On the Free plan the account-wide limit of 100k Worker requests a day is hit at roughly the same request volume, so /get adds little extra DoS power. What is unique to /get is that the per-link download stats can be forged. Severity is medium, not high.",
+    "reachable_by": "Any internet user, with no account, cookie or special UA, by looping GET https://clippiboy.com/get/<anything> (curl works). It is likely to work as long as GitHub serves the setup asset. Zone-level Cloudflare WAF or rate-limit rules, if any, cannot be seen from the source.",
+    "fix_assessment": "A rate-limit binding (per IP) around the /get counter, or a cap on new distinct refs per day, is the right local fix and is cheap. It does not close the quota-exhaustion risk unless /t/ping (and /auth/start) on the friends Worker get the same treatment, because they write to the same DB more cheaply."
+   },
+   {
+    "lens": "impact",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/site-proxy/index.ts:26-27 `if (/^\\/get(\\/|$)/.test(url.pathname)) return download(..., refFromPath(url.pathname));` | :67-74 `if (request.method === \"GET\" && !isBot(request.headers.get(\"User-Agent\"))) { ctx.waitUntil(env.DB.prepare(\"INSERT INTO downloads (day, ref, count) VALUES (?, ?, 1) ON CONFLICT(day, ref) DO UPDATE SET count = count + 1\")...` (registered before the body is streamed, so it runs even if the client aborts after headers). server/src/telemetry.ts:9 `REF_PATTERN = /^[a-z0-9-]{1,32}$/`; :74-75 `isBot` is a UA substring blocklist and `isBot(null)` is false, so a missing UA counts too; :18 `KEEP_DAYS = 400`, :118 sweep `DELETE FROM downloads WHERE day < ?`. server/site-proxy/wrangler.jsonc:20-27 binds the same D1 `clippiboy-friends` (id 67470f4b...) and declares no `ratelimits`; server/wrangler.jsonc:32 has only REPORT_LIMIT. migrations/0006_usage.sql:6-11 `PRIMARY KEY (day, ref)` (rowid table + autoindex, so a new ref costs about 2 rows written and a repeat ref about 1). server/src/shares.ts:13-14 confirms the Free plan.",
+    "corrected_claim": "The code works as described: every GET to clippiboy.com/get/<ref> from a client whose User-Agent is missing or not on the blocklist does one D1 upsert in the shared friends database. There is no rate limit, the ref is any [a-z0-9-]{1,32}, and rows are kept 400 days. The file is server/site-proxy/index.ts, not site-proxy/index.ts. Severity is overstated. Each counted request is also a Workers request, and on the Free plan the account has 100k requests a day in total. That means /get gives an attacker at most about 2x leverage over flooding any URL on clippiboy.com or api.clippiboy.com, which already takes the backend down with no D1 involved. It reaches about 100k rows written with roughly 50k new-ref requests, against 100k plain requests. SV-2 (/t/ping, about 6 rows per request) is the cheaper route to the same write-quota outage. Row growth is capped by the same request quota, at about 100 bytes a row. What is left is a modest extra DoS path and download analytics that anyone can forge and fill with junk refs. That is low, or at most medium. It is not high.",
+    "reachable_by": "Any unauthenticated internet client sending GET https://clippiboy.com/get/<anything> with no User-Agent or a non-bot one. It can abort right after the response headers and the count is still written.",
+    "fix_assessment": "A rate-limit binding (or a WAF rule) in the site proxy is the right direction, but it should gate only the counting and never the download. Behind CGNAT many real users share one IP. Also, simple rate limits are counted per Cloudflare location, so a spread-out attacker is slowed down, not stopped. Minimal fix: add a ratelimits binding to server/site-proxy/wrangler.jsonc and run the INSERT only when `await env.DL_LIMIT.limit({ key: request.headers.get(\"CF-Connecting-IP\") ?? \"\" })` succeeds. To stop junk rows, map refs that are not on an allowlist (or a small set of known campaign prefixes) to \"other\", so the table grows by at most known refs times days. A per-day cap on distinct refs would add D1 reads to every request. The real fix for the shared-quota outage is the same throttling on /t/ping (SV-2), so both should be fixed together."
+   }
+  ]
+ },
+ {
+  "id": "SV-40",
+  "title": "Privacy page: 'does not store your IP address' may be undermined by invocation logs",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [
+   "wrangler.jsonc:8",
+   "server/wrangler.jsonc",
+   "site/privacy.html",
+   "server/wrangler.jsonc:8",
+   "site/privacy.html:93"
+  ],
+  "claim": "The privacy page says 'Our server does not store your IP address with it.' That is true for D1, but `observability.enabled` (wrangler.jsonc:8) turns on invocation logs, which may record request metadata (time, path `/t/ping`, possibly IP and headers) for some days.",
+  "scenario": "Invocation logs retain per-request metadata, possibly including IPs, for `/t/ping` calls. Speculative: check in the dashboard.",
+  "fix": "Consider turning invocation logs off or excluding `/t/ping`.",
+  "reported_confidence": "speculative",
+  "slice": "08-server",
+  "severity_reported": "low",
+  "also": [
+   {
+    "id": "NW-28",
+    "slice": "06-network",
+    "title": "Cloudflare observability logs cover /t/ping but the usage-statistics section doesn't mention it",
+    "claim": "\"Our server does not store your IP address with it\" is true for D1, but `wrangler.jsonc` has `\"observability\": { \"enabled\": true }`, so Cloudflare request logs (IP, location, time) also cover `/t/ping` for a few days. The friends section mentions Cloudflare logs; the usage-statistics section does not.",
+    "locations": [
+     "server/wrangler.jsonc",
+     "site/privacy.html"
+    ],
+    "fix": "Mention Cloudflare request logs in the usage-statistics section (worth confirming in the dashboard)."
+   },
+   {
+    "id": "SC-46",
+    "slice": "11-supply-chain",
+    "title": "Privacy page's \"no IP stored\" telemetry statement vs. enabled Workers observability logs",
+    "claim": "site/privacy.html says \"Our server does not store your IP address with it\" for the telemetry ping. That is true for the D1 rows, but the friends Worker has `\"observability\": {\"enabled\": true}` (server/wrangler.jsonc:8), so Workers Logs keep request metadata for /ping; this is disclosed only in the Friends section (site/privacy.html:93).",
+    "locations": [
+     "server/wrangler.jsonc:8",
+     "site/privacy.html:93"
+    ],
+    "fix": "None stated (flagged as \"Watch\")."
+   }
+  ],
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/wrangler.jsonc:8 `\"observability\": { \"enabled\": true }` applies to the whole clippiboy-friends Worker, which serves /t/ping (server/src/index.ts:69). The ping code does not log itself: telemetry.ts handlePing has no console call, and server/src console.* calls are only error paths (index.ts:40,189,301, hub.ts:235,260, links.ts:254). site/privacy.html:74 says \"Our server does not store your IP address with it\", which is accurate for D1 (the installs/install_days columns have no address). site/privacy.html:93: \"Cloudflare keeps logs of requests to the server, for example with time, address and errors ... Cloudflare deletes them after a few days.\" This sits in the Friends section, but 'the server' is the same api.clippiboy.com named for pings at :66.",
+    "corrected_claim": "The page does disclose Cloudflare request logs with address for api.clippiboy.com (privacy.html:93). The disclosure is in the Friends section, though, and the usage-statistics section (:74) does not mention or point to it. So the D1 statement is true, and the gap is placement and clarity rather than an untrue statement. What Workers Logs invocation records actually contain (URL/path certainly; IP or headers possibly) and how long they are kept is Cloudflare platform behaviour that cannot be checked from the repo.",
+    "reachable_by": "Every daily ping from every app with usage stats enabled, as a Workers Logs invocation record, if those records include client IP or headers.",
+    "fix_assessment": "Adding one sentence to the usage-statistics section that refers to the request logs (as NW-28 suggests) is the smallest correct fix. Turning off invocation logs (observability.logs.invocation_logs: false) or lowering head_sampling_rate would also work, but costs error visibility for the whole friends server."
+   }
+  ]
+ },
+ {
+  "id": "SV-41",
+  "title": "Privacy page: 'database is located in Western Europe' unverifiable; Hub DO storage not pinned to EU",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [],
+  "claim": "The privacy page says 'The database is located in Western Europe.' The D1 and R2 locations cannot be verified from the repo. The Hub Durable Object storage (presence, status text, game, last seen) is not pinned to a jurisdiction (no `jurisdiction(\"eu\")`), so it is created wherever the user first connects.",
+  "scenario": "A user who first connects from outside Europe gets their presence, status, game and last-seen data stored outside Western Europe.",
+  "fix": "Not stated explicitly; implied: pin the Hub namespace with `jurisdiction(\"eu\")` and verify D1/R2 locations, or adjust the wording.",
+  "reported_confidence": "likely",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/wrangler.jsonc:33-36: `\"durable_objects\": { \"bindings\": [{ \"name\": \"HUB\", \"class_name\": \"Hub\" }] }`, with no jurisdiction. Every caller uses the plain namespace: server/src/index.ts:85 `env.HUB.getByName(me)`, index.ts:299 `env.HUB.getByName(id).friendsChanged()`, index.ts:389, hub.ts:233 `this.env.HUB.getByName(id).friendPresence(...)`, hub.ts:257, hub.ts:270 `.card()`. grep finds no `jurisdiction` or `locationHint` anywhere in server/src. Hub storage holds personal data: hub.ts:226 `this.ctx.storage.put({ [PUBLISHED]: next, [LAST_SEEN]: lastSeen })` (game, since, status text, busy, last seen). site/privacy.html:80: \"The database is located in Western Europe.\" No D1 location is recorded in the repo (none in wrangler.jsonc, README or scripts).",
+    "corrected_claim": "The Hub Durable Object namespace is not pinned to an EU jurisdiction, and it stores the status text, game, since and last-seen data listed under 'What is stored'. The D1 location cannot be verified from the repo. Two details are wrong. First, the page makes no location claim for R2: it says only 'stored in Cloudflare R2' at privacy.html:100. Second, a Hub is not necessarily placed 'where the user first connects'. Cloudflare places it near the first getByName caller, which can be a friend's request (notify at index.ts:299 on a friend request) or a friend's Hub (hub.ts:233 and :270). Exact placement is Cloudflare platform behaviour that cannot be checked from source.",
+    "reachable_by": "Any friends-feature user whose Hub is first touched from outside Europe, either by their own connection or by a friend's action. Their presence, status and last-seen data then live outside Western Europe.",
+    "fix_assessment": "`env.HUB.jurisdiction(\"eu\").getByName(...)` at all six call sites pins storage to the EU, but it creates new object IDs, so existing Hub state (lastSeen, published presence) is orphaned; that is acceptable here. 'EU' is also not literally 'Western Europe'. The alternative is to reword the page to cover only D1, after confirming its location hint in the dashboard."
+   }
+  ]
+ },
+ {
+  "id": "SV-48",
+  "title": "Missing tests: authorization matrix",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [],
+  "claim": "No test covers the authorization matrix: cross-user `DELETE` and poster `PUT` on shares, accept by the requester, and block and friendship interactions.",
+  "scenario": "A regression in owner or recipient-only checks would not be caught.",
+  "fix": "Add integration tests for these cases.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Only tests: server/src/shares.test.ts and telemetry.test.ts (pure functions; package.json `\"test\": \"node --test src/*.test.ts\"`), and no workflow in .github/workflows runs server tests. Share ownership is untested: links.ts:146-155 `owned()` -> `if (row.owner !== me) throw new HttpError(403, ...)`, used by putPoster (links.ts:274) and deleteShare (links.ts:292); nothing calls /shares in any test or in scripts/e2e.mjs. But the friend side IS exercised by server/scripts/e2e.mjs (README 'Test' section): e2e.mjs:89 `check(\"A cannot accept own request\", (await api(A, \"POST\", `/friends/${B.id}/accept`)).status === 404)`; e2e.mjs:141-147 `B blocks A` -> `friendship gone after block` -> `blocked A sees 'not found'` (404) -> `B's block list has A`; e2e.mjs:73,88 self request 400, duplicate 409.",
+    "corrected_claim": "Accept-by-the-requester and the main block/friendship interactions (block removes the friendship, the blocked user's request answers 404, block list) are covered by the manual integration script server/scripts/e2e.mjs, though it is not part of `npm test` or CI. What has no test anywhere is the share ownership check: DELETE /shares/<id> and PUT /shares/<id>/poster by a non-owner (403 from links.ts:153), plus smaller friend cases (blocker requesting the blocked user -> 409, allow_requests off -> 403, relay after a block).",
+    "reachable_by": "Not a runtime defect; affects any future change to owned()/acceptRequest/blockUser, which would regress without a failing test.",
+    "fix_assessment": "Extending scripts/e2e.mjs with a cross-account DELETE and poster PUT (expect 403) is the cheapest fix; running it (or a Miniflare/vitest-pool-workers suite) in CI would make it a real guard."
+   }
+  ]
+ },
+ {
+  "id": "SV-52",
+  "title": "Missing tests: Hub behaviour",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [],
+  "claim": "No test covers the Hub: relay to a non-friend, relay to an invisible friend, relay budget across several sockets, presence fan-out only to accepted friends, the stale-socket alarm, and `closeAll`.",
+  "scenario": "The per-socket relay budget bypass (SV-6) and invisible-probe leak (SV-7) shipped undetected.",
+  "fix": "Add Durable Object integration tests for these cases.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/scripts/e2e.mjs drives the real Hub over WebSockets and does cover relay to a non-friend: e2e.mjs:120-122 `relay ... to: \"...0000000000ff\"` -> `check(\"relay refuses strangers\", stranger?.reason === \"not a friend\")`, plus relay too big (117-119), relay to offline friend (131-133), invisible presence looks offline (99-102), snapshots and live presence. Not covered: relay to an invisible friend (hub.ts:158-162 `relay()` sends to every `ready` socket, ignores `invisible`), several sockets sharing the budget (hub.ts:51 `relayed = new Map<WebSocket, ...>`, hub.ts:248-252), a negative check that non-accepted users get no presence (db.ts:64 `status = 'accepted'`), alarm() stale close (hub.ts:119-136), closeAll() (hub.ts:178-187). The per-connection budget is the documented design: hub.ts:38 `Per connection, per window`, README 'at most 4 KB and 30 messages per 10 s per connection'.",
+    "corrected_claim": "Relay to a non-friend is tested (scripts/e2e.mjs:120-122, a manual script outside npm test/CI). Untested: relay to an invisible friend, budget across several sockets, negative presence fan-out to pending/non-friends, the stale-socket alarm and closeAll. The scenario overstates what tests would have caught: the per-connection relay budget is the documented spec (README, hub.ts:38), so a test written to that spec would pass; SV-7 would only be caught by a test that expected invisible users to get relayFailed 'offline'.",
+    "reachable_by": "Not a runtime defect; future Hub changes.",
+    "fix_assessment": "Most of these can be added to scripts/e2e.mjs (second socket for the same user, invisible relay, pending-request fan-out); the alarm and closeAll need a Miniflare/vitest-pool-workers Durable Object test with controllable time."
+   }
+  ]
+ },
+ {
+  "id": "SV-53",
+  "title": "Missing tests: body limits",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [],
+  "claim": "No test covers body limits: `handlePing`, report and `body()` with chunked oversized bodies, and with `null` or array JSON.",
+  "scenario": "The unbounded-body (SV-8) and null-body 500 (SV-15) issues shipped undetected.",
+  "fix": "Add tests for these cases.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "The only server tests are src/shares.test.ts, src/telemetry.test.ts and scripts/e2e.mjs (git ls-files). None of them call handlePing (telemetry.ts:83), reportShare (links.ts:315) or body() (util.ts:16). util.ts cannot even be loaded by `node --test` (see telemetry.ts:5-6: \"util.ts uses syntax type stripping does not cover\"). e2e.mjs only posts a valid object `{code:\"x\",verifier:\"y\"}` to /auth/exchange and never hits /t/ping or /c/<id>/report. Not covered: chunked or oversized bodies on any of the three. Already covered: null JSON for the ping and report validators. telemetry.test.ts:37 passes `null` and expects cleanPing to return null, and shares.test.ts:129 has `assert.equal(cleanReport(null), null)`. Both validators start with `if (!raw || typeof raw !== \"object\") return null`, so an array also gives 400 (telemetry.ts:37, shares.ts:145).",
+    "corrected_claim": "Untested: oversized or chunked bodies on handlePing, reportShare and body(), and null or array bodies on body() callers (index.ts:94, 103, 212), which is where the SV-15 500 comes from. Null and array JSON on the ping and report routes cannot 500: cleanPing and cleanReport reject them, and both are unit-tested with null.",
+    "reachable_by": "Developers changing the request-handling code; the gaps hide unauthenticated DoS-style body reads (/auth/exchange, /t/ping, /c/<id>/report) and the body() null 500.",
+    "fix_assessment": "Worth adding handler-level tests, but body() lives in util.ts, which plain `node --test` cannot load. That needs Miniflare or vitest-pool-workers, or moving the size guard into an import-free module like telemetry.ts. Note that no CI workflow runs `npm test` in server/ at all."
+   }
+  ]
+ },
+ {
+  "id": "SV-55",
+  "title": "Missing tests: Range and conditional requests",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [],
+  "claim": "No test covers Range and conditional requests: unsatisfiable, multi-range, suffix ranges, `If-None-Match`, HEAD.",
+  "scenario": "The incorrect 206-with-full-body behaviour (SV-18) went undetected.",
+  "fix": "Add tests for these cases.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "shareFile (links.ts:378-407) is never exercised by any test or by e2e.mjs. Only the pure helper byteRange is tested, and that test includes a suffix range: shares.test.ts:73 `assert.deepEqual(byteRange({ suffix: 50 }, 1000), { offset: 950, length: 50 })`. There are no tests for unsatisfiable or multi-range requests, If-None-Match, or HEAD. Two notes from the source: (1) If-None-Match is not implemented at all. links.ts:383 passes only `{ range: request.headers }` and no `onlyIf`, so a test would be checking behaviour that does not exist. (2) In miniflare, an invalid or multi-range header makes `validate.range` return undefined (bucket.worker.js:521-524). R2 then reports the full default range (bucket.worker.js:955-956), so `ranged` is true at links.ts:397 and the response is a 206 with the whole body. Only an R2-backed integration test, not a byteRange unit test, would expose that.",
+    "corrected_claim": "Suffix ranges are covered at the byteRange level (shares.test.ts:73). What is missing is any handler-level test of shareFile: unsatisfiable, malformed and multi-range requests, HEAD, and conditional requests (which are not implemented).",
+    "reachable_by": "Developers changing media serving; anyone who sends crafted Range headers to /c/<id>.mp4.",
+    "fix_assessment": "Handler tests against Miniflare R2 would catch the 206-with-full-body bug. If-None-Match support has to be built (by passing onlyIf or checking the ETag) before it can be tested."
+   }
+  ]
+ },
+ {
+  "id": "SV-56",
+  "title": "Missing tests: site proxy",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [],
+  "claim": "No test covers the site proxy: `refFromPath`, HEAD not counted, bots not counted, the Location rewrite, and pinning of `release.setup.url`.",
+  "scenario": "Regressions in download counting, the Location rewrite (SV-37) or release URL pinning (SV-14) go undetected.",
+  "fix": "Add tests for these cases.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "low",
+    "evidence": "Nothing tests the site-proxy worker (site-proxy/index.ts) itself: the Location rewrite (lines 37-42), the GET-only and non-bot counting gate (line 67, `request.method === \"GET\" && !isBot(...)`), and HEAD returning a null body (line 83) are all untested. Two of the listed items are tested, though. refFromPath has its own test at telemetry.test.ts:47-54 (`/get/tiktok1`, upper case, `/get`, `/get/`, `/get/Bad!`, a 33-character ref). isBot is tested at telemetry.test.ts:56-68, covering Discordbot, Googlebot, facebookexternalhit, WhatsApp, TelegramBot, Embedly and null. And release.setup.url is never pinned: line 61 is `file = await fetch(release.setup.url, { method: request.method })` with no origin check. A test of pinning would test a feature that does not exist.",
+    "corrected_claim": "refFromPath and the bot detection (isBot) are unit-tested in telemetry.test.ts. What is untested is the site-proxy handler: the Location rewrite (including the `//` case from SV-37), the rule that only GETs from non-bots are counted, and HEAD handling. release.setup.url has no pinning to test; SV-14 needs that code first.",
+    "reachable_by": "Developers changing site-proxy/index.ts; download-count accuracy and the redirect behaviour on clippiboy.com.",
+    "fix_assessment": "Handler tests with a stubbed fetch and D1 would cover the rewrite and the counting gate. For SV-14, the URL check must be written first, and then tested."
+   }
+  ]
+ },
+ {
+  "id": "SV-29",
+  "title": "Note: MP4/HTML polyglots are accepted; safety relies on fixed video/mp4 type plus nosniff",
+  "severity": "info",
+  "category": "security",
+  "locations": [
+   "shares.ts:173-216"
+  ],
+  "claim": "The MP4 checker accepts an MP4/HTML polyglot (ftyp + moov + size-0 mdat + HTML). This is by design, and it is safe only because media is served with a fixed `video/mp4` type plus `nosniff`.",
+  "scenario": "Repro: the polyglot was accepted. If the fixed Content-Type or `nosniff` were ever dropped, the upload could be interpreted as HTML.",
+  "fix": "Keep the fixed `video/mp4` type and `nosniff` (and document the polyglot case in tests).",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "server/src/shares.ts:176 `if (this.toEnd) return true;` and :208-209 `if (size === 0) { this.toEnd = true; }` mean any box of size 0 swallows the rest of the upload. :191 `end()` accepts `(this.skip === 0 || this.toEnd) && this.moov`. The doc comment at :158-160 already says so: \"What it cannot rule out is a payload inside a box ... served as video with `nosniff`, which is what keeps such a file a (broken) video.\" Reproduced by running a copy of shares.ts under node 22 in the scratchpad: ftyp+moov+size-0 mdat+HTML -> true; ftyp+moov+`free` box holding HTML -> true; ftyp+size-0 moov+HTML -> true. Serving: links.ts:247 `env.CLIPS.put(video(id), ..., { httpMetadata: { contentType: \"video/mp4\" } })` is set by the server and never comes from the client; links.ts:387 `object.writeHttpMetadata(headers)`, :391 `X-Content-Type-Options: nosniff`, :392 `Content-Disposition: inline`. Media is served from MEDIA_ORIGIN `https://api.clippiboy.com` (links.ts:34). shares.ts:203 requires the first box to be `ftyp` with size 16..1024, so byte 0 of every accepted file is a binary size byte (0x00), not '<' or whitespace.",
+    "corrected_claim": "Polyglots really are accepted, and through more than a size-0 mdat: a `free`/`skip`/`mdat` box of normal size with HTML in it, or a size-0 moov, also passes. The doc comment at shares.ts:156 (\"anything hung on behind, fails\") does not hold for a size-0 last box. The comment at :158-160 already admits the polyglot case, so it is known. The safety reasoning is overstated, though. What matters is the declared `video/mp4` type, which the server sets itself (links.ts:247). Browsers do not turn a response declared as video/mp4 into HTML whether or not nosniff is sent, so losing nosniff alone changes nothing. Because the checker forces a binary ftyp header at offset 0, the HTML-sniffing patterns (which match only at the start, after whitespace) would not match even with no Content-Type at all. The file would sniff as MP4 or octet-stream. The case that would actually make it HTML is a regression that labels the object text/html (or similar), and no client input can cause that.",
+    "reachable_by": "Any signed-in, non-banned account can upload such a file through POST /shares (createShare, links.ts:171) within its weekly quota. It only becomes dangerous if a future server change serves R2 objects with an HTML-capable Content-Type. No client-controlled path does this today.",
+    "fix_assessment": "Keeping the server-fixed video/mp4 type and nosniff is right, and so is adding a test that pins the polyglot case. Also fix the shares.ts:156 comment. Defense in depth could serve media from a cookieless origin separate from the API (api.clippiboy.com carries the cb_login state cookie and the API) or add `Content-Security-Policy: sandbox`. Only re-encoding would actually rule out embedded payloads."
+   }
+  ]
+ },
+ {
+  "id": "SV-34",
+  "title": "workers_dev: true lets anyone bypass zone-level WAF and rate-limit rules",
+  "severity": "low",
+  "category": "security",
+  "locations": [],
+  "claim": "The friends Worker has `workers_dev: true`, so it is reachable at its `*.workers.dev` address in addition to `api.clippiboy.com`, which lets anyone bypass zone-level WAF and rate-limit rules.",
+  "scenario": "An attacker targets the workers.dev address to avoid any WAF or zone rate-limit rule added for api.clippiboy.com.",
+  "fix": "Turn off `workers_dev`.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "server/wrangler.jsonc:9-12 `// The app talks to api.clippiboy.com. The workers.dev address stays on, so builds from before the domain keep working.` ... `\"workers_dev\": true,`. README.md:7-8,22-23 keeps the workers.dev URL as a registered Discord redirect, and scripts/e2e.mjs:11 defaults to it. The only rate limits in source are hostname-independent and run inside the Worker: wrangler.jsonc:32 REPORT_LIMIT binding used at links.ts:318-319, and the relay limits in the Hub DO. No zone WAF or rate-limit rule is defined or referenced anywhere in the repo.",
+    "corrected_claim": "The Worker really is reachable at clippiboy-friends.fabian081964.workers.dev, on purpose, for pre-domain builds. That only bypasses zone-level WAF or rate-limit rules if such rules exist on the clippiboy.com zone, and none are defined here. Every limit the code itself enforces (the REPORT_LIMIT binding, the Hub relay caps) applies on both hostnames. So this is a defence-in-depth note, not a present bypass. That workers.dev traffic skips zone rules is Cloudflare platform behaviour and cannot be checked from source.",
+    "reachable_by": "Anyone, but only against zone-level rules that the owner adds in the Cloudflare dashboard; nothing in the repository is bypassed today.",
+    "fix_assessment": "Turning workers_dev off breaks builds from before the domain (and the e2e default and the second Discord redirect), so it needs those builds to be retired first. Until then, keep any protective limits inside the Worker (rate-limit bindings), where they cover both hostnames."
+   }
+  ]
+ },
+ {
+  "id": "SV-35",
+  "title": "QUICK_LINKS_FOR is read from env through a cast and missing from secrets.d.ts",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "links.ts:67"
+  ],
+  "claim": "`QUICK_LINKS_FOR` reaches `env` through a cast (links.ts:67) and is missing from `secrets.d.ts`.",
+  "scenario": "Type checking cannot catch a misspelled or missing `QUICK_LINKS_FOR` binding.",
+  "fix": "Not stated explicitly; implied: declare `QUICK_LINKS_FOR` in `secrets.d.ts` and drop the cast.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "server/src/links.ts:66-68 `const list = (env as Env & { QUICK_LINKS_FOR?: string }).QUICK_LINKS_FOR ?? \"\";`. server/src/secrets.d.ts:2-4 declares only `DISCORD_CLIENT_SECRET: string;`, and the generated worker-configuration.d.ts:4-10 __BaseEnv_Env has no QUICK_LINKS_FOR. It is the only use site (grep). tsconfig.json includes src, so a declaration in secrets.d.ts would be picked up.",
+    "corrected_claim": "The cast exists and secrets.d.ts omits the variable, but the stated consequence is overstated. QUICK_LINKS_FOR is optional by design: unset means 'changes nothing' (links.ts:61-63). TypeScript cannot detect a missing or misspelled secret set with `wrangler secret put`, whether or not it is declared. A code-side misspelling at this single use site would be just as uncaught with a misspelled declaration. Moving the type into secrets.d.ts is a consistency cleanup, not a fix for a reachable failure.",
+    "reachable_by": "Developers editing the code; no runtime or user-facing effect.",
+    "fix_assessment": "Declare it as optional (`QUICK_LINKS_FOR?: string;`) in secrets.d.ts and drop the cast. Declaring it as required `string` would be wrong, because it is normally unset."
+   }
+  ]
+ },
+ {
+  "id": "SV-44",
+  "title": "Privacy page: 'Delete account removes everything immediately' is not fully true",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [],
+  "claim": "The privacy page says deleting the account removes everything 'immediately'. Media can survive in caches for up to an hour (`public, max-age`); `logins` rows stay until the next sign-in start; reports referencing the share IDs stay 30 days (they hold no personal data).",
+  "scenario": "After account deletion, clips remain fetchable from caches for up to an hour and login rows remain until someone next starts a sign-in.",
+  "fix": "Shorten/privatise media caching and sweep logins in the cron (see SV-19, SV-22), or adjust the wording.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "site/privacy.html:104 lists only 'your account, sign-ins, friendships, blocks, online status and share links are removed immediately'; it does not say 'everything'. deleteAccount (server/src/index.ts:383-391) does remove each of these in the request: R2 objects via deleteSharesOf (links.ts:301-306), 'DELETE FROM users' with ON DELETE CASCADE on sessions/friendships/blocks/shares (migrations/0001_init.sql:20,38-39,49-50; 0002_shares.sql owner REFERENCES users ON DELETE CASCADE), and Hub storage via closeAll -> 'await this.ctx.storage.deleteAll()' (hub.ts:177-187). Residue that is real: links.ts:395 'headers.set(\"Cache-Control\", `public, max-age=${Math.min(left, 3600)}`)'; logins.user_id has no FK (0001_init.sql:28-34) and stale rows are only removed by 'DELETE FROM logins WHERE created_at < ?' in authStart (index.ts:139); a consumed login is already deleted in authExchange (index.ts:218). Reports keep only share_id/reason/note (0005_moderation.sql) and are swept after 30 days (links.ts:447).",
+    "corrected_claim": "Every item the page lists is deleted server-side, synchronously, in DELETE /me. A new request for a deleted clip gets 410, because the share row is cascade-deleted and live() returns null (links.ts:139-143, 381). The cache residue is only in the HTTP cache of a viewer who already loaded the clip or poster; it can replay from there for up to an hour. Cloudflare does not put responses a Worker generates into its edge cache unless the Cache API is used, which this code does not do, so a new viewer cannot fetch the clip from any cache we run. That part rests on platform behaviour and cannot be checked from source. The logins leftover only exists for a login that went through the callback but was never exchanged. It holds an orphaned UUID, an unused code and a challenge hash, and the next /auth/start by anyone removes it. The page does not list logins among the deleted items ('sign-ins' means sessions, privacy.html:88). This is a minor wording or retention nit, not a false promise.",
+    "reachable_by": "Any user who deletes their account. The only exposure is a viewer who had already opened their share link and replays it from that viewer's own browser cache within the hour.",
+    "fix_assessment": "Switching media to 'private, max-age=...' (or no-cache with ETag) and adding a logins sweep to the hourly cron (SV-19, SV-22) would remove the remaining edge cases cheaply. Adjusting the wording alone would also be acceptable."
+   }
+  ]
+ },
+ {
+  "id": "SV-45",
+  "title": "README: sessions 'expire after 180 days' but rows are kept",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [],
+  "claim": "The README says sessions 'expire after 180 days'. They are rejected after that, but the rows are kept until the account is deleted.",
+  "scenario": "Session rows of long-inactive users persist indefinitely despite the documented expiry.",
+  "fix": "Delete stale sessions in the cron (see SV-21).",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "server/README.md:36-37 'Sessions are stored as hashes and expire after 180 days without use.' server/src/db.ts:125 'const SESSION_IDLE_MS = 180 * 24 * 60 * 60 * 1000;' and :139-141 'if (!session || now - session.last_used > SESSION_IDLE_MS) { throw new HttpError(401, ...) }', before the touch at :143-145, so an expired session never revives. No code deletes expired rows: sweep() (links.ts:419-448) and sweepUsage() (telemetry.ts:114-121) never touch sessions. Rows are only removed by logout (index.ts:87-90 'DELETE FROM sessions WHERE token_hash = ?') or by the cascade on account deletion (0001_init.sql:20).",
+    "corrected_claim": "The facts are right: idle sessions older than 180 days are rejected but their rows (token_hash, user_id, created_at, last_used) stay until logout or account deletion. The README is not actually contradicted, though. It says the sessions 'expire after 180 days without use' and they do, because the code refuses them. It never promises deletion. The privacy page also says this data 'stays stored until you delete your account' (privacy.html:104), so what is stored is disclosed. The real issue is a storage-limitation gap that keeps dead rows, the same as SV-21, not a documentation error.",
+    "reachable_by": "Passive: any user who stops using a device without signing out leaves an unusable session row behind indefinitely.",
+    "fix_assessment": "Adding 'DELETE FROM sessions WHERE last_used < ?' (now - SESSION_IDLE_MS) to the hourly cron is a one-line fix and makes the wording literally true. It belongs with SV-21."
+   }
+  ]
+ },
+ {
+  "id": "SV-50",
+  "title": "Missing tests: Mp4Boxes edge cases",
+  "severity": "low",
+  "category": "test-gap",
+  "locations": [],
+  "claim": "No test covers `Mp4Boxes` edge cases: size-0 box to the end of the file, 64-bit largesize, size smaller than the header, `ftyp` over 1 KB, very many tiny boxes (CPU), and the documented polyglot case.",
+  "scenario": "The box-count CPU issue (SV-28) and regressions in box parsing go undetected.",
+  "fix": "Add unit tests for these cases.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "shares.test.ts:85-109 has three Mp4Boxes tests, all built with a `box()` helper that always writes size = 8 + body: whole MP4 in 1- and 1000-byte chunks; `an ftyp glued in front of something else fails` (ftyp size 8 + ZIP `0x50,0x4b,3,4`, and real ftyp + ZIP); `an MP4 with something hung on behind, or without moov, fails` (trailing `0x50,0x4b`, no moov, MZ header). Nothing exercises shares.ts:198/200 (size32 === 1 largesize), shares.ts:208-209 (size 0 -> toEnd), shares.ts:210 `size < h.length` for a non-first box, shares.ts:203 `size > 1024` for ftyp, or a high box count. A probe against the real class (scratchpad sv5x/probe.mjs) shows these branches currently behave correctly: size-0 moov -> true, largesize mdat -> true, size-4 box -> false, 1100-byte ftyp -> false.",
+    "corrected_claim": "Five of the six cases are untested (size-0 box, 64-bit largesize, non-first box smaller than its header, ftyp over 1 KB, very many tiny boxes). The polyglot cases the doc comment says are caught (shares.ts:155-156: ftyp glued in front, anything hung on behind) ARE tested at shares.test.ts:99-109 with ZIP signatures; only the documented-as-uncatchable payload inside a box has no test. The untested branches work today, so the gap is regression protection; the SV-28 box-count issue is a missing limit that no test would catch until a cap is chosen.",
+    "reachable_by": "Not a runtime defect; future edits to Mp4Boxes.readHeader.",
+    "fix_assessment": "Easy to add to shares.test.ts with the existing walk() helper (shares.ts imports nothing, so it runs under the current `node --test`); a box-count test makes sense together with the SV-28 cap."
+   }
+  ]
+ },
+ {
+  "id": "SV-37",
+  "title": "Site proxy Location rewrite can produce a protocol-relative URL",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "site-proxy/index.ts:41"
+  ],
+  "claim": "The site proxy's Location rewrite `location.slice(\"/clippiboy\".length)` (site-proxy/index.ts:41) would turn `/clippiboy//x` into the protocol-relative `//x`.",
+  "scenario": "An upstream redirect to `/clippiboy//x` is rewritten to `//x`, which the browser resolves as a different host. Speculative.",
+  "fix": "Only rewrite results that start with a single `/`.",
+  "reported_confidence": "speculative",
+  "slice": "08-server",
+  "status": "unverified",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "unverifiable",
+    "severity_suggestion": "info",
+    "evidence": "server/site-proxy/index.ts:37-41: `const location = response.headers.get(\"Location\"); if (location?.startsWith(ORIGIN)) {...} else if (location?.startsWith(\"/clippiboy\")) { response.headers.set(\"Location\", location.slice(\"/clippiboy\".length) || \"/\"); }`. A Location of `/clippiboy//x` does become `//x`, and `/clippiboyfoo` becomes the relative `foo`. The upstream fetch at :29 uses `${ORIGIN}${url.pathname}` with redirect: \"manual\", so the request path reaches GitHub Pages as sent. The only directories in the published site are site/img and site/fonts (find site -type d).",
+    "corrected_claim": "The string handling is as described. Whether it ever matters depends on GitHub Pages sending a root-relative Location starting with `/clippiboy//`. That would need (a) GitHub Pages to use relative rather than absolute (https://einfabo.github.io/clippiboy/...) Location headers, which the first branch at :38 already handles, and (b) it to keep a double slash from a request like clippiboy.com//img. Even then the target \"host\" could only be an existing directory name (img, fonts), because WHATWG URL parsing collapses `..` segments, so an attacker cannot choose a host. The result would be a broken redirect, not an open redirect.",
+    "reachable_by": "Only a visitor who opens a crafted URL such as clippiboy.com//img, and only if GitHub Pages sends a root-relative Location that keeps the double slash. That cannot be determined from source.",
+    "fix_assessment": "Cheap hardening: rewrite only when the location is exactly `/clippiboy` or starts with `/clippiboy/`, and collapse a leading run of slashes in the result to one (or always emit an absolute HOME + path). That closes both the `//x` and the `/clippiboyfoo` cases."
+   }
+  ]
+ },
+ {
+  "id": "SV-14",
+  "title": "The download endpoint trusts release.setup.url without pinning it",
+  "severity": "medium",
+  "category": "supply-chain",
+  "locations": [
+   "site-proxy/index.ts:61"
+  ],
+  "claim": "site-proxy/index.ts:61 streams whatever URL `release.json` (read from Pages) names in `release.setup.url`, served as `ClippiBoy_<v>_x64-setup.<ref>.exe` from clippiboy.com, without validating the URL origin or the version format.",
+  "scenario": "Any compromise of the Pages content, the bake workflow, or the `einfabo` GitHub namespace makes the official domain serve an arbitrary binary. Severity: Low-Medium.",
+  "fix": "Require `setup.url` to start with `https://github.com/EinFabo/clippiboy/releases/download/` and `version` to match `^\\d+\\.\\d+\\.\\d+$`.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "SV-43",
+  "title": "Privacy page: share links say 'display name and avatar' but also expose the Discord user ID",
+  "severity": "medium",
+  "category": "privacy",
+  "locations": [],
+  "claim": "The privacy page says share links show 'display name and avatar'. The avatar URL also exposes the Discord user ID (same issue as SV-10).",
+  "scenario": "Anyone with a share link reads the uploader's Discord snowflake ID from the avatar URL.",
+  "fix": "Proxy or replace the avatar, or disclose it (see SV-10).",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "SV-6",
+  "title": "Hub Durable Object: unlimited sockets per user, no rate limit on hello/presence, relay budget is per connection",
+  "severity": "medium",
+  "category": "security",
+  "locations": [
+   "hub.ts:66",
+   "hub.ts:248-252",
+   "hub.ts:89-98",
+   "hub.ts:256"
+  ],
+  "claim": "`acceptWebSocket` at hub.ts:66 has no cap on sockets per user. The relay budget (intended 30 per 10 s) lives in `this.relayed`, keyed per WebSocket (hub.ts:248-252), so more sockets multiply it. Every `hello` or `presence` message (hub.ts:89-98) runs `sendSnapshot`, then `publish`: a Durable Object storage write, a D1 `friendIds` query, and one RPC to each friend's Hub, which in turn sends to every one of that friend's sockets; there is no rate limit on these messages. Every relay does a D1 `areFriends` lookup (hub.ts:256), even when the result is 'not a friend'.",
+  "scenario": "Repro: 4 sockets of one user delivered 119 relays in about 2 s (intended limit 30 per 10 s); 200 presence flips produced 200 fan-out messages at a friend. One free Discord account opens N sockets and spams relays to random UUIDs, or flips its presence; every message costs a D1 read and Durable Object requests or storage writes, draining the account-wide D1 and Durable Object daily quotas for everyone and flooding friends' apps.",
+  "fix": "Cap sockets per user (e.g. close the oldest beyond 5). Apply one per-connection budget to all message types and close the socket with code 4008 on abuse. Keep the per-user relay budget in `ctx.storage` or in memory per user, not per socket. Cache the friend set in the Hub, invalidated by `friendsChanged`, so relays do not hit D1. Coalesce `publish` calls (debounce about 1 s).",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "SV-7",
+  "title": "'Appear offline' can be detected through a relay probe",
+  "severity": "medium",
+  "category": "privacy",
+  "locations": [
+   "hub.ts:158-162"
+  ],
+  "claim": "`relay()` at hub.ts:158-162 delivers to every `ready` socket and returns true without checking `attachment.invisible`, so the sender only gets `relayFailed: \"offline\"` when the target has truly no sockets. An invisible user is therefore distinguishable from an offline one, contradicting the privacy page promise: \"With 'Appear offline', friends see you as offline.\"",
+  "scenario": "Repro: B said hello with `invisible: true`; A relayed `{id: \"probe\"}`: there was no `relayFailed`, and B received the probe. Any accepted friend can poll a body that the target's app ignores and learn exactly when an invisible friend is online.",
+  "fix": "If `this.current() === null` (invisible or offline), do not deliver and answer \"offline\". Alternatively, have the app opt in per relay. Either way the answer must look the same.",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "SV-8",
+  "title": "Unbounded request bodies are read into memory, including on unauthenticated routes",
+  "severity": "medium",
+  "category": "security",
+  "locations": [
+   "util.ts:16-22",
+   "telemetry.ts:85-87",
+   "links.ts:324"
+  ],
+  "claim": "`body()` at util.ts:16-22 calls `request.json()` with no size limit; it is used by `/auth/exchange` (unauthenticated), `/me` PATCH and `/friends/request`. At telemetry.ts:85-87 the size check relies on Content-Length, which is absent in chunked uploads, then calls `request.text()`. links.ts:324 does `JSON.parse((await request.text()).slice(0, 2048))`, reading everything and then slicing. `putPoster` already guards against this (see its comment at links.ts:276), but these routes do not.",
+  "scenario": "Repro: a 5 MB chunked body to `/t/ping` was read completely before the 400 came back. Bodies of up to 100 MB (the edge limit) are buffered and decoded, which can exceed the isolate's 128 MB memory and kill other requests running on the same isolate. The report notes severity is Medium-Low in practice because the attacker pays the bandwidth.",
+  "fix": "A shared `readLimited(request, max)` that streams with `getReader()`, cancels and returns 413 once `max` is passed, and rejects when Content-Length exceeds `max`. Validate that the parsed JSON is an object (this also fixes the null-body 500).",
+  "reported_confidence": "confirmed",
+  "slice": "08-server",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "SV-9",
+  "title": "A few throwaway accounts can keep the global share bucket 'full' with abandoned pending uploads",
+  "severity": "medium",
+  "category": "security",
+  "locations": [
+   "shares.ts:18",
+   "links.ts:57",
+   "links.ts:252"
+  ],
+  "claim": "shares.ts:18 sets `TOTAL_BYTES = 9 GB` with `WEEKLY_LIMIT = 3` per account. At links.ts:57 a pending upload holds its declared `bytes` for up to 30 minutes, and an aborted upload is deleted (links.ts:252), so it does not use up a weekly slot. Reservations can be re-opened repeatedly at no quota cost.",
+  "scenario": "About 60 Discord accounts each keep 3 x 50 MB uploads open with a stalled body. Every 30 minutes the reservations lapse and the attacker simply re-opens them. Everyone else gets 507 'Sharing is full' indefinitely, and almost nothing is stored. Real 50 MB uploads from the same accounts do it for 5 days at a time. Likely.",
+  "fix": "Count a pending reservation against the week even after it is abandoned (keep the row with `aborted = 1` instead of deleting it). Cap how many bytes a single account can have live. Alert on a full bucket. Consider a per-IP rate limit on `POST /shares`.",
+  "reported_confidence": "likely",
+  "slice": "08-server",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ }
+]

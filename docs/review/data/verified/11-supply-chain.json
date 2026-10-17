@@ -1,0 +1,1195 @@
+[
+ {
+  "id": "SC-1",
+  "title": "Installer and app exe are not Authenticode-signed, and the first install has no integrity check",
+  "severity": "high",
+  "category": "supply-chain",
+  "locations": [
+   "src-tauri/tauri.conf.json:63-70",
+   "site/index.html:35",
+   "site/index.html:46",
+   "scripts/make-probe.mjs:71"
+  ],
+  "claim": "The `bundle.windows` block in src-tauri/tauri.conf.json:63-70 has only an \"nsis\" section: there is no `certificateThumbprint`, `signCommand` or `timestampUrl`, so the NSIS `-setup.exe` and the app exe carry no Authenticode signature. The release pipeline produces no checksums and no provenance, and the site publishes no checksums (site/index.html:35,46 just link to `clippiboy.com/get/site`). scripts/make-probe.mjs:71 tells testers: \"If Windows warns that the publisher is unknown: 'More info' and then 'Run anyway'.\" Minisign only protects updates; a fresh install trusts whatever asset currently sits on the latest release.",
+  "scenario": "Anyone or anything holding `contents: write` (the compromised-action path in SC-3, a leaked PAT, a careless maintainer) can replace `-setup.exe` on the latest release. Every new download through clippiboy.com/get would then serve the replacement, and nothing verifies it. Users also see SmartScreen warnings, and on Windows 11 with Smart App Control on, unsigned low-reputation binaries are blocked outright.",
+  "fix": "Sign with Azure Trusted Signing through tauri's `bundle.windows.signCommand` (e.g. `trusted-signing-cli -e <endpoint> -a <account> -c <profile> %1`) or another OV/EV certificate; enable GitHub \"immutable releases\"; publish `SHA256SUMS` and `actions/attest-build-provenance` attestations and show the hash on the site; stop telling users to click through SmartScreen.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src-tauri/tauri.conf.json:63-70 `\"windows\": { \"nsis\": { \"installMode\": \"currentUser\", ... \"installerHooks\": \"./windows/hooks.nsh\" } }` - no certificateThumbprint/signCommand/timestampUrl anywhere in the repo (grep for signtool|signCommand|certificateThumbprint|timestampUrl|trusted-signing finds nothing). .github/workflows/release.yml:54-71 runs tauri-action@v0 with only TAURI_SIGNING_PRIVATE_KEY (minisign updater key), `releaseDraft: false`, no checksum/attest step; job has `contents: write` (release.yml:23). First-install path: site/index.html download buttons -> clippiboy.com/get/<ref> -> server/site-proxy/index.ts:26-27 `download(...)` -> :58-61 fetches `${ORIGIN}/release.json` then `fetch(release.setup.url)` and streams the bytes back (:83) with no hash check; release.setup.url is `setup.browser_download_url` (.github/scripts/bake-release.mjs:73), a tag+name URL, so a same-name replacement asset is served transparently. Only updates are verified: tauri.conf.json:44-48 updater `pubkey` (minisign), src-tauri/src/updater.rs:89 `.check()`. scripts/make-probe.mjs:71-72 `If Windows warns that the publisher is unknown: \"More info\" and then \"Run anyway\".` (README of the diagnostic probe package for testers, not the main installer). site/ contains no SHA256 for the installer.",
+    "corrected_claim": "",
+    "reachable_by": "Tampering requires someone/something with write access to GitHub releases (maintainer account/PAT compromise, or a compromised third-party action in release.yml's contents:write job). Any ordinary new user downloading via clippiboy.com/get then receives that file with no integrity check. Not triggerable by an ordinary internet user, friend, or Discord user. The SmartScreen 'unknown publisher' prompt is hit by every new user in ordinary use (Smart App Control blocking is platform behaviour, plausible but not verifiable from source).",
+    "fix_assessment": "Authenticode signing (Azure Trusted Signing via bundle.windows.signCommand) is compatible with the /get rename scheme (embedded signature survives renaming) and defeats out-of-band asset replacement, but not a compromise inside the release job itself, which would hold signing access; pair it with GitHub immutable releases and build-provenance attestations/SHA256SUMS. Dropping the 'Run anyway' instruction only makes sense once the probe is signed too."
+   },
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src-tauri/tauri.conf.json:63-70 `\"windows\": { \"nsis\": { \"installMode\": \"currentUser\", ... \"installerHooks\": \"./windows/hooks.nsh\" } }`. There is no certificateThumbprint, signCommand or timestampUrl, and in tauri-utils-2.9.3/src/config.rs:1045-1095 those fields default to None. src-tauri/ has no other tauri.*.conf.json. .github/workflows/release.yml:54-71 runs tauri-action@v0 with only the TAURI_SIGNING_PRIVATE_KEY (minisign updater) secrets, no `args`/signing env, no checksum, attest or SBOM step. release.yml:76-83 even re-uploads an asset with `--clobber`. .github/scripts/bake-release.mjs:69-76 bakes only `setup: { url: setup.browser_download_url, size }` and no hash. server/site-proxy/index.ts:58-62 fetches release.json, then `fetch(release.setup.url)`, and streams those bytes back as `ClippiBoy_<v>_x64-setup.<ref>.exe` (:76-83) without checking anything. Because browser_download_url is /releases/download/<tag>/<name>, a same-name replacement asset gets served. site/index.html:35,46 link `https://clippiboy.com/get/site` with no hash shown. scripts/make-probe.mjs:71-72 `If Windows warns that the publisher is unknown: \"More info\" and then \"Run anyway\".`",
+    "corrected_claim": "",
+    "reachable_by": "Anyone who can write release assets on EinFabo/clippiboy (a compromised workflow action with contents: write, a leaked PAT or maintainer account) can swap the -setup.exe that clippiboy.com/get proxies to every new user. The missing signature (SmartScreen warnings, possible Smart App Control blocking) affects every first-time downloader.",
+    "fix_assessment": "Authenticode signing through bundle.windows.signCommand (e.g. Azure Trusted Signing) works with the worker's per-ref renaming, because the filename is not part of the signature. Signing alone does not stop an asset swap, though: users already click through warnings, so a swapped unsigned file looks no different. Immutable releases, published SHA256 and build-provenance attestations, plus a hash check in the site-proxy worker against a value baked in at build time, cover the swap part."
+   },
+   {
+    "lens": "impact",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "src-tauri/tauri.conf.json:63-70 `\"windows\": { \"nsis\": { \"installMode\": \"currentUser\", ... \"installerHooks\": \"./windows/hooks.nsh\" } }`: there is no certificateThumbprint, signCommand or timestampUrl, and there is no tauri.windows.conf.json override (src-tauri/ holds only tauri.conf.json). .github/workflows/release.yml passes only TAURI_SIGNING_PRIVATE_KEY/_PASSWORD (minisign, updater only) to tauri-action@v0; it has no signtool step, no SHA256SUMS and no attest-build-provenance. server/site-proxy/index.ts:58-62 `const baked = await fetch(`${ORIGIN}/release.json`...); file = await fetch(release.setup.url, ...)` and :82 streams `file.body` unverified, so every clippiboy.com/get/* download serves whatever -setup.exe the latest release holds (bake-release.mjs picks it via `/-setup\\.exe$/`). The updater has a pubkey (tauri.conf.json:48), so only existing installs are protected. scripts/make-probe.mjs:71 is in the README of the diagnostic encoder-probe ZIP sent to testers (make-probe.mjs:1 `Packs the diagnostic probe into something a stranger can double-click`), not in user-facing installer guidance; site/index.html:188-193 says nothing about SmartScreen.",
+    "corrected_claim": "Accurate: the installer and app exe are unsigned, and fresh downloads (including those proxied through clippiboy.com/get, server/site-proxy/index.ts:53-83) get no integrity check, because minisign protects only the updater. Two corrections. First, make-probe.mjs:71 is the README of the separate tester probe package, not installer guidance. Second, severity is overstated. The asset-swap scenario needs someone who already has contents: write, which is a compromise in its own right. In the SC-3 compromised-action path, the attacker runs inside the release job, so it would also reach a signing key wired into that job. Checksums published on the same release or site can be rewritten by the same attacker. So the gap is defense in depth plus distribution friction (SmartScreen warnings, Smart App Control blocks where SAC is on), not a vulnerability that can be exploited on its own.",
+    "reachable_by": "Integrity: only an actor who already has release-asset write on EinFabo/clippiboy (a leaked PAT, a compromised workflow action, a maintainer account) or control of GitHub Pages release.json. Friction: every new Windows user gets the SmartScreen 'unknown publisher' prompt, and Windows 11 machines with Smart App Control on block the installer.",
+    "fix_assessment": "Authenticode signing through bundle.windows.signCommand (Azure Trusted Signing, or SignPath/Certum for an individual outside the regions Trusted Signing serves) is the right fix for SmartScreen and SAC. It adds integrity only if the credential sits in a protected GitHub Environment with required reviewers and OIDC, apart from steps that run unpinned third-party actions. GitHub immutable releases block the post-publish asset swap most directly. SHA256SUMS on the same release add little, and attestations help only the few users who verify them. A cheap minimal addition: have the site-proxy worker check the release's minisign -setup.exe.sig against the updater pubkey before it streams the installer, which carries the existing update protection over to fresh downloads. Also drop 'Run anyway' from the probe README once the probe is signed."
+   }
+  ]
+ },
+ {
+  "id": "SC-2",
+  "title": "A workflow_dispatch \"trial run\" publishes a real signed release tagged `main`",
+  "severity": "high",
+  "category": "bug",
+  "locations": [
+   ".github/workflows/release.yml:15-16",
+   ".github/workflows/release.yml:60",
+   ".github/workflows/release.yml:68",
+   ".github/workflows/release.yml:71",
+   ".github/workflows/release.yml:74-75",
+   "README.md:752"
+  ],
+  "claim": ".github/workflows/release.yml:15-16 enables `workflow_dispatch:` under the comment `# For a trial run without a tag.`, while `:60` sets `tagName: ${{ github.ref_name }}`, `:68` `releaseDraft: false` and `:71` `includeUpdaterJson: true`. In tauri-action v0 (`src/index.ts:178`: `if (tagName && !releaseId) { ... createRelease(...) }`; `create-release.ts` calls `createRelease({ tag_name, target_commitish: commitish || context.sha, draft })`) a non-empty tagName always creates a release. On a dispatch from main, `github.ref_name` is \"main\", so tauri-action creates git tag `main` and publishes a non-draft release \"ClippiBoy main\", signed with the production updater key and carrying a `latest.json`. The comment at `:74-75` (\"a workflow_dispatch trial run has no release to attach anything to\") is wrong. Confirmed against tauri-action v0 source.",
+  "scenario": "GitHub marks new published releases as latest by default, so the updater endpoint `releases/latest/download/latest.json` then serves the trial build. If the version was already bumped, which is the documented order (README.md:752 \"bump the version … first\"), every installation is offered an untagged build. A tag named `main` also makes `git checkout main` ambiguous.",
+  "fix": "Use `tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}` (an empty tagName makes tauri-action build only), and upload trial artifacts with `actions/upload-artifact`.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "medium",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "release.yml:12-16 `push: tags: [\"v*\"]` + `# For a trial run without a tag.` `workflow_dispatch:` (no job-level `if`, so dispatch from any branch runs every step with secrets). release.yml:54-71 tauri-action@v0 gets `tagName: ${{ github.ref_name }}`, `releaseName: ClippiBoy ${{ github.ref_name }}`, `releaseDraft: false`, `prerelease: false`, `includeUpdaterJson: true`, with TAURI_SIGNING_PRIVATE_KEY from secrets (:57-58). On a dispatch from main, github.ref is refs/heads/main, so ref_name = \"main\", a non-empty tagName. Only the plugin-attach step is guarded (:77 `if: startsWith(github.ref, 'refs/tags/')`), and its comment at :73-75 (\"a workflow_dispatch trial run has no release to attach anything to\") assumes tauri-action makes no release, which is wrong. tauri.conf.json:44-47 has the updater endpoint `https://github.com/EinFabo/clippiboy/releases/latest/download/latest.json`. The installed updater only offers an update when the version is higher: tauri-plugin-updater-2.10.1/src/updater.rs:530-532 `None => release.version > self.current_version`, and src-tauri/src/updater.rs:72-89 sets no custom comparator. README.md:752 tells the maintainer to bump the version first and tag afterwards. tauri-action's own source is not on disk, so these points rest on its known v0 behaviour and on the GitHub API: (1) a non-empty tagName without releaseId makes it find or create the release (getReleaseByTag, then createRelease with tag_name and target_commitish = commitish or context.sha), after the build succeeds; (2) createRelease with a new tag_name creates that tag; (3) `make_latest` defaults to true for a newly published, non-prerelease release.",
+    "corrected_claim": "Small correction to the side effect: `git checkout main` still picks the branch. What breaks is that `git rev-parse/log main` warn \"refname is ambiguous\" and resolve to the tag, and `git push origin main` fails with \"src refspec main matches more than one\". The trial release also lacks the Stream Deck plugin because the attach step is skipped. Installations are offered the trial build only if tauri.conf.json's version is already higher than theirs when the dispatch runs (updater.rs:532). Otherwise the result is a junk release, \"ClippiBoy main\", marked latest until the next tag is pushed.",
+    "reachable_by": "Any repository collaborator with write access who clicks \"Run workflow\" (workflow_dispatch) on any branch. The comment invites exactly that as a safe trial. Users are affected automatically through the updater if the version was bumped before the dispatch.",
+    "fix_assessment": "The proposed `tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}` evaluates to '' on a branch dispatch. With an empty tagName and no releaseId, tauri-action only builds, and adding actions/upload-artifact for the bundle dir keeps the trial useful. Simpler alternatives: drop workflow_dispatch, or guard the tauri-action step with the same `if` as the attach step and fix the misleading comment."
+   },
+   {
+    "lens": "reach",
+    "verdict": "confirmed",
+    "severity_suggestion": "medium",
+    "evidence": "release.yml:15-16 `# For a trial run without a tag.` / `workflow_dispatch:`; :60 `tagName: ${{ github.ref_name }}`; :68 `releaseDraft: false`; :69 `prerelease: false`; :71 `includeUpdaterJson: true`; only the plugin-attach step is gated (:77 `if: startsWith(github.ref, 'refs/tags/')`), the tauri-action step is not. tauri-action v0 (fetched from raw.githubusercontent.com/tauri-apps/tauri-action/v0) src/index.ts:41 `let tagName = core.getInput('tagName').replace('refs/tags/', '')`, :178 `if (tagName && !releaseId) { ... getOrCreateRelease(...) }`, :211-223 `if (releaseId) { uploadReleaseAssets(...); if (includeUpdaterJson) uploadVersionJSON(...) }`; src/create-release.ts:87 `getReleaseByTag({tag: tagName})` -> on 404 :103-111 `createRelease({ tag_name: tagName, name: releaseName, draft, prerelease, target_commitish: commitish || context.sha })`. On a dispatch from branch main, github.ref_name == 'main', so GitHub creates tag `main` at the dispatched SHA and a published, non-prerelease release 'ClippiBoy main' with signed installers and latest.json (no make_latest passed, so the GitHub default 'true' for newly published releases applies). tauri.conf.json:45-46 updater endpoint `https://github.com/EinFabo/clippiboy/releases/latest/download/latest.json` then resolves to that release. README.md:754 (not 752) `# bump the version in package.json and src-tauri/tauri.conf.json first`. No `main` tag exists in the local clone today.",
+    "corrected_claim": "",
+    "reachable_by": "Only a repository collaborator with write access (the maintainer) can start it, through Actions -> Release -> Run workflow on a branch. The workflow's own comment advertises this as a safe 'trial run', so a maintainer is quite likely to try it. Once it runs, every installed copy is affected, because the updater polls releases/latest and the build carries the production signature. Installs are only offered the build if tauri.conf.json's version is higher than theirs, i.e. it was bumped before the dispatch, which is the order the README documents. Friends, internet users and local processes cannot trigger it.",
+    "fix_assessment": "The proposed `tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}` works. An empty tagName and releaseId Number('')=0 reach index.ts:242 'No releaseId or tagName provided, skipping all uploads', so the job only builds. Adding actions/upload-artifact for the bundle output keeps the trial artifacts. Alternatively, gate the tauri-action step or force releaseDraft/prerelease on non-tag refs."
+   }
+  ]
+ },
+ {
+  "id": "SC-11",
+  "title": "rustls 0.23.43 has open RustSec advisories",
+  "severity": "low",
+  "category": "supply-chain",
+  "locations": [
+   "src-tauri/Cargo.lock:4733"
+  ],
+  "claim": "`rustls 0.23.43` (src-tauri/Cargo.lock:4733) is affected by RUSTSEC-2026-0285, -0346, -0348 and -0349, fixed in >=0.23.46. All are low impact for a client that has no brotli feature. Confirmed with the RustSec advisory DB.",
+  "scenario": "The shipped TLS stack carries known (low-impact) advisories although a semver-compatible fix is available.",
+  "fix": "`cargo update -p rustls` (a free fix).",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/Cargo.lock:4733-4744 `name = \"rustls\" version = \"0.23.43\"`, deps log/once_cell/ring/rustls-pki-types/rustls-webpki/subtle/zeroize (no brotli, so the `brotli` feature is off; brotli 8.0.4 in the lock belongs to other crates). Only one rustls version is locked. Local RustSec DB (scratchpad/advisory-db, HEAD 2026-10-17): RUSTSEC-2026-0285 patched \">= 0.23.45\", unaffected \"< 0.23.13\"; -0346 patched \">= 0.23.46\", unaffected \"< 0.21.0\"; -0348 patched \">= 0.23.46\", brotli-only; -0349 patched \">= 0.23.46\" (no unaffected range). -0347 has unaffected \"< 0.23.44\", so 0.23.43 is correctly left out. Index cache (fetched 2026-10-17) lists 0.23.46 as the newest stable release, same rust_version 1.71, needing webpki ^0.103.14, which the lock already has (Cargo.lock:4797-4798 rustls-webpki 0.103.14). No dependent pins rustls exactly (iroh/noq/reqwest/updater all ask for ^0.23.x). The app has no custom ClientSessionStore or EchMode (only CryptoProvider install in tools.rs:211, friends.rs:744).",
+    "corrected_claim": "One small detail is wrong: RUSTSEC-2026-0285 is already fixed in 0.23.45. The other three advisories are fixed in 0.23.46. -0348 cannot be reached because brotli is off, and -0346 cannot be reached because the app has no custom session store. -0285 (plaintext handshake messages accepted, transcript still authenticated) and -0349 (classical key-share downgrade on resumption) do apply to the app's reqwest and iroh clients, with low impact.",
+    "reachable_by": "A network-position attacker or a malicious TLS server facing the app's rustls clients (reqwest downloads/updater, iroh relay/QUIC); impact is limited to protocol-strictness and loss of post-quantum key exchange on resumed connections.",
+    "fix_assessment": "`cargo update -p rustls` to 0.23.46 is semver-compatible and needs no other lock changes beyond what is present, so it is a free fix."
+   }
+  ]
+ },
+ {
+  "id": "SC-18",
+  "title": "Outdated direct dependencies cause duplicate crates (windows, png, dirs)",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src-tauri/Cargo.toml:65",
+   "src-tauri/Cargo.toml:47",
+   "src-tauri/Cargo.toml:39"
+  ],
+  "claim": "src-tauri/Cargo.toml:65 `windows = 0.58` is used only by clippiboy, while tauri, wry and tao use 0.61.3 and netwatch uses 0.62.2, giving three `windows` crates. `png = \"0.17\"` (:47) sits next to 0.18 from image and tray-icon; `dirs = \"5\"` (:39) sits next to 6 from tauri and 4 from auto-launch. 58 crates are duplicated in total.",
+  "scenario": "Duplicate crate versions inflate build time and binary size.",
+  "fix": "Move to `windows`/`windows-core` 0.61, `png` 0.18 and `dirs` 6.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/Cargo.toml:65 `windows = { version = \"0.58\", ...`, :101 `windows-core = \"0.58\"`, :47 `png = \"0.17\"`, :39 `dirs = \"5\"`. Cargo.lock: windows 0.58.0 <- only clippiboy; windows 0.61.3 <- tauri, tao, wry, tauri-runtime(-wry), webview2-com, wmi, tauri-plugin-opener, tauri-winrt-notification; windows 0.62.2 <- netwatch. png 0.17.16 <- clippiboy, ico 0.5.0, tauri-codegen 2.6.3; png 0.18.1 <- image, muda, tray-icon. dirs 4.0.0 <- auto-launch; 5.0.1 <- only clippiboy; 6.0.0 <- tauri, tauri-build, wry, tray-icon, updater. 58 package names have more than one version in the lock.",
+    "corrected_claim": "",
+    "reachable_by": "Every build. The extra windows 0.58 with about 35 features and the target-side png 0.17 are compiled and linked only because of clippiboy's own pins.",
+    "fix_assessment": "Bumping removes windows/windows-core 0.58 and dirs 5 entirely. png 0.17 stays in the lockfile because tauri-codegen and ico (build-time, host) need it, although it drops out of the shipped binary. windows 0.61/0.62 stay duplicated through netwatch. The windows 0.58->0.61 bump is a real API migration (about 96 `windows::` uses across 18 files, plus an `#[implement]` COM handler at audio/capture.rs:177), not a version-string edit. png 0.18 needs BufRead+Seek, which the BufReader<File> and Cursor used in shot.rs already provide."
+   }
+  ]
+ },
+ {
+  "id": "SC-19",
+  "title": "Mobile-template crate-type adds link time to a Windows-only app",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src-tauri/Cargo.toml:10"
+  ],
+  "claim": "src-tauri/Cargo.toml:10 sets `crate-type = [\"staticlib\", \"cdylib\", \"rlib\"]`, the mobile template default. With `lto = true` and `codegen-units = 1`, a Windows-only app pays extra link time for the staticlib and cdylib outputs.",
+  "scenario": "Every release/LTO build links two unneeded library artifacts, lengthening build time.",
+  "fix": "Set `crate-type = [\"rlib\"]` (or drop the `[lib]` crate-type).",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/Cargo.toml:10 `crate-type = [\"staticlib\", \"cdylib\", \"rlib\"]`. bundle targets are `[\"nsis\"]` (tauri.conf.json:56), gen/ has only schemas (no android/apple), and lib.rs:1151 `#[cfg_attr(mobile, tauri::mobile_entry_point)]` is template boilerplate. Reproduced with a scratch crate using the same [lib] and [profile.release]: `cargo build --release --bins -v` invokes rustc on the lib with `--crate-type staticlib --crate-type cdylib --crate-type rlib` and no `-C lto`. It emits libctt_lib.a (22 MB for a one-line crate), libctt_lib.so and the .rlib. Only the bin gets `-C lto`.",
+    "corrected_claim": "The staticlib and cdylib are produced on every build, dev builds included, even when only the binary is requested. LTO does not make them more expensive: cargo runs LTO only for the bin and links the lib's cdylib/staticlib without `-C lto`. The waste is a full non-LTO DLL link plus a large static archive of all dependencies, on top of the LTO link of the exe.",
+    "reachable_by": "Every `cargo build`/`tauri dev`/`tauri build`, locally and in CI.",
+    "fix_assessment": "Setting `crate-type = [\"rlib\"]` (or dropping the line) is safe for a desktop-only app. main.rs links clippiboy_lib as an rlib, and mobile_entry_point is cfg(mobile)-gated."
+   }
+  ]
+ },
+ {
+  "id": "SC-20",
+  "title": "Declared rust-version 1.77 is wrong",
+  "severity": "low",
+  "category": "dx",
+  "locations": [
+   "src-tauri/Cargo.toml:6",
+   "src-tauri/src/telemetry.rs:11"
+  ],
+  "claim": "src-tauri/Cargo.toml:6 says `rust-version = \"1.77\"`, but src-tauri/src/telemetry.rs:11 uses `std::sync::LazyLock` (needs 1.80) and iroh 1.2.0 declares an MSRV of 1.91.",
+  "scenario": "A toolchain that satisfies the declared MSRV (1.77-1.90) fails to build the crate.",
+  "fix": "Set `rust-version = \"1.91\"`.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/Cargo.toml:6 `rust-version = \"1.77\"`; src-tauri/src/telemetry.rs:11 `use std::sync::LazyLock;` (stabilised in 1.80); ~/.cargo/registry/.../iroh-1.2.0/Cargo.toml:14 `rust-version = \"1.91\"` (also netwatch, portmapper, iroh-relay, iroh-base 1.91; notify-rust 1.89; image/time 1.88).",
+    "corrected_claim": "",
+    "reachable_by": "Any developer or CI that uses a Rust toolchain between 1.77 and 1.90 and trusts the declared MSRV. cargo then fails on iroh's rust-version check, or on LazyLock with versions before 1.80.",
+    "fix_assessment": "`rust-version = \"1.91\"` matches the highest dependency MSRV and is correct. Pinning that same version in a rust-toolchain.toml (SC-21) would keep the two in sync."
+   }
+  ]
+ },
+ {
+  "id": "SC-21",
+  "title": "Release toolchain is not reproducible (floating toolchain, no --locked)",
+  "severity": "low",
+  "category": "dx",
+  "locations": [
+   ".github/workflows/release.yml:33",
+   ".github/workflows/release.yml:54"
+  ],
+  "claim": "CI uses floating `dtolnay/rust-toolchain@stable` and `windows-latest`, there is no `rust-toolchain.toml`, and tauri-action does not pass `--locked`, so release builds use whatever toolchain is current and do not enforce Cargo.lock.",
+  "scenario": "Two releases from the same commit can be built with different compilers, and a lockfile drift is not caught at build time.",
+  "fix": "Add a `rust-toolchain.toml` with a pinned version and pass `args: -- --locked` to tauri-action (verify that tauri forwards it to cargo).",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": ".github/workflows/release.yml:20 `runs-on: windows-latest`, :33 `- uses: dtolnay/rust-toolchain@stable`, :54-71 tauri-action `with:` has no `args`. No rust-toolchain(.toml) exists at the repo root or in src-tauri, and no other workflow mentions a toolchain or `--locked`. src-tauri/Cargo.lock is tracked by git. The bundled tauri CLI binary (node_modules/@tauri-apps/cli-linux-x64-gnu, 2.11.4) contains no `--locked` string, so the CLI does not add it by itself.",
+    "corrected_claim": "",
+    "reachable_by": "Every tag-triggered or workflow_dispatch release run. The compiler version moves with each new stable Rust, and a Cargo.toml/Cargo.lock mismatch gets silently re-resolved instead of failing.",
+    "fix_assessment": "Pinning via rust-toolchain.toml, or `dtolnay/rust-toolchain@<version>`, plus `args: -- --locked` on tauri-action is the right fix. The claim that `tauri build -- <args>` forwards trailing args to cargo comes from tauri's documented CLI behaviour; it could not be checked in source here because only the compiled binary is present."
+   }
+  ]
+ },
+ {
+  "id": "SC-25",
+  "title": "Public download count includes updater traffic",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   ".github/scripts/bake-release.mjs:61-63",
+   "server/site-proxy/index.ts:61"
+  ],
+  "claim": ".github/scripts/bake-release.mjs:61-63 counts GitHub downloads of the `-setup.exe` asset and comments \"The `.sig` and `latest.json` beside it are fetched by the updater, not by people, and are left out.\" But with Tauri v2 and `createUpdaterArtifacts: true`, the NSIS updater downloads the `-setup.exe` itself, so every auto-update of every install counts as a \"download\". The `/get` proxy (server/site-proxy/index.ts:61) also fetches from GitHub for bots it does not count in D1.",
+  "scenario": "The download count shown on the site is inflated by auto-updates and by bot fetches through the proxy.",
+  "fix": "Show the D1 `downloads` sum instead, or subtract updater fetches.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "bake-release.mjs:61-67 sums download_count of every asset matching /-setup\\.exe$/i; site/main.js:344 does the same in the fallback. tauri.conf.json: `\"createUpdaterArtifacts\": true`, targets [\"nsis\"]; the bundled CLI says `Legacy v1 compatible updater is deprecated ... change bundle > createUpdaterArtifacts to true`, i.e. `true` signs the installer itself; tauri-plugin-updater-2.10.1/src/updater.rs:781 `[AppName]_[version]_x64-setup.exe # NSIS installer` and :920-923 extract_exe handle a bare .exe. The repo itself says so: src-tauri/src/tools.rs:4 `the updater always downloads and runs the whole installer`. server/site-proxy/index.ts:61 `file = await fetch(release.setup.url, { method: request.method });` runs before the `!isBot(...)` check at :67, which gates only the D1 insert.",
+    "corrected_claim": "Updates are not automatic: src-tauri/src/updater.rs:1-8 only reports a find and the user starts the install, so it is each in-app update installed (not each auto-update) that adds a setup.exe download. That GitHub increments download_count for each such GET (and possibly for proxied HEAD requests) is GitHub platform behaviour, not checkable here.",
+    "reachable_by": "Every existing install that installs an update through the app; any crawler/bot (or HEAD request) hitting clippiboy.com/get.",
+    "fix_assessment": "Showing only the D1 sum would undercount people who download directly from the GitHub release page; better to keep GitHub's count but exclude updater traffic (e.g. point latest.json at a separately counted asset or subtract) and skip the upstream fetch for bots (redirect them instead)."
+   }
+  ]
+ },
+ {
+  "id": "SC-26",
+  "title": "Stream Deck plugin never rediscovers the app after a connection failure",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   "streamdeck/src/client.ts:212-216",
+   "streamdeck/src/client.ts:183-185",
+   "streamdeck/src/client.ts:228-230",
+   "src-tauri/src/control.rs:108"
+  ],
+  "claim": "streamdeck/src/client.ts:212-216 returns `null` on any fetch error, and `#poll` (:183-185) calls `forget()` only on HTTP 403. `#connect` (:228-230) returns the cached connection (port and token) forever, so the plugin never re-reads the `streamdeck.json` handshake after network failures.",
+  "scenario": "The user changes the control port in ClippiBoy (src-tauri/src/control.rs:108 `restart`); the keys show \"—\" until the user clicks \"Save and check\" in the property inspector or Stream Deck restarts. The cached port is also kept after the app has exited, so a different local process (on a multi-user machine) that later binds that port receives the token twice a second.",
+  "fix": "Call `forget()` after N consecutive network errors, or when the handshake file's mtime changes, and drop the cache once the handshake disappears.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "streamdeck/src/client.ts:177-181 (cited as 212-216) `} catch { ... return null; }` in #send; :148-150 (cited 183-185) #poll calls `this.forget()` only when `answer.status === 403`; :193-195 (cited 228-230) `if (this.#connection !== null) { return this.#connection; }`; post() (:134-137) also forgets only on 403. Other forget() callers: plugin.ts:10 onDidReceiveGlobalSettings and plugin.ts:26 the PI 'probe' command; plugin.ts:16-18 onDidAppear calls describe() without forget. src-tauri/src/commands.rs:154-157 calls control::restart on a port change; control.rs:94-111 stop() clears and start() rewrites streamdeck.json with the new port, which the plugin never re-reads. Token persists across app restarts (control.rs:352-367 ensure_token reuses the stored token).",
+    "corrected_claim": "Line numbers have drifted (actual 177-181, 148-150, 193-195). Also, on quit the app does not remove streamdeck.json (lib.rs:1369-1383 has no control::stop on Exit), so after an exit the handshake file itself still names the old port/token; dropping the cache when the handshake disappears would not cover the exit case.",
+    "reachable_by": "A user changing the control port in ClippiBoy's settings while Stream Deck keys are visible; the token-leak variant needs another local user's process to bind that loopback port after ClippiBoy exits (runtime-dependent).",
+    "fix_assessment": "Clearing #connection after a few consecutive network failures works, but it must not reset #lookedUp (forget() does), or the handshake file would be re-read every 500 ms while the app is down; comparing the handshake file's mtime/content on each lookup is a cleaner trigger."
+   }
+  ]
+ },
+ {
+  "id": "SC-27",
+  "title": "Stream Deck status polls overlap with no in-flight guard",
+  "severity": "low",
+  "category": "robustness",
+  "locations": [
+   "streamdeck/src/client.ts:116",
+   "streamdeck/src/client.ts:88"
+  ],
+  "claim": "The plugin polls with `setInterval(…, 500)` (streamdeck/src/client.ts:116) while each request has a 2 s timeout (:88) and there is no in-flight guard.",
+  "scenario": "Against a stalled app, up to 4 status requests can be outstanding at once.",
+  "fix": "Add an in-flight guard so a new poll does not start while one is pending (implied by the report).",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "streamdeck/src/client.ts:50 `const POLL_MS = 500;` and :53 `const TIMEOUT_MS = 2000;`. :81-82 `this.#timer = setInterval(() => void this.#poll(), POLL_MS); void this.#poll();`. :143-144 `async #poll() { const answer = await this.#send(\"GET\", \"/v1/status\");`, with no pending flag anywhere in the class (fields :63-68 are #connection, #watchers, #timer, #status, #lookedUp). :168-175 `fetch(... { ..., signal: AbortSignal.timeout(TIMEOUT_MS) })`. The cited lines drifted (:116 is now :81, :88 is now :53/:175). Server side: control.rs:131-138 handles requests one at a time on one thread; slow POSTs go to reply_later threads (:314-323), and status (:288-307) is built from snapshots. So status requests only hang when the process is frozen or wedged, or the serve thread is blocked.",
+    "corrected_claim": "",
+    "reachable_by": "Any time a ClippiBoy key is visible while ClippiBoy accepts TCP connections but does not answer (process hung or suspended, serve thread blocked on a lock, machine under heavy load). If the app is simply not running, fetch fails fast with connection refused and nothing piles up.",
+    "fix_assessment": "An in-flight flag in #poll, or a setTimeout chain that schedules the next poll after the current one settles, fixes it and also stops a late answer from overwriting a newer status. The change is cheap."
+   }
+  ]
+ },
+ {
+  "id": "SC-28",
+  "title": "Stream Deck keys are redrawn every 500 ms even when nothing changed",
+  "severity": "low",
+  "category": "perf",
+  "locations": [
+   "streamdeck/src/keys.ts",
+   "streamdeck/src/actions/*.ts"
+  ],
+  "claim": "`setTitle`/`setState` are sent for every key every 500 ms even when nothing changed (streamdeck/src/keys.ts, streamdeck/src/actions/*.ts).",
+  "scenario": "Constant redundant messages to Stream Deck for every visible key, twice a second.",
+  "fix": "Diff against the last drawn values and only send changes.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "streamdeck/src/client.ts:152-159: after every poll `this.#status = next; for (const watcher of this.#watchers) { ... watcher(next);` with no comparison to the previous status. keys.ts:26 `clippiboy.watch((status) => void this.draw(key, status))`. Draws are unconditional: toggle-buffer.ts:21-22 and record.ts:20-21 call `await key.setState(...); await key.setTitle(...)`, save-clip.ts:59 and screenshot.ts:17 call `await key.setTitle(...)`. In the SDK (@elgato/streamdeck 2.1.2 dist/plugin/actions/key.js:66-92), setState and setTitle each call `connection.send({event: ...})` directly, and connection.js:71-75 does `connection.send(JSON.stringify(command))`. Nothing is deduplicated. #poll runs even when #connect returns null (app not running), so the keys get \"—\" redrawn twice a second all evening.",
+    "corrected_claim": "Scope detail: this only happens for keys on the visible page, and only while at least one ClippiBoy key is visible (keys.ts:18-33, client.ts:84-92). The screenshot key's title never changes, and the buffer and recording labels change at most about once a second. So most sends are redundant, but the absolute cost is a few small localhost WebSocket messages per second.",
+    "reachable_by": "Normal use: any visible ClippiBoy key, whether or not ClippiBoy is running.",
+    "fix_assessment": "Keep the last drawn title and state per key id in ClippiBoyKey (or in each draw) and skip sends that would not change anything. Clear the cache on willAppear, because Stream Deck resets the key when it reappears."
+   }
+  ]
+ },
+ {
+  "id": "SC-29",
+  "title": "Stream Deck manifest targets end-of-life Node 20 with Debug enabled",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "streamdeck/com.einfabo.clippiboy.sdPlugin/manifest.json:24-27"
+  ],
+  "claim": "streamdeck/com.einfabo.clippiboy.sdPlugin/manifest.json:24-27 declares `\"Nodejs\": {\"Version\": \"20\", \"Debug\": \"enabled\"}`. Node 20 has been end-of-life since April 2026. `Debug: enabled` only applies in Stream Deck developer mode (`--inspect=127.0.0.1:{PORT}`) but should be removed from releases.",
+  "scenario": "The released plugin runs on an EOL Node runtime and ships a debug setting meant for development.",
+  "fix": "Move to Node \"24\" (requires raising `Software.MinimumVersion`) and remove `Debug: enabled` from releases.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "streamdeck/com.einfabo.clippiboy.sdPlugin/manifest.json:15-16 `\"Software\": {\"MinimumVersion\": \"6.5\"}` and :24-27 `\"Nodejs\": {\"Version\": \"20\", \"Debug\": \"enabled\"}`. Release CI (.github/workflows/release.yml:47-52) runs `npm run pack` (`streamdeck pack com.einfabo.clippiboy.sdPlugin`) on this manifest unchanged, and no script in the repo strips Debug. In the locked @elgato/schemas 0.4.16 (streamdeck/plugins/manifest.json), the Nodejs.Version branches for Software.MinimumVersion 6.4-7.0 are `\"const\": \"20\"`, and only the 7.1+ branches use definitions/Nodejs with `\"enum\": [\"20\", \"24\"]`. The Debug description reads \"Command-line arguments supplied to the plugin when run in debug mode ... `\\\"enabled\\\"` results in `--inspect=127.0.0.1:{PORT}`\".",
+    "corrected_claim": "Two parts rest on outside facts. That Node 20 has been EOL since 2026-04-30 comes from Node's schedule, not this repo. That Debug only takes effect in Stream Deck developer mode comes from the schema's \"when run in debug mode\" wording and Elgato's documentation; the Stream Deck runtime cannot be checked here. Moving to Node 24 means raising Software.MinimumVersion to at least 7.1, which drops users on Stream Deck 6.5-7.0. @types/node is also pinned to ^20 (streamdeck/package.json:17).",
+    "reachable_by": "Every installed copy of the released plugin runs on Stream Deck's bundled Node 20 runtime. The --inspect listener would only open on machines with Stream Deck developer mode on.",
+    "fix_assessment": "The fix is sound. Set Nodejs.Version to \"24\" with Software.MinimumVersion \"7.1\" (the schema requires it) and drop Debug from the shipped manifest, or strip it in CI before `streamdeck pack`. Weigh the lost 6.5-7.0 users before doing it."
+   }
+  ]
+ },
+ {
+  "id": "SC-35",
+  "title": "Website has no security headers",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "server/site-proxy/index.ts:29-43"
+  ],
+  "claim": "The site proxy Worker (server/site-proxy/index.ts:29-43) passes GitHub Pages' headers through and only rewrites `Location`. clippiboy.com is served with no Content-Security-Policy, `X-Content-Type-Options`, `Referrer-Policy` or `frame-ancestors`. Risk is low because site/main.js is XSS-clean and there are no external scripts or fonts.",
+  "scenario": "No defense-in-depth against framing/clickjacking, MIME sniffing or a future XSS on clippiboy.com.",
+  "fix": "In the proxy, set `Content-Security-Policy: default-src 'self'; connect-src 'self' https://api.github.com; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: strict-origin-when-cross-origin`, and enable HSTS at Cloudflare.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "server/site-proxy/index.ts:29-43: `const response = new Response(upstream.body, upstream);` copies GitHub Pages' headers as-is, and only `Location` is rewritten (lines 37-42). No other header is set on that path. No security header or `<meta http-equiv>` CSP appears anywhere in site/*.html. The /c/<id> share pages on clippiboy.com go to the friends Worker (index.ts:23-24 `return env.API.fetch(request);`), whose HTML response sets only Content-Type and Cache-Control (server/src/links.ts:373). Only the video/poster responses add `X-Content-Type-Options: nosniff` (links.ts:391). site/main.js only fetches `release.json` (line 305) and api.github.com (line 323). Its style changes go through element.style (lines 266-269), which CSP style-src allows.",
+    "corrected_claim": "Code part confirmed. Whether the live clippiboy.com responses really lack these headers depends on what GitHub Pages sends and on any Cloudflare zone settings (Transform Rules, managed headers), and neither is in the repo. GitHub Pages is generally known to send no CSP, nosniff, Referrer-Policy or X-Frame-Options, but it does send Strict-Transport-Security on github.io, which this proxy would pass through. The gap also covers the /c/<id> share pages, which the proxy hands off before line 29.",
+    "reachable_by": "Any third-party site that frames clippiboy.com (clickjacking), or a future XSS on the static site. There is no current exploit path.",
+    "fix_assessment": "The proposed CSP fits what site/main.js does (self + api.github.com, no inline script or style attributes). It only covers the pass-through branch, though: the /c/<id> share page (links.ts:373) needs its own headers in the friends Worker. The HSTS step may be redundant if GitHub's HSTS header already passes through."
+   }
+  ]
+ },
+ {
+  "id": "SC-37",
+  "title": "An unverified ffmpeg from the search path runs until the pinned copy is in place",
+  "severity": "low",
+  "category": "supply-chain",
+  "locations": [
+   "src-tauri/src/muxer.rs:39-49",
+   "site/index.html:191-192"
+  ],
+  "claim": "src-tauri/src/muxer.rs:39-49 falls back to `_ => PathBuf::from(name)` when `TOOL_DIR` is unset or the pinned file is missing. Rust's `Command` on Windows then searches the exe's own directory (`%LOCALAPPDATA%\\ClippiBoy`), then System32, then PATH, so any ffmpeg found that way runs without a hash check while the pinned download is pending (\"The buffer already runs while that happens\", site/index.html:191-192). This is the one gap in the otherwise end-to-end ffmpeg hash pinning.",
+  "scenario": "On first start, an `ffmpeg.exe` on PATH or next to the app is executed unverified. Same-user trust only, but it breaks the \"tested build only\" promise.",
+  "fix": "Refuse to fall back, or hash-check the fallback.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "src-tauri/src/muxer.rs:45-48 `match TOOL_DIR.get().map(|dir| dir.join(&file)) { Some(path) if path.is_file() => path, _ => PathBuf::from(name), }`, and muxer.rs:52 `Command::new(tool(name))`. TOOL_DIR is only set after provide() succeeds (tools.rs:156 `crate::muxer::set_tool_dir(target.clone());`). The fallback is intended: tools.rs:117 \"Until then [`crate::muxer`] falls back to the PATH\". The gates let a search-path ffmpeg stand in for the pinned one: state.rs:814 and 978 `if !crate::tools::is_ready() && !crate::muxer::available() { return Err(...) }`, so with no pinned copy and an ffmpeg on the search path, save_clip and start_recording go ahead. state.rs:486 `if !crate::muxer::available() && crate::tools::is_ready()` runs available() first, which runs `ffmpeg -version` (muxer.rs:81-87) every time the pipeline launches. The buffer start happens on its own thread (lib.rs:465), after tools::setup has spawned its thread (lib.rs:1233, tools.rs:120).",
+    "corrected_claim": "The mechanism is right, but the window is wider than 'first start while the download is pending'. (1) The fallback lasts as long as the download keeps failing (Status::Failed retries with backoff indefinitely, tools.rs:137-155), e.g. when offline or when GitHub is blocked. (2) On every launch, state.rs:486 can run `ffmpeg -version` from the search path before the setup thread calls set_tool_dir. (3) After setup, if the pinned exe goes missing (e.g. AV quarantine), `path.is_file()` fails and the fallback silently returns. Rust's search order also includes the Windows directory (exe dir, System32, Windows dir, PATH; the current directory is not searched). This rests on documented std behaviour; the std source is not present here. 'The one gap' overstates things: tools.rs:11-12 says the hash is checked only on arrival, not at each start, so the pinned copy itself runs unverified on later launches (same same-user trust level).",
+    "reachable_by": "A user (or anything running as that user) with an ffmpeg.exe on PATH or in the install directory, when the pinned copy is missing or not yet registered. Mostly a 'wrong ffmpeg version' correctness risk; as an attack it needs write access that could replace ClippiBoy itself.",
+    "fix_assessment": "Refusing the fallback is the workable option. A hash check on a PATH ffmpeg would almost never match the pinned build, so in practice it equals refusing. Saves would then wait for the download, with not_ready_reason() already giving the message. state.rs:486 should check is_ready() before calling available()."
+   }
+  ]
+ },
+ {
+  "id": "SC-38",
+  "title": "tools/report invokes powershell by bare name (binary planting)",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "tools/report/src/main.rs:98-101",
+   "tools/report/README.md:40-41"
+  ],
+  "claim": "tools/report/src/main.rs:98-101 calls `Command::new(\"powershell\")` by bare name. Rust resolves the application directory first, so a `powershell.exe` planted next to `clippiboy-report.exe` runs instead.",
+  "scenario": "The report exe is meant to be \"sent around\" (README:40-41) and usually lands in Downloads; a `powershell.exe` already present in Downloads is executed when the user runs `clippiboy-report.exe`.",
+  "fix": "Use `%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`.",
+  "reported_confidence": "likely",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "tools/report/src/main.rs:98-101 `fn powershell(script: &str) -> String { match Command::new(\"powershell\").args([\"-NoProfile\", \"-NonInteractive\", \"-Command\", script]).output()`. It is the only process spawn in the tool, and it runs first in header() (main.rs:127 `powershell(\"Get-Date ...\")`) and then in almost every section. tools/report/README.md:13-15 says the exe \"can be sent around; it needs nothing else on the target machine\", and package.json:15 builds it with plain `cargo build --release`. Rust std on Windows (library/std/src/sys/.../windows process `search_paths`) looks for a bare program name in this order: the child's PATH if it was changed, then the directory of current_exe(), then GetSystemDirectoryW, then GetWindowsDirectoryW, then the parent's PATH, adding `.exe`. powershell.exe sits in System32\\WindowsPowerShell\\v1.0, which is reached only through PATH. So `<exe dir>\\powershell.exe` wins. I could not open the std source here (no rust-src component), so that order comes from knowledge of std (rust-lang PR #87704). It matches CreateProcess's own rule of searching the application directory first.",
+    "corrected_claim": "",
+    "reachable_by": "Anyone who can put a file named powershell.exe in the folder the user runs clippiboy-report.exe from, for example an earlier drive-by or bundled download into Downloads, or an archive unpacked together with the exe. The attacker gets code execution as the user. They need a pre-existing write into that folder, and browsers already warn about exe downloads.",
+    "fix_assessment": "The proposed fix works: build the absolute path from %SystemRoot% (GetSystemDirectoryW + `WindowsPowerShell\\v1.0\\powershell.exe`) instead of hard-coding C:. It removes both the app-dir and the PATH lookup for this one binary."
+   }
+  ]
+ },
+ {
+  "id": "SC-40",
+  "title": "Non-draft release creation rests on a misconception and leaves an incomplete-latest window",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   ".github/workflows/release.yml:66-67"
+  ],
+  "claim": ".github/workflows/release.yml:66-67 says \"Publishing as a draft would be safer, but the updater only sees finished releases.\" and therefore publishes immediately. The release could instead be created as a draft and published as the last step; publishing first creates a window where \"latest\" has no `latest.json` or no plugin attached.",
+  "scenario": "Between tauri-action publishing the release and the later `gh release upload`, the latest release lacks `latest.json` or the `.streamDeckPlugin`.",
+  "fix": "Create the release as a draft, upload the installer, `.sig`, `latest.json` and plugin, then run `gh release edit \"$env:TAG\" --draft=false` as the last step.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": "release.yml:66-68 `# Publishing as a draft would be safer, but the updater only sees finished releases — otherwise nobody gets the update.  releaseDraft: false`. release.yml:71 sets `includeUpdaterJson: true`. release.yml:76-83 then runs a separate step, `gh release upload ${{ github.ref_name }} streamdeck/dist/com.einfabo.clippiboy.streamDeckPlugin --clobber`. The updater endpoint is tauri.conf.json:46 `https://github.com/EinFabo/clippiboy/releases/latest/download/latest.json`. tauri-action (not present locally; from its source) builds first, then createRelease with the requested draft flag, then uploadReleaseAssets, then uploadVersionJSON. A non-draft release is therefore 'latest' while the installer, .sig and latest.json are still uploading, and the .streamDeckPlugin arrives only after a further step. During that window tauri-plugin-updater-2.10.1/src/updater.rs:507-510 logs `update endpoint did not respond with a successful status code` on the 404, and :528 `remote_release.ok_or(Error::ReleaseNotFound)?` turns it into an error.",
+    "corrected_claim": "",
+    "reachable_by": "Every tagged release. During the window, a client's hourly check (updater.rs INTERVAL = 1 h) fails with ReleaseNotFound and retries an hour later, and GitHub's latest release has no plugin. The site is not affected: pages.yml bakes only on workflow_run completed+success, and site/main.js skips releases without a setup. The lasting risk is a failed upload of latest.json or the plugin after the release is already public. That leaves the published 'latest' broken for every client until someone fixes it by hand.",
+    "fix_assessment": "The fix is sound. Set releaseDraft: true, keep the gh upload (gh resolves draft releases by tag), and end with `gh release edit ${{ github.ref_name }} --draft=false`. The `$env:TAG` in the proposal is undefined in this workflow, so use the ref expression or add an env var. tauri-action rewrites untagged-* draft asset URLs in latest.json to the tag URL; verify this in the pinned action version before relying on it."
+   }
+  ]
+ },
+ {
+  "id": "SC-43",
+  "title": "Root .gitignore lacks .env and site/release.json",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   ".gitignore"
+  ],
+  "claim": "The root `.gitignore` does not list `.env` or `site/release.json`.",
+  "scenario": "A local `.env` or a generated `site/release.json` can be committed accidentally.",
+  "fix": "Add `.env` and `site/release.json` to `.gitignore` (implied).",
+  "reported_confidence": "likely",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "low",
+    "evidence": ".gitignore has node_modules/, dist/, probe-package/, src-tauri/target/, tools/report/target/, dist-ffmpeg/, src-tauri/resources/, *.key, *.pem, .DS_Store, *.log, shot.png, .claude/, ram-probe.ps1. It has no .env and no site/release.json. server/.gitignore: 'node_modules/ .wrangler/ .dev.vars' (no .env). streamdeck/.gitignore has no .env either. git ls-files shows no .env or release.json committed today. .github/scripts/bake-release.mjs:77 `await writeFile(\"site/release.json\", ...)` and it also rewrites the tracked site/index.html (line ~107). It runs from .github/workflows/pages.yml ('run: node .github/scripts/bake-release.mjs'). The installed wrangler 4.141.0 (server/node_modules/wrangler/wrangler-dist/cli.js ~185470-185480) falls back to loading `.env`/`.env.local` from the worker directory when .dev.vars is missing, because getCloudflareLoadDevVarsFromDotEnv defaults to true (~19834).",
+    "corrected_claim": "The claim is accurate. Nothing in the app/Vite/Tauri code reads a .env file, so the realistic case is server/.env: wrangler 4 loads it by default for local Worker secrets when .dev.vars is missing, and neither .gitignore covers it. site/release.json only holds public release metadata and is normally written in CI. If a stale copy were committed and the CI bake bailed out with exit(0), it would be deployed: site/main.js would show it and server/site-proxy /get/ would serve its installer URL. Ignoring release.json would not keep a local bake run clean, because the same script also edits the tracked site/index.html.",
+    "reachable_by": "A developer who runs the bake script locally, or who puts Worker secrets in server/.env, and then runs git add -A.",
+    "fix_assessment": "Adding `.env`, `.env.*` (root pattern, so it matches server/.env too) and `site/release.json` to the root .gitignore is correct and costs nothing."
+   }
+  ]
+ },
+ {
+  "id": "SC-13",
+  "title": "rusqlite 0.32 bundles an old SQLite 3.46.0",
+  "severity": "low",
+  "category": "supply-chain",
+  "locations": [
+   "src-tauri/Cargo.lock"
+  ],
+  "claim": "`rusqlite 0.32` bundles SQLite 3.46.0 (the latest rusqlite is 0.40). Later SQLite CVEs need attacker-supplied SQL, so impact is low.",
+  "scenario": "Bundled SQLite lags upstream security fixes; exploitation would require attacker-supplied SQL.",
+  "fix": "None stated explicitly; the report points to the newer rusqlite 0.40.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/Cargo.toml:38 `rusqlite = { version = \"0.32\", features = [\"bundled\"] }`; Cargo.lock:4681-4682 rusqlite 0.32.1, :3075-3076 libsqlite3-sys 0.30.1; libsqlite3-sys-0.30.1/sqlite3/sqlite3.h:149 `#define SQLITE_VERSION \"3.46.0\"` (source id 2024-05-23). Index cache: newest rusqlite 0.40.2, libsqlite3-sys 0.38.2. RustSec DB has only RUSTSEC-2022-0090 for libsqlite3-sys (patched >= 0.25.1), so nothing for 0.30.1. All SQL is static or parameterised: src-tauri/src/clips.rs:34-52 constant execute_batch, :80 `WHERE name = ?1`, :84 `format!(\"ALTER TABLE clips ADD COLUMN {name} {decl}\")` called only with string literals at clips.rs:56-71.",
+    "corrected_claim": "Small detail: the newest rusqlite is 0.40.2. Which SQLite CVEs were fixed after 3.46.0 is external data and was not checked here. The app passes no attacker-controlled SQL, and its database file (clips.db in the app data dir) can only be replaced by someone who already has local write access.",
+    "reachable_by": "No remote path. Exploiting it would need attacker-supplied SQL, which the app never runs, or a crafted clips.db, which needs local write access to the user profile.",
+    "fix_assessment": "Updating to rusqlite 0.40 / libsqlite3-sys 0.38 brings in current SQLite. It is a semver-major bump, so there may be small API changes in clips.rs. This is good hygiene, not urgent."
+   }
+  ]
+ },
+ {
+  "id": "SC-14",
+  "title": "tiny_http 0.12.0 is low-maintenance (judged acceptable)",
+  "severity": "info",
+  "category": "supply-chain",
+  "locations": [
+   "src-tauri/Cargo.lock"
+  ],
+  "claim": "`tiny_http 0.12.0` (last release 2022) is low-maintenance, but it is bound to loopback only; the report calls this acceptable.",
+  "scenario": "An unmaintained HTTP server crate backs the local control port; exposure is limited to loopback.",
+  "fix": "None proposed (acceptable).",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/Cargo.lock:6131-6134 `name = \"tiny_http\" version = \"0.12.0\"`. The local crates.io index cache (~/.cargo/registry/index/.../.cache/ti/ny/tiny_http) lists 0.12.0 as the newest version. src-tauri/src/control.rs:62 `Server::http((\"127.0.0.1\", port))`, with the comment 'Explicitly the loopback address, not 0.0.0.0'. control.rs:147-157: every request must carry x-clippiboy-token (`equals(&supplied, token)`), and any request with Origin/Referer/Sec-Fetch-Site is refused with 403.",
+    "corrected_claim": "The claim holds. Exposure is narrower than 'loopback only': requests also need the per-install token, and browser-originated requests are refused, which blocks DNS rebinding and CSRF. The 2022 release date comes from crates.io metadata and is not checkable locally; the local index only shows that no newer version exists.",
+    "reachable_by": "Local processes on the same machine. Unauthenticated access only goes as far as the header-parsing code before the 403.",
+    "fix_assessment": "Accepting it is reasonable. Keep an eye on RustSec advisories for tiny_http."
+   }
+  ]
+ },
+ {
+  "id": "SC-15",
+  "title": "tauri, tauri-plugin-updater and iroh lag current releases",
+  "severity": "low",
+  "category": "supply-chain",
+  "locations": [
+   "src-tauri/Cargo.lock"
+  ],
+  "claim": "Core dependencies are behind current releases: tauri 2.11.5 (latest 2.12.4), tauri-plugin-updater 2.10.1 (latest 2.14.0), iroh 1.2.0 (latest 1.3.0).",
+  "scenario": "Fixes shipped in newer releases of these crates (including the updater plugin) are not picked up.",
+  "fix": "None stated explicitly; implied update to the listed latest versions.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/Cargo.lock:5585-5586 tauri 2.11.5; :5876-5877 tauri-plugin-updater 2.10.1; :2623-2624 iroh 1.2.0. The local crates.io index cache was fetched 2026-10-17 09:19. Its newest stable non-yanked versions are tauri 2.12.4, tauri-plugin-updater 2.14.0 and iroh 1.3.0. Cargo.toml:16/20 (`\"2\"`) and :61 (`iroh = \"1.2\"`) already allow these, so a `cargo update` would pick them up. The local RustSec DB has no advisory for tauri 2.x (crates/tauri only has RUSTSEC-2022-0088/-0091 for 1.x) and no directory for tauri-plugin-updater or iroh.",
+    "corrected_claim": "The version lag is real. No known security fix is missing, though: there is no RustSec advisory against the locked tauri, tauri-plugin-updater or iroh versions. The scenario 'fixes are not picked up' is speculative. Even tauri-plugin-updater 2.14.0 keeps zip ^4, so upgrading the updater does not fix SC-12.",
+    "reachable_by": "Nothing specific. This is maintenance lag with no known exploitable defect.",
+    "fix_assessment": "`cargo update -p tauri -p tauri-plugin-updater -p iroh` stays within the declared semver ranges. It is reasonable hygiene but needs a regression test of the Tauri runtime and iroh networking."
+   }
+  ]
+ },
+ {
+  "id": "SC-16",
+  "title": "npm audit reports dev/build-time advisories in root, streamdeck and server lockfiles",
+  "severity": "low",
+  "category": "supply-chain",
+  "locations": [
+   "package-lock.json",
+   "streamdeck/package-lock.json",
+   "server/package-lock.json"
+  ],
+  "claim": "`npm audit --package-lock-only` reports advisories that are all dev or build-time only: root `source-map-js` (high, DoS); streamdeck `brace-expansion` and `fast-uri`; server `wrangler 4.141` -> `miniflare` -> `undici 7.29` and `sharp`. The plugin's runtime lockfile is clean.",
+  "scenario": "Vulnerable packages are present in build/dev tooling only; shipped runtime code is not affected.",
+  "fix": "None stated explicitly; section 3 adds `npm audit --omit=dev --audit-level=high` to CI.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "Lockfiles the reviewer audited are byte-identical to the repo ones (cmp). package-lock.json: node_modules/source-map-js 1.2.1 `dev: true`, pulled in by postcss/@tailwindcss/node; root prod deps are only @tauri-apps/*, react, react-dom, zustand. streamdeck/package-lock.json: brace-expansion 2.1.4 and fast-uri 3.1.7 `dev: true` (through minimatch/ajv under @elgato/cli); the root has only devDependencies. server/package-lock.json: wrangler 4.141.0, miniflare 5.20260925.0-alpha, undici 7.29.0, sharp 0.35.4 all `dev: true`, and miniflare depends on sharp 0.35.4 and undici 7.29.0; the server has no prod dependencies. streamdeck/com.einfabo.clippiboy.sdPlugin/package-lock.json is prod-only: @elgato/streamdeck 2.1.2, ws 8.21.3, zod 3.25.76. The reviewer's npm logs (scratchpad npm-root.log: '1 high severity vulnerability'; npm-server.log: '4 high severity vulnerabilities') match the counts claimed.",
+    "corrected_claim": "The exact advisory IDs and severities come from npm registry data and could not be re-checked offline. The streamdeck results have no saved log at all. Only the dev/prod split and the dependency chains were checked from source. These packages do run in the release job: vite/postcss during the tauri-action build step (which has TAURI_SIGNING_PRIVATE_KEY in its env) and @elgato/cli during `npm run pack`. So they are build-time exposure, not 'unused'. The stated issues are DoS/parsing problems, not code execution.",
+    "reachable_by": "Only build/dev tooling processing attacker-influenced input (source maps, glob patterns, URIs, local dev-server requests). No shipped runtime code (app bundle, Worker, plugin runtime) contains these packages.",
+    "fix_assessment": "`npm audit --omit=dev --audit-level=high` in CI guards the runtime trees. A routine `npm update` of wrangler/vite/@elgato/cli would clear the dev advisories at no real cost."
+   }
+  ]
+ },
+ {
+  "id": "SC-23",
+  "title": "Script-injection pattern with github.ref_name in workflow run steps",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   ".github/workflows/ffmpeg.yml:33",
+   ".github/workflows/ffmpeg.yml:49-50",
+   ".github/workflows/release.yml:81"
+  ],
+  "claim": ".github/workflows/ffmpeg.yml:33,49-50 interpolate `$version = \"${{ github.ref_name }}\" -replace ...` inside a pwsh double-quoted string, and release.yml:81 runs `gh release upload ${{ github.ref_name }} ...`. Git ref names may contain characters such as `$`, `(`, `)`, `;`, backslash and double quote, so the expression is spliced into the script unescaped. Confirmed pattern; only tag pushers can trigger it.",
+  "scenario": "Pushing a tag such as `ffmpeg-9$(calc)` executes the embedded command in the workflow runner.",
+  "fix": "Use `env: TAG: ${{ github.ref_name }}`, then `\"$env:TAG\"` in the script.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": ".github/workflows/ffmpeg.yml:31-33 `shell: pwsh` / `$version = \"${{ github.ref_name }}\" -replace '^ffmpeg-', ''`; :49-50 same plus `gh release create \"${{ github.ref_name }}\"`; release.yml:80-81 `run: > gh release upload ${{ github.ref_name }}` on windows-latest (default shell pwsh). `git check-ref-format refs/tags/'ffmpeg-9$(calc)'` and `'v1;calc'`, `'v1\"x'`, \"v1'x\", 'v1`x' all pass; `v1\\x` and `v1 x` are rejected. In a pwsh double-quoted string (and in a pwsh bareword argument) `$(...)` is a subexpression, so the tag text is executed.",
+    "corrected_claim": "Backslash and space are not allowed in git ref names (`$ ( ) ; \" ' ` & ` are). The workflows run the code of the tagged commit, so anyone able to push a matching tag can already run arbitrary workflow code by tagging a commit with a modified workflow; the injection crosses no privilege boundary today and is a hardening issue.",
+    "reachable_by": "Only accounts with permission to push `ffmpeg-*` / `v*` tags to the repository (maintainers).",
+    "fix_assessment": "Passing the ref through `env: TAG: ${{ github.ref_name }}` and using `$env:TAG` is the standard, correct fix and also applies to release.yml:81."
+   }
+  ]
+ },
+ {
+  "id": "SC-24",
+  "title": "bake-release.mjs String.replace replacement strings expand `$` patterns",
+  "severity": "low",
+  "category": "bug",
+  "locations": [
+   ".github/scripts/bake-release.mjs:97",
+   ".github/scripts/bake-release.mjs:102-106"
+  ],
+  "claim": ".github/scripts/bake-release.mjs:97 (`` `$1${escape(release.plugin.url)}\"` ``) and :102-106 interpolate the tag/URL into `String.replace` replacement strings. Special replacement patterns `$&`, `` $` `` or `$'` contained in a tag or URL would be expanded and splice page content; `escape()` does not cover this.",
+  "scenario": "A release tag or asset URL containing `$&`, `` $` `` or `$'` makes the baked `index.html` contain spliced/duplicated page content.",
+  "fix": "Use function replacers: `html.replace(re, (_, a, b) => a + value + b)`.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": ".github/scripts/bake-release.mjs:91 `html.replace(pattern, replacement)` with string replacements built at :97 `` `$1${escape(release.plugin.url)}\"` ``, :98 `` `$1Version ${escape(release.version)}, ${mb} MB$2` `` and :104-105 (version, html_url). release.version = tag_name.replace(/^v/, \"\") (:70); only filter is /^v\\d/ (:36). escape() (:39-40) maps & to &amp; which leaves `$&amp;` still starting with `$&`, and does not touch $, ` or '. Reproduced in node: version \"1$&\" yields `Version 1<span data-version>old</span>amp;`; \"1$'\" and \"1$`\" splice the text after/before the match.",
+    "corrected_claim": "Also line 98 (version span) is affected. The version path is the reliably reachable one, since it comes straight from tag_name; whether GitHub percent-encodes `$` in browser_download_url/html_url is not checkable here.",
+    "reachable_by": "A maintainer publishing a release whose tag (v<digit>...) contains `$&`, `$'`, `` $` `` or `$<n>`; such tags are valid git refs but unlikely in practice.",
+    "fix_assessment": "Function replacers (`(_, a, b) => a + value + b`) remove the problem entirely; escaping `$` as `$$` in the value would also work."
+   }
+  ]
+ },
+ {
+  "id": "SC-32",
+  "title": "Stream Deck plugin README omits /v1/recording",
+  "severity": "low",
+  "category": "dx",
+  "locations": [
+   "streamdeck/README.md:23"
+  ],
+  "claim": "The plugin README (streamdeck/README.md:23) lists the endpoints a key press uses (`POST /v1/clip`, `/v1/screenshot` or `/v1/buffer`) but omits `/v1/recording`.",
+  "scenario": "Documentation of the control API used by the plugin is incomplete.",
+  "fix": "Add `/v1/recording` to the README (implied).",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "streamdeck/README.md:22-23: \"A press goes to `POST /v1/clip`, `/v1/screenshot` or `/v1/buffer` and only answers once the work is done\". But the plugin has a fourth key: streamdeck/src/actions/record.ts:16 `await this.press(ev.action, \"/v1/recording\", { action: \"toggle\" });`, served by src-tauri/src/control.rs:239 `(Method::Post, \"/v1/recording\") => {`. The same README's opening (lines 3-4) does name the fourth key (\"start and stop a recording\"), so only the endpoint list is incomplete.",
+    "corrected_claim": "",
+    "reachable_by": "Developers reading streamdeck/README.md. No runtime effect.",
+    "fix_assessment": "Adding `/v1/recording` to the list on line 23 is correct and enough."
+   }
+  ]
+ },
+ {
+  "id": "SC-33",
+  "title": "Stream Deck inner package.json version disagrees with manifest",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "streamdeck/com.einfabo.clippiboy.sdPlugin/package.json",
+   "streamdeck/com.einfabo.clippiboy.sdPlugin/manifest.json"
+  ],
+  "claim": "The inner `package.json` (streamdeck/com.einfabo.clippiboy.sdPlugin/package.json) says version 0.4.0 while the manifest says 0.6.5.0.",
+  "scenario": "Version metadata of the shipped plugin is inconsistent.",
+  "fix": "Align the versions (implied).",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "streamdeck/com.einfabo.clippiboy.sdPlugin/package.json:4 `\"version\": \"0.4.0\"` (its package-lock.json:3,9 also say 0.4.0). manifest.json:5 `\"Version\": \"0.6.5.0\"`, and the outer streamdeck/package.json:5 says `\"version\": \"0.6.5\"`. No script or workflow syncs them (grep of .github/workflows/release.yml and streamdeck/ finds no version bumping).",
+    "corrected_claim": "",
+    "reachable_by": "Only people reading the packed plugin folder. The Stream Deck software reads manifest.json's Version, and the inner package.json is `private` and only used to `npm install` the runtime dependency, so nothing at runtime reads 0.4.0.",
+    "fix_assessment": "Bumping the inner package.json (and its lockfile) to 0.6.5 works. Dropping its version field or noting that the manifest is the source of truth would also stop it drifting again."
+   }
+  ]
+ },
+ {
+  "id": "SC-36",
+  "title": "Personal identifier in a public workers.dev hostname, which is also a second public origin",
+  "severity": "low",
+  "category": "privacy",
+  "locations": [
+   "server/README.md:7",
+   "server/README.md:23",
+   "server/scripts/e2e.mjs:11",
+   "server/wrangler.jsonc:12"
+  ],
+  "claim": "server/README.md:7,23 and server/scripts/e2e.mjs:11 contain the hostname `clippiboy-friends.fabian081964.workers.dev` (a first name plus number). server/wrangler.jsonc:12 keeps `\"workers_dev\": true`, so the friends Worker is publicly reachable on this second origin besides `api.clippiboy.com`.",
+  "scenario": "The maintainer's personal identifier is published in the public repo, and requests to the workers.dev origin bypass any zone-level WAF or rate-limit rules applied to `api.clippiboy.com`.",
+  "fix": "Plan to set `workers_dev: false` once old builds are gone, and scrub the name from docs.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "server/README.md:7 \"the old `clippiboy-friends.fabian081964.workers.dev` stays on for builds from before the domain\", README.md:23 `https://clippiboy-friends.fabian081964.workers.dev/auth/callback`, server/scripts/e2e.mjs:11 `const BASE = process.env.FRIENDS_SERVER ?? \"https://clippiboy-friends.fabian081964.workers.dev\";`, server/wrangler.jsonc:9-12 comment \"The workers.dev address stays on, so builds from before the domain keep working\" and `\"workers_dev\": true`. Current app source uses only the custom domain: src-tauri/src/friends.rs:31-32 `SERVER = \"https://api.clippiboy.com\"`, `SOCKET = \"wss://api.clippiboy.com/ws\"`. The in-Worker rate limiter (server/src/links.ts:319 `env.REPORT_LIMIT.limit(...)`) runs on both hostnames.",
+    "corrected_claim": "The facts are right. The 'bypasses zone-level WAF/rate limits' consequence is only hypothetical: the repo defines no zone-level rules, and the only rate limit it does define (the REPORT_LIMIT binding) is enforced inside the Worker and applies on the workers.dev origin too. The second origin is deliberate (wrangler.jsonc:9-10) and is still needed by old builds and by the Discord redirect registered for it. The identifier is also in git history, so scrubbing the docs alone does not remove it.",
+    "reachable_by": "Anyone reading the public repo (identifier). Anyone on the internet can reach the workers.dev origin while workers_dev is true.",
+    "fix_assessment": "Setting `workers_dev: false` once pre-domain builds are gone, removing the Discord redirect and pointing e2e.mjs's default BASE at api.clippiboy.com is reasonable. Scrubbing the docs only helps going forward, since the name stays in history."
+   }
+  ]
+ },
+ {
+  "id": "SC-41",
+  "title": "LICENSE forbids copying/modifying while README tells readers to clone and build",
+  "severity": "low",
+  "category": "legal",
+  "locations": [
+   "LICENSE:16-18",
+   "README.md:700-712"
+  ],
+  "claim": "LICENSE:16-18 forbids copying or modifying the source, while README.md:700-712 tells readers to clone and build it.",
+  "scenario": "Readers following the README's build instructions technically violate the LICENSE terms.",
+  "fix": "Clarify that a personal build is allowed.",
+  "reported_confidence": "likely",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "LICENSE:16-18 `You MAY NOT, without prior written permission from the copyright holder * copy, modify, merge or translate the source code or artwork, in whole or in part`. LICENSE:13-14 allows only to `read the source code, and view and fork this repository on GitHub to the extent GitHub's Terms of Service allow`. README.md:700-712 `## Building from source ... git clone https://github.com/EinFabo/clippiboy.git; cd clippiboy; npm install; npm run app; npm run app:build    # NSIS installer`. README.md:858-862 says `copying, modifying or redistributing it needs permission. Download it only from the Releases page.` package.json:4 is `\"license\": \"UNLICENSED\"`. Nothing grants a personal-build exception.",
+    "corrected_claim": "",
+    "reachable_by": "Any reader who follows the README's build instructions, which means cloning (copying) the source and producing a local installer. Whether that legally infringes depends on jurisdiction, for example statutory allowances for copies needed for lawful use, and is not checkable here. The inconsistency between the two documents is objective.",
+    "fix_assessment": "Adding an explicit MAY clause to LICENSE resolves it. For example: clone and build for personal, non-distributed use, and modify locally to contribute back via issues or PRs. The alternative is to label the README build section as maintainer or permission-only."
+   }
+  ]
+ },
+ {
+  "id": "SC-45",
+  "title": "README requires end-of-life Node 20+",
+  "severity": "low",
+  "category": "dx",
+  "locations": [
+   "README.md:715"
+  ],
+  "claim": "README.md:715 says \"Node 20+\", which is end-of-life.",
+  "scenario": "Contributors are pointed at an EOL Node runtime.",
+  "fix": "Update the stated Node requirement (implied).",
+  "reported_confidence": "likely",
+  "slice": "11-supply-chain",
+  "status": "confirmed",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "confirmed",
+    "severity_suggestion": "info",
+    "evidence": "README.md:713 (cited as 715, a 2-line drift): 'You need Node 20+, Rust with the MSVC toolchain, the Visual Studio 2022 Build Tools...'. Node 20 reached end of life on 2026-04-30, and today is 2026-10-17. CI uses newer Node: .github/workflows/release.yml:30 and ffmpeg.yml:25 `node-version: 22`. Installed toolchain engines: vite 6.4.3 '^18.0.0 || ^20.0.0 || >=22.0.0', @tailwindcss/oxide '>= 20', so the app build does still work on Node 20. server/package-lock.json:1494-1496 wrangler 4.141.0 `\"engines\": {\"node\": \">=22.0.0\"}`. server `test` runs `node --test src/*.test.ts`, which needs Node 22.18+ for type stripping.",
+    "corrected_claim": "The line is at README.md:713. '20+' is a floor, not a pin, and the app build in that section still works on Node 20. The stated floor is stale, though: it admits an EOL runtime, it is below the Node 22 that CI uses, and it is wrong for the repo's server/ part, whose locked wrangler requires Node >=22.",
+    "reachable_by": "Contributors following the Building from source section.",
+    "fix_assessment": "Change it to 'Node 22+' (or 22.18+ if the server tests are in scope), so it matches CI and wrangler's engines field."
+   }
+  ]
+ },
+ {
+  "id": "SC-12",
+  "title": "zip 4.6.1 has RustSec advisories (app not affected)",
+  "severity": "low",
+  "category": "supply-chain",
+  "locations": [
+   "src-tauri/Cargo.lock",
+   "src-tauri/src/tools.rs:265-283"
+  ],
+  "claim": "`zip 4.6.1` has RUSTSEC-2026-0367, -0368 and -0369, fixed in 9.0. These affect only `extract()`; src-tauri/src/tools.rs:265-283 uses `by_name` with its own hashing, so the app is not affected.",
+  "scenario": "The dependency carries known advisories; not reachable today because the app only uses `by_name`.",
+  "fix": "Upgrade zip (to 9.0) anyway.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/Cargo.lock:7999-8000 `zip 4.6.1`. RustSec RUSTSEC-2026-0367/-0368/-0369 all `patched = [\">= 9.0.0\"]` with no unaffected range. App code: src-tauri/src/tools.rs:265 `zip::ZipArchive::new(file)` + :273 `.by_name(name)`, hashed via copy_hashing. BUT zip is also a dependency of tauri-plugin-updater (Cargo.lock:5876-5905 lists \"zip\"; Cargo.toml:20 `tauri-plugin-updater = \"2\"` keeps default features `[\"rustls-tls\",\"zip\"]`), and on Windows tauri-plugin-updater-2.10.1/src/updater.rs:885-887 `if infer::archive::is_zip(bytes) { return self.extract_zip(bytes); }` -> :903-904 `let mut extractor = zip::ZipArchive::new(archive)?; extractor.extract(&temp_dir)?;`. That path only runs after updater.rs:712 `verify_signature(&buffer, &self.signature, &self.config.pubkey)?` (the app calls download_and_install, src-tauri/src/updater.rs:123). zip-4.6.1/src/read.rs:456-476 make_symlink creates symlinks with no target check (Windows: symlink_dir/symlink_file); the permission handling at read.rs:915-925 is cfg(unix) only. Index cache: tauri-plugin-updater 2.10.1, 2.13.3 and 2.14.0 all require `zip ^4` on cfg(target_os=\"windows\").",
+    "corrected_claim": "The advisories are real for zip 4.6.1. But 'extract() is never used' is wrong: tauri-plugin-updater's Windows extract_zip calls ZipArchive::extract on the update payload. It is still not exploitable, for two reasons. First, the payload must pass minisign verification against the pinned pubkey before extraction, and anyone who can sign an update can ship a malicious installer anyway. Second, the release uses NSIS setup.exe artifacts (tauri.conf.json `createUpdaterArtifacts: true`, targets [\"nsis\"]), so the zip branch is not normally taken. -0367 and -0369 are Unix-only. -0368 (symlinks) would need symlink privilege on Windows.",
+    "reachable_by": "Only someone who holds the Tauri updater signing key, by publishing a signed zip update. tools.rs is not affected (by_name + checksum). No network attacker path.",
+    "fix_assessment": "Moving the direct dependency to zip 9 does not clear the advisory: even the newest tauri-plugin-updater (2.14.0) still requires zip ^4 on Windows, so 4.x stays in the lockfile. To remove it, also set tauri-plugin-updater to `default-features = false, features = [\"rustls-tls\"]`. That is safe because the app ships un-zipped NSIS updater artifacts."
+   }
+  ]
+ },
+ {
+  "id": "SC-17",
+  "title": "Unmaintained and unsound transitive crates via tauri",
+  "severity": "low",
+  "category": "supply-chain",
+  "locations": [
+   "src-tauri/Cargo.lock"
+  ],
+  "claim": "Unmaintained transitive crates (`paste`, `proc-macro-error`, `unic-*`) come through tauri; `glib 0.18` (flagged unsound) is Linux-only.",
+  "scenario": "The dependency tree contains unmaintained/unsound crates pulled in by tauri; glib only affects Linux builds.",
+  "fix": "None stated explicitly (section 3 proposes cargo-deny advisories checks in CI).",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "Cargo.lock: paste 1.0.15 <- netlink-packet-core 0.8.2 <- netwatch 0.19.3 / netdev 0.46.3 <- iroh 1.2.0 (not tauri); netwatch-0.19.3/Cargo.toml:150 `[target.'cfg(any(target_os = \"linux\", target_os = \"android\"))'.dependencies.netlink-packet-core]`, netdev-0.46.3/Cargo.toml:108 same cfg. proc-macro-error 1.0.4 <- glib-macros 0.18.5 / gtk3-macros 0.18.2 <- glib/gtk 0.18, which tauri-2.11.5/Cargo.toml:335 pulls only under `cfg(any(target_os = \"linux\", ...bsd))`. unic-ucd-ident/-char-property/-char-range/-common/-ucd-version 0.9.0 <- urlpattern 0.3.0 (Cargo.toml:41 unconditional) <- tauri-utils 2.9.3 (Cargo.toml:202 `[dependencies.urlpattern]`, unconditional). glib 0.18.5 is in the lock, Linux/BSD-only via tauri's gtk/webkit2gtk.",
+    "corrected_claim": "The lockfile does hold these crates, but only unic-* (via tauri-utils -> urlpattern) are built for the Windows target. paste comes through iroh (netwatch/netdev -> netlink-packet-core), not tauri, and only on Linux/Android. proc-macro-error and glib 0.18 come through tauri's GTK stack and only on Linux/BSD. None of them is in the shipped Windows binary except unic-*. The advisory status (unmaintained/unsound RUSTSEC entries) is not checked here because no advisory-db is available locally.",
+    "reachable_by": "Nobody at runtime. This is lockfile hygiene that only a cargo-audit/cargo-deny run would flag. For Windows release builds it amounts to the unmaintained unic-* crates used for URL-pattern parsing inside tauri-utils.",
+    "fix_assessment": "The project cannot fix these by itself because all of them are transitive. A cargo-deny advisories check in CI, with documented ignores for the Linux-only and unmaintained-only entries, is the reasonable action."
+   }
+  ]
+ },
+ {
+  "id": "SC-22",
+  "title": "Committed generated schema files drift",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src-tauri/gen/schemas/linux-schema.json"
+  ],
+  "claim": "`src-tauri/gen/schemas/*` is tracked in git, and a build in this checkout regenerated `linux-schema.json` with +252 lines (the deep-link permissions), so the committed copy is stale. The Tauri template ignores `/gen/schemas`.",
+  "scenario": "Every build produces a dirty working tree and the committed schemas do not reflect the current permissions.",
+  "fix": "Either ignore `/gen/schemas`, or regenerate it in CI and fail on a diff.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "git ls-files tracks src-tauri/gen/schemas/{acl-manifests,capabilities,desktop-schema,linux-schema,windows-schema}.json. linux-schema.json is 2782 lines with 0 'deep-link' hits, while windows-schema.json and desktop-schema.json are 3034 lines (byte-identical) with 9 hits; 3034-2782 = 252. Working tree is currently clean (git status empty). tauri-utils-2.9.3/src/acl/schema.rs:325-339 writes only `{target}-schema.json` for the build target and only `if schema_str != fs::read_to_string(&schema_path)`, then copies it to desktop-schema.json. Capabilities use `\"$schema\": \"../gen/schemas/desktop-schema.json\"` (capabilities/default.json:2 etc.). The CLI's embedded src-tauri/.gitignore template contains `/gen/schemas`.",
+    "corrected_claim": "Only linux-schema.json is stale (missing the deep-link permissions); windows-schema.json and desktop-schema.json, which the capability files reference, are current. tauri-build rewrites only the schema for the host target and only when it changed, so Windows builds (the only shipping target and the CI host) leave the tree clean; only a Linux build (cargo check/clippy in a Linux sandbox) dirties linux-schema.json. No build in this checkout has left a diff now.",
+    "reachable_by": "Developers running cargo build/check on Linux; no effect on Windows builds, CI releases or runtime behaviour.",
+    "fix_assessment": "Ignoring /gen/schemas (as the Tauri template does) is correct, but the capability files point $schema at desktop-schema.json, so editor validation needs a first build; alternatively just regenerate and commit linux-schema.json."
+   }
+  ]
+ },
+ {
+  "id": "SC-30",
+  "title": "@elgato/streamdeck SDK is a major version behind",
+  "severity": "low",
+  "category": "supply-chain",
+  "locations": [
+   "streamdeck/com.einfabo.clippiboy.sdPlugin/package.json:8"
+  ],
+  "claim": "`@elgato/streamdeck` is at ^2.1.2 while 3.0.2 is available.",
+  "scenario": "The plugin misses SDK v3 features and fixes (e.g. Secrets, see SC-31).",
+  "fix": "Upgrade to @elgato/streamdeck 3.x (implied).",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "streamdeck/com.einfabo.clippiboy.sdPlugin/package.json:8 `\"@elgato/streamdeck\": \"^2.1.2\"`, locked to 2.1.2 in its package-lock.json. The cached npm packument shows dist-tags latest 3.0.2, with 3.0.0 published 2026-09-22, 3.0.2 published 2026-10-08 and 2.1.2 published 2026-08-17. However, 2.1.2 already ships Secrets: dist/plugin/system.js:59-61 `export function getSecrets() { requiresVersion(6.9, connection.version, \"Secrets\"); requiresSDKVersion(3, \"Secrets\");`, and validation.js:9-12 shows requiresSDKVersion checks the manifest's \"SDKVersion\" field, not the npm package major. engines is `>=20.5.1` in both 2.1.2 and 3.0.2.",
+    "corrected_claim": "The plugin is one npm major behind (2.1.2 vs 3.0.2), but 2.1.2 is the newest 2.x and 3.0.0 is only about four weeks old. The cited consequence is wrong: Secrets is already in SDK 2.1.2 as streamDeck.system.getSecrets(). It is gated on manifest SDKVersion 3 and Stream Deck 6.9, not on npm @elgato/streamdeck 3.x. No specific 3.x fix the plugin needs is shown.",
+    "reachable_by": "Maintenance only. No runtime path is affected.",
+    "fix_assessment": "An upgrade to 3.x is optional hygiene, not a fix. Note that the 3.x readme states Node.js 24 and Stream Deck 7.1 requirements, which ties it to the MinimumVersion trade-off in SC-29."
+   }
+  ]
+ },
+ {
+  "id": "SC-34",
+  "title": "streamdeck/install.ps1 uses npm install instead of npm ci",
+  "severity": "info",
+  "category": "dx",
+  "locations": [
+   "streamdeck/install.ps1"
+  ],
+  "claim": "The dev-only `streamdeck/install.ps1` uses `npm install` rather than `npm ci` (noted under \"Checked and fine\"; otherwise it needs no admin and writes to `%APPDATA%` only).",
+  "scenario": "Dev installs may not reproduce the committed lockfile exactly.",
+  "fix": "Use `npm ci` (implied).",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "streamdeck/install.ps1: `if (-not (Test-Path (Join-Path $here \"node_modules\"))) { npm install --silent }` and `npm install --silent --prefix \"$uuid.sdPlugin\"`. Both run only when node_modules is absent. Both streamdeck/package-lock.json and streamdeck/com.einfabo.clippiboy.sdPlugin/package-lock.json are tracked, use lockfileVersion 3, and their root dependency specs match package.json exactly (checked by script). npm arborist build-ideal-tree.js (~290-330) starts from the lockfile (loadVirtual) and only re-resolves invalid edges. Release CI uses `npm ci` (release.yml:50-51).",
+    "corrected_claim": "The script does use `npm install`. The stated consequence mostly does not happen: on a fresh tree with an in-sync v3 lockfile, npm >=7 installs exactly the locked versions. The only difference from `npm ci` is what happens after package.json drifts from the lockfile: `npm install` quietly rewrites the lockfile, while ci would fail. The release artifacts are built with `npm ci`, so shipped output is not affected.",
+    "reachable_by": "A developer running install.ps1 after editing package.json without updating the lockfile.",
+    "fix_assessment": "Switching to `npm ci` is harmless and slightly stricter, but optional. The package.json 'setup' script would need the same change to stay consistent."
+   }
+  ]
+ },
+ {
+  "id": "SC-39",
+  "title": "rust-cache is probably useless for release builds",
+  "severity": "low",
+  "category": "dx",
+  "locations": [
+   ".github/workflows/release.yml:35"
+  ],
+  "claim": "release.yml uses swatinem/rust-cache and the comment at .github/workflows/release.yml:35 expects reuse, but caches saved by a run on `refs/tags/vX` are visible only to that ref and to the default branch. No workflow builds Rust on main, so every release likely starts cold.",
+  "scenario": "Every tagged release compiles all ~740 crates from scratch despite the cache step.",
+  "fix": "A main-branch CI job (SC-P-1) would warm the cache.",
+  "reported_confidence": "likely",
+  "slice": "11-supply-chain",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": ".github/workflows/release.yml:12-16 `on: push: tags: [\"v*\"]  workflow_dispatch:`; release.yml:35-38 `# The Rust build is the long part; without a cache every run takes ~15 min.  - uses: swatinem/rust-cache@v2 with: workspaces: src-tauri`. The other workflows do not build Rust: ffmpeg.yml runs on `tags: [\"ffmpeg-*\"]` and pages.yml runs on push to main on ubuntu with no cargo. src-tauri/Cargo.lock has 740 [[package]] entries, which matches the ~740 crates. GitHub's cache scoping (not checkable from source) lets a run restore only caches from its own ref or the default branch. A cache saved under refs/tags/v0.2.0 is therefore invisible to the run for refs/tags/v0.3.0.",
+    "corrected_claim": "The core is right: caches saved by tag-triggered release runs are scoped to that tag and cannot be reused by the next tag. \"No workflow builds Rust on main\" is wrong, though. release.yml has `workflow_dispatch` (line 16), and a trial run dispatched from main builds the same `windows` job with the same rust-cache step. If it succeeds, it saves a cache on refs/heads/main that later tag runs can restore by prefix. That only helps if the dispatch ran recently (GitHub evicts caches unused for 7 days) and the job succeeded (rust-cache's cache-on-failure is off by default). Releases are cold unless such a dispatch happened in the past week. They are not cold unconditionally.",
+    "reachable_by": "Every tagged release run. It costs CI time only and has no correctness or security effect.",
+    "fix_assessment": "The fix works: a scheduled or push-to-main job that builds src-tauri with the same rust-cache settings (or a shared-key) warms the default-branch cache. Running the existing workflow_dispatch on main shortly before tagging also warms it. Note that the dispatch currently passes tagName=main to tauri-action."
+   }
+  ]
+ },
+ {
+  "id": "SC-42",
+  "title": "render-sounds.cjs installs an unpinned native npm module",
+  "severity": "low",
+  "category": "supply-chain",
+  "locations": [
+   "scripts/render-sounds.cjs:7"
+  ],
+  "claim": "scripts/render-sounds.cjs:7 uses an unpinned `npm i --no-save node-web-audio-api`, a native module with install scripts.",
+  "scenario": "Running the script installs whatever version is latest at that moment and runs its install scripts.",
+  "fix": "None stated explicitly; implied pinning of the version.",
+  "reported_confidence": "likely",
+  "slice": "11-supply-chain",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "scripts/render-sounds.cjs:7-8 are comments: `//   npm i --no-save node-web-audio-api` and `//   node scripts/render-sounds.cjs`. The script itself only does `require(\"node-web-audio-api\")` at line 13. Nothing in package.json, package-lock.json, CI or README references the script or the package, and there is no .npmrc (ignore-scripts not set). node-web-audio-api is not in node_modules or the npm cache here, so its install-script behaviour cannot be checked.",
+    "corrected_claim": "The script does not install anything. Running it with the package missing throws MODULE_NOT_FOUND at line 13. The unpinned install is a usage instruction in a header comment, which a maintainer copies by hand to regenerate the WAVs. Following it fetches the latest node-web-audio-api with --no-save, outside the lockfile, and runs any lifecycle scripts it may have. The claim that the package has install scripts is unverified, because it may ship only prebuilt .node binaries. This is a dev-only, rarely run, maintainer-side step that is not in any build or CI path.",
+    "reachable_by": "Only a developer who follows the comment to re-render the notification sounds. A malicious or compromised future node-web-audio-api release would run on that developer's machine. Users, CI and the shipped app are not affected.",
+    "fix_assessment": "Pin the version in the comment (`npm i --no-save node-web-audio-api@<x.y.z>`), or add it as a pinned devDependency so it falls under package-lock integrity hashes. Optionally add --ignore-scripts if the package works without them."
+   }
+  ]
+ },
+ {
+  "id": "SC-44",
+  "title": "src-tauri/Cargo.toml lacks publish = false",
+  "severity": "low",
+  "category": "quality",
+  "locations": [
+   "src-tauri/Cargo.toml"
+  ],
+  "claim": "`src-tauri/Cargo.toml` lacks `publish = false`.",
+  "scenario": "The proprietary crate could be published to crates.io by an accidental `cargo publish`.",
+  "fix": "Add `publish = false` (implied).",
+  "reported_confidence": "likely",
+  "slice": "11-supply-chain",
+  "status": "partial",
+  "final_severity": "info",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "partially_confirmed",
+    "severity_suggestion": "info",
+    "evidence": "src-tauri/Cargo.toml:1-6 `[package] name = \"clippiboy\" version = \"0.8.3\" description = ... edition = \"2021\" rust-version = \"1.77\"`. There is no `publish`, no `license` and no `license-file` key anywhere in the manifest. LICENSE: 'All rights reserved'. package.json files are `\"private\": true` / UNLICENSED.",
+    "corrected_claim": "It is true that the crate has no `publish = false`. An accidental `cargo publish` would still not succeed as the manifest stands: crates.io rejects uploads with no `license` or `license-file` (this is crates.io's server-side check and cannot be verified from local source), and publishing also needs a crates.io API token on the machine. So this is defence-in-depth hygiene, not a reachable leak.",
+    "reachable_by": "Only a maintainer with a crates.io token who runs cargo publish in src-tauri/ after a license field has been added.",
+    "fix_assessment": "Adding `publish = false` to [package] (and to tools/report/Cargo.toml) is a free, correct guard. It is not urgent."
+   }
+  ]
+ },
+ {
+  "id": "SC-3",
+  "title": "Third-party actions on mutable refs run alongside the updater signing key and a contents: write token",
+  "severity": "high",
+  "category": "supply-chain",
+  "locations": [
+   ".github/workflows/release.yml:33",
+   ".github/workflows/release.yml:36",
+   ".github/workflows/release.yml:54",
+   ".github/workflows/release.yml:57-58",
+   ".github/workflows/release.yml:26",
+   ".github/workflows/ffmpeg.yml:21",
+   ".github/workflows/release.yml:40",
+   ".github/workflows/release.yml:50-51"
+  ],
+  "claim": ".github/workflows/release.yml uses third-party actions on mutable refs: `:33` `dtolnay/rust-toolchain@stable` (a branch), `:36` `swatinem/rust-cache@v2`, `:54` `tauri-apps/tauri-action@v0` (currently 84b9d35 = v0.6.2, while v1.0.0 exists). `:57-58` pass the signing key `TAURI_SIGNING_PRIVATE_KEY` and its password in env to tauri-action. `actions/checkout@v4` (release.yml:26, ffmpeg.yml:21) keeps the default `persist-credentials: true`, leaving the `contents: write` token in `.git/config`. `npm ci` (release.yml:40, :50-51) runs dependency install scripts in the same job.",
+  "scenario": "A retagged or compromised action (the tj-actions/changed-files incident pattern) or a malicious npm lifecycle script could read `TAURI_SIGNING_PRIVATE_KEY` and sign a malicious update for every user, or use the token left in `.git/config` to replace release assets (see SC-1).",
+  "fix": "Pin every action to a full SHA and add Dependabot for `github-actions`; set `persist-credentials: false`; run `npm ci --ignore-scripts` where possible; move signing into its own job or step, or an environment (SC-4).",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "not-verified",
+  "final_severity": "high",
+  "votes": []
+ },
+ {
+  "id": "SC-10",
+  "title": "Release workflow never checks that the tag matches the version",
+  "severity": "medium",
+  "category": "quality",
+  "locations": [
+   ".github/workflows/release.yml:3-5",
+   ".github/workflows/ffmpeg.yml:33-37"
+  ],
+  "claim": ".github/workflows/release.yml:3-5 says \"The tag has to match the `version` in `src-tauri/tauri.conf.json`\", but no step enforces it, whereas ffmpeg.yml:33-37 has exactly such a check.",
+  "scenario": "If `v0.9.0` is tagged without bumping `tauri.conf.json` (0.8.3), `latest.json` advertises 0.8.3, nobody is updated, and the release is mislabelled.",
+  "fix": "Add the \"Tag must match versions\" guard step from section 3 (SC-P-3), also comparing `package.json` and `Cargo.toml`.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "SC-4",
+  "title": "Updater signing secrets are repo-level with no environment protection, review gate or tag ruleset",
+  "severity": "medium",
+  "category": "security",
+  "locations": [
+   ".github/workflows/release.yml:7-9"
+  ],
+  "claim": "The updater signing secrets used by .github/workflows/release.yml:7-9 are repo-level secrets with no `environment:` protection. There is no review gate and no tag ruleset (part of the report's \"Signing-key governance\" finding).",
+  "scenario": "Anyone who can push a tag can point a `v*` tag at a commit carrying a modified `release.yml` and print the signing key.",
+  "fix": "Create a `release` environment with required reviewers and a deployment rule limited to `v*` tags, move both secrets there, and add a tag ruleset.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "SC-5",
+  "title": "Updater key password is stored in plaintext beside the key; single key with no rotation or backup",
+  "severity": "medium",
+  "category": "security",
+  "locations": [
+   "README.md:759-765",
+   "README.md:750"
+  ],
+  "claim": "README.md:759-765 documents that \"the key lives under `%USERPROFILE%\\.clippiboy\\updater.key` with its password beside it in `updater.password`\". A plaintext password sitting next to the encrypted key defeats the encryption. There is a single key with no rotation or backup plan, and README.md:750 notes it cannot be recovered if lost (part of the report's \"Signing-key governance\" finding).",
+  "scenario": "Whoever obtains the maintainer's `.clippiboy` folder gets both the encrypted key and its password and can sign updates; if the single key is lost it cannot be recovered.",
+  "fix": "Store the password in a password manager, not beside the key, and keep an offline backup of the key.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "SC-6",
+  "title": "GPLv3 ffmpeg is redistributed without license text or a source offer",
+  "severity": "medium",
+  "category": "legal",
+  "locations": [
+   ".github/workflows/ffmpeg.yml:38-39",
+   ".github/workflows/ffmpeg.yml:52",
+   "scripts/make-probe.mjs:113-117"
+  ],
+  "claim": ".github/workflows/ffmpeg.yml:38-39 zips only the two exes (`Compress-Archive -Path dist-ffmpeg/ffmpeg.exe, dist-ffmpeg/ffprobe.exe`), dropping gyan.dev's LICENSE and README; the release notes at `:52` say only \"(gyan.dev essentials build $version)\". gyan.dev essentials builds are configured `--enable-gpl --enable-version3` (libx264/libx265). `scripts/make-probe.mjs --full` (:113-117) ships the same exes with no license either. Distributing GPLv3 object code requires the license and Corresponding Source, or a written offer, or equivalent access with clear directions (GPLv3 §6). Running ffmpeg as a separate process keeps the proprietary app itself out of scope, but the redistribution obligations still apply.",
+  "scenario": "Every `ffmpeg-*` release ZIP and every `make-probe.mjs --full` bundle redistributes GPLv3 binaries without the license text or source access/offer required by GPLv3 §6.",
+  "fix": "Include `LICENSE.txt` and gyan's README in the ZIP and the release; link to or mirror the exact source and build scripts for that version; mention it in-app and on the site. Alternatively switch to an LGPL build if the GPL encoders are not needed.",
+  "reported_confidence": "likely",
+  "slice": "11-supply-chain",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "SC-7",
+  "title": "No third-party license notices anywhere",
+  "severity": "medium",
+  "category": "legal",
+  "locations": [
+   "LICENSE:23-25",
+   "src",
+   "src-tauri/src",
+   "src-tauri/windows",
+   "site"
+  ],
+  "claim": "A search of `src/`, `src-tauri/src`, `src-tauri/windows` and `site/` found no third-party license or notice file or screen. The only LICENSE is the proprietary one (LICENSE:23-25 says third-party parts \"stay under their own licenses\"). The installer statically links about 740 crates (MIT, Apache-2.0, BSD, ISC; Apache-2.0 also needs its NOTICE files), plus React, zustand, the bundled SQLite and ring. The Stream Deck plugin ships `@elgato/streamdeck`, `ws` and `zod` in `node_modules`. The site serves Inter (OFL). MIT and BSD require the copyright notice in binary distributions.",
+  "scenario": "Every distributed installer, Stream Deck plugin and the website omit the copyright and license notices that the bundled third-party components' licenses require.",
+  "fix": "Generate `THIRD-PARTY-NOTICES` with `cargo about` plus `license-checker` or `npm-license-crawler` in CI, bundle it as a resource, and link it from Settings → About and from the site.",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "SC-8",
+  "title": "No CI quality gate at all",
+  "severity": "medium",
+  "category": "dx",
+  "locations": [
+   ".github/workflows",
+   "server/package.json:9-10"
+  ],
+  "claim": "`.github/` contains only `ffmpeg.yml`, `pages.yml` and `release.yml`. There is no PR or push workflow, no `dependabot.yml`, no `rustfmt`/`clippy`/`deny` config and no `rust-toolchain.toml`. `grep '#[test]' src-tauri/src` counts 271 tests that never run in CI; `server/src/*.test.ts` and server's `tsc --noEmit` (server/package.json:9-10) never run either.",
+  "scenario": "A release is the first time code is compiled in CI, so a broken commit is found at tag time or by users.",
+  "fix": "Add the `ci.yml` from section 3 of the report (see SC-P-1).",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "not-verified",
+  "final_severity": "medium",
+  "votes": []
+ },
+ {
+  "id": "SC-31",
+  "title": "Manual control-port token stored in plain Stream Deck global settings",
+  "severity": "low",
+  "category": "security",
+  "locations": [
+   "streamdeck/src/client.ts",
+   "streamdeck/com.einfabo.clippiboy.sdPlugin/ui/settings.html"
+  ],
+  "claim": "The manually entered ClippiBoy control token is stored in plain Stream Deck global settings, although SDK v3 \"Secrets\" (Stream Deck 6.9+) exists for this purpose.",
+  "scenario": "The control-port token sits in plaintext Stream Deck settings storage readable by anything that reads those settings.",
+  "fix": "Store the token with SDK v3 Secrets (Stream Deck 6.9+).",
+  "reported_confidence": "confirmed",
+  "slice": "11-supply-chain",
+  "status": "refuted",
+  "final_severity": "low",
+  "votes": [
+   {
+    "lens": "code",
+    "verdict": "refuted",
+    "severity_suggestion": "info",
+    "evidence": "Storage is as described: settings.html:109 `<input id=\"token\" type=\"text\" ...>` and :249 `send({ event: \"setGlobalSettings\", context: uuid, payload: { port, token } })`; client.ts:208-210 reads it back only as a fallback after the handshake file. But Secrets cannot hold it. In @elgato/streamdeck 2.1.2, dist/api/command.d.ts:224 lists `GetSecrets` in the PluginCommand union but has no SetSecrets, and system.js:59-66 getSecrets only listens for `didReceiveSecrets`, \"secrets associated with this plugin\" that come \"from Stream Deck\" (api/events/system.d.ts:53-63). There is no API for a plugin or property inspector to write a user-entered value into Secrets. The token is also not more exposed than it already is: ClippiBoy saves it in plaintext in its own config (control.rs:359-365, `config.control.token = token.clone(); ... config::save`) and writes it in plaintext to %APPDATA%\\ClippiBoy\\streamdeck.json (control.rs:379-387, write_handoff), and both are readable by any process running as the same user.",
+    "corrected_claim": "The manual token does sit in plain Stream Deck global settings, but this is not a defect. The suggested store is read-only: SDK Secrets are provided by Stream Deck and the plugin can only fetch them with getSecrets(). And anything that can read the user's Stream Deck settings can already read the same token in plaintext from ClippiBoy's own config.json and streamdeck.json. The token only works against a 127.0.0.1-bound port that refuses browser-originated requests (control.rs:62, :142-158). At most there is a cosmetic point: the property-inspector field is type=\"text\", not type=\"password\".",
+    "reachable_by": "Only a process already running as the same Windows user, which can read the token from ClippiBoy's own files anyway. A Stream Deck backup or profile export could also carry it, but the token is useless off-machine.",
+    "fix_assessment": "The proposed fix cannot be implemented with the SDK as shipped, because there is no set-secrets command. If anything, mask the input (type=\"password\") or use Windows DPAPI. That would require ClippiBoy to protect its own config and handoff file too, which defeats the zero-setup handshake."
+   }
+  ]
+ }
+]

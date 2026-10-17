@@ -1,0 +1,917 @@
+{
+  "slice": "09-frontend-core",
+  "defects": [
+    {
+      "id": "FC-1",
+      "title": "UI config copy goes stale: patchConfig sends the whole stale config and ignores the core's corrected reply",
+      "severity": "high",
+      "category": "bug",
+      "locations": [
+        "src/store.ts:362-373",
+        "src/lib/ipc.ts:47",
+        "src-tauri/src/commands.rs:55-59",
+        "src-tauri/src/commands.rs:72-81",
+        "src-tauri/src/state.rs:367",
+        "src-tauri/src/lib.rs:472-507",
+        "src-tauri/src/lib.rs:542",
+        "src-tauri/src/lib.rs:586",
+        "src-tauri/src/commands.rs:110-118",
+        "src/routes/Recording.tsx:353-356"
+      ],
+      "claim": "patchConfig in src/store.ts:362-373 does `const config = { ...get().config, ...patch }; set({ config }); ... await api.setConfig(config);`, and src/lib/ipc.ts:47 types it as `setConfig: (config: AppConfig) => invoke<void>(\"set_config\", { config })` (also listed under the report's IPC-contract-drift finding: setConfig is typed void but the command returns a config). The core command actually returns AppConfig (commands.rs:55-59) after rewriting it: while a recording runs, a source change is reverted and the core calls `crate::notify(&app, \"error\", \"Stop the recording before changing the source.\")` (commands.rs:72-81); the encoder is replaced by `encode::resolve(...)` (state.rs:367); accent colours are cleaned. The UI discards that reply and keeps (and later resends) its own uncorrected whole config. The core also edits the config on its own and never tells the UI: `repair_screens()` (lib.rs:472-507, called on monitor changes at lib.rs:542 and :586) rewrites `recording.target_id`, the overlay screen and the console screen; there is no `config-changed` event.",
+      "scenario": "(a) During a recording the user picks another monitor; the core refuses but the tile stays \"Selected\". Every later unrelated toggle (a sound, the watermark) resends that target and shows the error toast again; once the recording stops, the next unrelated toggle silently applies the change and restarts the buffer (commands.rs:110-118), discarding buffered footage. (b) The user plugs/unplugs a monitor and `\\\\.\\DISPLAYn` is renumbered; the next unrelated setting change sends the old `targetId`, `target_changed` is true, the replay buffer restarts and everything it held is lost. (c) The user selects an encoder marked \"(not available)\" (selectable, Recording.tsx:353-356); UI and Dashboard keep showing it while the core runs a fallback.",
+      "fix": "1) Type `set_config` as `invoke<AppConfig>` and apply the reply behind a version guard (same ticket pattern as `clips-changed` at store.ts:301): `const v = ++cfgVersion; const next = await api.setConfig(config); if (v === cfgVersion) set({ config: next });`. 2) Emit `config-changed` from the core after `repair_screens`, the tray hint and token changes, and listen for it in `init`. 3) Better: replace the whole-config write with a core-side merged `patch_config(patch)`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-2",
+      "title": "Sliders write every intermediate value; dragging the buffer slider discards footage",
+      "severity": "high",
+      "category": "bug",
+      "locations": [
+        "src/routes/Recording.tsx:393-409",
+        "src/routes/Recording.tsx:468-477",
+        "src-tauri/src/state.rs:381-388",
+        "src-tauri/src/buffer.rs:69-73",
+        "src/routes/settings/Sounds.tsx:257-263",
+        "src/routes/settings/Sounds.tsx:297-303",
+        "Console.tsx:229-236",
+        "src/routes/AudioMixer.tsx:384-391"
+      ],
+      "claim": "The buffer-length slider in Recording.tsx:393-409 uses `onChange={(seconds) => patchConfig({ buffer: { ...config.buffer, seconds, ... } })}` and the memory-budget slider at Recording.tsx:468-477 does the same, so every intermediate drag value is written. The core applies each value immediately: state.rs:381-388 calls `shared.packets.lock().set_capacity(next.buffer.seconds, memory)` and buffer.rs:69-73 `set_capacity` calls `self.trim()`. The same per-move write pattern exists in Sounds.tsx:257-263 and :297-303 (100 steps), the console scale slider in Console.tsx:229-236, and the gain slider in AudioMixer.tsx:384-391 (`upsertSource` on every move).",
+      "scenario": "The buffer holds 10 minutes; the user drags the length slider down past 30 s and back to 5 min. The ring was trimmed to 30 s mid-drag and the footage is gone; the memory slider drops old GOPs the same way. Each tick is a synchronous `set_config` on the Tauri main thread running `replace_config`, which writes the config file (`config::save`), may spawn an audio-refresh thread enumerating the process tree, and calls `apply_autostart` (registry read), `overlay::reposition` and `console::relayout` - 30-100 times per drag. With optimistic updates and last-reply-wins, the thumb can also jump back while dragging.",
+      "fix": "Give `Slider` a local draft value and an `onCommit` callback fired on `pointerup`/`keyup` (or `change`) and write only on commit; alternatively reuse the `SETTLE_MS` debounce from Colors.tsx:29-34. On the core side, debounce `config::save`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-3",
+      "title": "Main window keeps rendering and receiving 20 Hz IPC while the user is gaming",
+      "severity": "high",
+      "category": "perf",
+      "locations": [
+        "src-tauri/tauri.conf.json:27",
+        "src-tauri/src/overlay.rs:40-56",
+        "src-tauri/src/lib.rs:964-967",
+        "src/store.ts:272",
+        "src/routes/Clips.tsx:707",
+        "src/components/NavBar.tsx:176",
+        "src/components/NavBar.tsx:49",
+        "src/styles/motion.css:132-134",
+        "src/lib/accent.ts:157"
+      ],
+      "claim": "tauri.conf.json:27 gives the main window `--disable-features=...CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding`; per overlay.rs:40-56 and the README these flags exist for the banner, which now has its own data dir and browser process. The core emits `audio-levels` to `main` at 20 Hz whenever the window is visible and not minimized (lib.rs:964-967), including when behind the game, and store.ts:272 does `set({ levels })` on every page even with no meter on screen; each `set` runs every subscriber's selector (the gallery has one per tile, `NameField`, Clips.tsx:707). NavBar.tsx:176 renders `<LiveDot />` whenever the buffer runs, an infinite animation (motion.css:132-134, `cb-live-ring 2s infinite`) inside a `backdropFilter: \"blur(20px)\"` pill (NavBar.tsx:49), so the compositor produces frames continuously and likely re-blurs each frame. In RGB accent mode accent.ts:157 runs `setInterval(refresh, 80)` rewriting 16 root custom properties (whole-document style recalc), gated only by `!document.hidden`, which does not change when the window is merely occluded once occlusion detection is off.",
+      "scenario": "While the user is gaming with ClippiBoy's main window open behind the game, the main window keeps animating, re-blurring, recalculating styles every 80 ms in RGB mode (huge with a 1000-tile gallery) and processing 20 Hz level IPC that notifies every store subscriber, costing CPU/GPU during gameplay. Code facts confirmed; magnitude needs measuring.",
+      "fix": "1) Drop the three occlusion/backgrounding flags from the main window. 2) Add a frontend \"dormant\" mode driven by `onHidden`, `blur`, `focus` from lib/hidden.ts: set `html[data-dormant]` with `[data-dormant] [class*=\"cb-\"]{animation-play-state:paused}` and stop the accent interval. 3) Make levels opt-in (ref-counted `api.watchLevels(on)` while a `Meter` is mounted, or a separate tiny levels store). 4) Throttle RGB mode to 2-4 Hz or animate it with `filter: hue-rotate()` on the few accent surfaces.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-4",
+      "title": "Clip gallery is unvirtualized and unmemoized; each tile pays for an uncached toLocaleDateString",
+      "severity": "medium",
+      "category": "perf",
+      "locations": [
+        "src/lib/format.ts:24",
+        "src/routes/Clips.tsx:625",
+        "src/routes/Clips.tsx:199-225",
+        "src/components/ui/Card.tsx:38",
+        "src/routes/Clips.tsx:557",
+        "src/routes/Clips.tsx:1180"
+      ],
+      "claim": "format.ts:24 does `new Date(ts).toLocaleDateString(\"en-US\", { day: \"numeric\", month: \"long\", year: \"numeric\" })` once per tile per render (Clips.tsx:625); measured in Node/V8 at 63-81 ms per 1000 calls versus about 1 ms with a cached `Intl.DateTimeFormat`. `visible` (Clips.tsx:199-225) and every tile are rebuilt inline on every render (each search keystroke, `clips-changed`, `links` change, rename or confirm-state change). Each tile carries 2-4 `Pill`s with `backdrop-blur-md` (Card.tsx:38) plus heart/action buttons with `backdrop-blur-md` (Clips.tsx:557, :1180), so hundreds of backdrop-filter surfaces re-blur while scrolling. On first visit every tile, including off-screen ones, gets `cb-tile-in`.",
+      "scenario": "With a large library (hundreds to 1000 clips), every keystroke in search or any clips-changed event re-renders all tiles and reformats every date, and scrolling re-blurs hundreds of surfaces, making the gallery sluggish.",
+      "fix": "Hoist `const DATE = new Intl.DateTimeFormat(...)` in format.ts; extract a `ClipTile` wrapped in `React.memo` with stable id-keyed callbacks and memoize `visible` with `useMemo([clips, query, filter])`; add `content-visibility:auto; contain-intrinsic-size:auto 300px` to tiles or virtualize rows (e.g. `@tanstack/react-virtual`), so `useFlip` animates only mounted rows; replace `backdrop-blur` on tile chrome with solid `bg-black/60`; pass `updateClip` into `NameField` instead of subscribing per tile.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-5",
+      "title": "Mixer source label saves on every keystroke; a stale reply can drop typed characters",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "src/routes/AudioMixer.tsx:333-337",
+        "src/store.ts:418-423"
+      ],
+      "claim": "AudioMixer.tsx:333-337 has `onChange={(e) => upsertSource({ ...source, label: e.target.value })}`, and store.ts:418-423 then does `set({ config: await api.updateAudioSource(source) })` unconditionally (last reply wins, no version guard). The same last-reply-wins problem affects gain, mute and solo.",
+      "scenario": "Each keystroke means one IPC call, `replace_config`, a config file write and an audio-refresh thread. If a reply arrives after the next keystroke (main thread busy with a file dialog or slow disk), the store snaps the label back to the older value; the controlled input jumps and the next keystroke is appended to the stale text, losing characters. (Character loss under load is likely.)",
+      "fix": "Keep a draft label and commit on blur/Enter, as `NameField` already does (Clips.tsx:697-771). Add the version guard from FC-1 to `upsertSource`/`removeSource`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-6",
+      "title": "Mock data is the real store's initial config and its fallback in Tauri mode",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "src/store.ts:164",
+        "src/store.ts:263"
+      ],
+      "claim": "store.ts:164 initialises the store with `config: mock.mockConfig`, and store.ts:263 loads with `load(\"Reading the settings\", api.getConfig, get().config)`, i.e. the mock config is the fallback if `get_config` fails, also in Tauri mode.",
+      "scenario": "Until `getConfig` returns, the Dashboard shows fake values (\"3 audio sources\", \"1080p60 · NVENC\"). If `get_config` fails, the app marks itself `ready` with the mock config; the next `patchConfig` writes fake PIDs as audio sources, clipDir `C:\\Users\\user\\Videos\\ClippiBoy`, the mock hotkeys and `token: \"mock-token\"` into the user's real config. The core keeps a token only if it arrives empty, so the Stream Deck stops working. (Code path confirmed; failure unlikely but damaging.)",
+      "fix": "Use `config: AppConfig | null` (or a `loaded` flag), don't render config-dependent routes until loaded, never fall back to mock in Tauri, and make `patchConfig` refuse to run before load.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-7",
+      "title": "Errors only show at the bottom of Settings and are never cleared",
+      "severity": "medium",
+      "category": "ux",
+      "locations": [
+        "src/routes/settings/index.tsx:80-84",
+        "src/store.ts:188"
+      ],
+      "claim": "Every failing store action calls `set({ lastError })` (`updateClip`, `setFavorite`, `setClipTags`, `patchConfig`, `clearGame`, `toggleBuffer`, `refreshTargets` and others), but `lastError` is only displayed in settings/index.tsx:80-84, and nothing ever sets `lastError: null` after the initial state (store.ts:188).",
+      "scenario": "A failed rename or heart in the gallery gives no feedback at all. A startup error such as \"Reading applications failed\" sits under every Settings tab forever.",
+      "fix": "Add a store-level `notify(kind, msg)` that feeds `Toasts` (which should also get `role=\"status\"`/`aria-live`). Make `lastError` dismissible, or drop it.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-8",
+      "title": "Dashboard player tracks a position in a live list and never files clips",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "src/routes/Dashboard.tsx:80-83",
+        "src/routes/Dashboard.tsx:271-279",
+        "src/routes/Clips.tsx:344-376"
+      ],
+      "claim": "Dashboard.tsx:80-83 derives `recent = clips.filter(...).slice(0, 3)` and Dashboard.tsx:271-279 passes `index={Math.min(playing, recent.length - 1)}` with `onClose={() => setPlaying(null)}`, so the player is keyed by index into a live list (unlike the gallery's `shownId` handling at Clips.tsx:344-376). Favorites or game edits made in the Dashboard player never call `fileClip`.",
+      "scenario": "While the user watches a recent clip, a new clip arrives (hotkey, console, a friend's clip); `clip-saved` prepends it, the same index now points to a different clip, and the player switches mid-playback. Favorite/game edits in the Dashboard player leave files in the wrong folder until the next start.",
+      "fix": "Extract the gallery's playlist logic (`playlist`, `shownId`, `coming`, `touched`, `deletedHere`) into a `usePlayerSession()` hook and use it in both places.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-9",
+      "title": "Clearing a game makes one IPC write per clip and change events undo the optimistic update mid-loop",
+      "severity": "medium",
+      "category": "bug",
+      "locations": [
+        "src/store.ts:570-578",
+        "src-tauri/src/commands.rs:941",
+        "src/store.ts:302-310"
+      ],
+      "claim": "`clearGame` in store.ts:570-578 loops `await api.updateClip(...)` then `await get().fileClip(...)` per clip. Each `update_clip` runs `announce_change`, which emits `clips-changed` (commands.rs:941), and the listener at store.ts:302-310 re-reads the full clip list each time.",
+      "scenario": "Removing a game with 200 clips means 200 writes, 200 full-list IPC reads and gallery re-renders. The re-reads restore the game on clips not yet processed, so the chip comes back and counts down. A failure partway through leaves the UI out of sync with no rollback.",
+      "fix": "Add a single `clear_game(game)` core command that runs in one transaction and announces once.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-10",
+      "title": "Hotkey recorder cannot be started from the keyboard; recorder/Unbind buttons not tied to row labels",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "src/routes/settings/Hotkeys.tsx:329-333"
+      ],
+      "claim": "In settings/Hotkeys.tsx:329-333 recording starts only on `onMouseDown`; Enter/Space fire `click`, not mousedown, so keyboard users cannot assign hotkeys. The recorder button and the \"Unbind\" buttons are not associated with their row labels.",
+      "scenario": "A keyboard-only user tabs to a hotkey recorder and presses Enter or Space; nothing starts recording, so they cannot assign hotkeys. Screen readers announce the buttons without the row's label.",
+      "fix": "Add an `onClick`/`onKeyDown` path to start recording, and tie the recorder and Unbind buttons to their row labels.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-11",
+      "title": "Most Toggles have no accessible name",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "src/routes/settings/shared.tsx:54-71",
+        "src/routes/settings/Behaviour.tsx:226",
+        "src/routes/settings/Banner.tsx",
+        "src/routes/settings/Console.tsx",
+        "src/routes/settings/Friends.tsx",
+        "src/routes/settings/Sounds.tsx",
+        "src/routes/AudioMixer.tsx:578"
+      ],
+      "claim": "24 of 33 `<Toggle>`s have no `label`, because `Row` renders its label in a `<p>` (settings/shared.tsx:54-71) without wiring it to the control; examples: Behaviour.tsx:226, Banner, Console, Friends, Sounds settings, and `QuickSetup` at AudioMixer.tsx:578.",
+      "scenario": "A screen-reader user reaches a toggle in Settings and hears only \"switch, on/off\" with no name.",
+      "fix": "Add a `ToggleRow` that wires `aria-labelledby` to the row label.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-12",
+      "title": "Recording page selects have no labels",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "src/routes/Recording.tsx:292-372"
+      ],
+      "claim": "The Resolution, Frame rate, Quality, Encoder and Keyframe interval selects in Recording.tsx:292-372 have no `label`.",
+      "scenario": "Screen-reader users hear unnamed comboboxes on the Recording page.",
+      "fix": "Give each select an accessible label.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-13",
+      "title": "Mixer M/S/⧉ buttons and label input are unnamed and lack state",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "src/routes/AudioMixer.tsx:608-633",
+        "src/routes/AudioMixer.tsx:333"
+      ],
+      "claim": "The M/S/⧉ `MiniToggle`s (AudioMixer.tsx:608-633) have no `aria-pressed`/`aria-label`; ⧉ only has a `title`. The source label `<input>` (AudioMixer.tsx:333) is unnamed.",
+      "scenario": "Screen-reader users cannot tell what the mute/solo/⧉ buttons do or whether they are on, and the label field is announced without a name.",
+      "fix": "Add `aria-pressed` and `aria-label` to the MiniToggles and a label to the input.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-14",
+      "title": "Gallery tile actions stay invisible when keyboard-focused",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "src/routes/Clips.tsx:560",
+        "src/routes/Clips.tsx:572"
+      ],
+      "claim": "The heart, folder and delete buttons on tiles use `opacity-0 group-hover:opacity-100` (Clips.tsx:560, :572) with no `focus-visible`/`group-focus-within` reveal.",
+      "scenario": "A keyboard user tabs through the gallery and focus lands on invisible buttons.",
+      "fix": "Reveal the actions on `focus-visible` / `group-focus-within`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-15",
+      "title": "Dashboard clip cards and Stat cards are clickable divs without keyboard support",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "src/routes/Dashboard.tsx:227-231",
+        "src/routes/Dashboard.tsx:300-303"
+      ],
+      "claim": "Dashboard clip cards and Stat cards (Dashboard.tsx:227-231, :300-303) are `div onClick` with no role, `tabIndex` or keyboard handling.",
+      "scenario": "Keyboard and screen-reader users cannot open recent clips or stat targets from the Dashboard.",
+      "fix": "Use buttons/links, or add role, tabIndex and key handling.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-16",
+      "title": "Focus is lost to <body> when delete is swapped for ConfirmDelete",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "src/components/ui/ConfirmDelete.tsx"
+      ],
+      "claim": "Clicking delete swaps the trigger for `ConfirmDelete`, so the focused element disappears and focus falls to `<body>`.",
+      "scenario": "A keyboard user activates delete and loses their place; the next Tab starts from the top of the document.",
+      "fix": "Move focus to ConfirmDelete's Cancel button (the safe default).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-17",
+      "title": "Menu opened by keyboard on Friends \"More\" appears top-left",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "src/routes/Friends.tsx:448"
+      ],
+      "claim": "A menu opened by keyboard-activating \"More\" (Friends.tsx:448, `onClick={openMenu}`) is positioned from the event's `clientX/Y`, which are 0 for keyboard-generated clicks.",
+      "scenario": "A keyboard user presses Enter on \"More\" and the menu appears at the top-left corner of the window, away from the button.",
+      "fix": "Use the button's bounding rect when `event.detail === 0`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-18",
+      "title": "Menu lacks Home/End/Tab handling and aria-activedescendant",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "src/components/ui/Menu.tsx"
+      ],
+      "claim": "The Menu component has no Home/End/Tab keyboard handling and no `aria-activedescendant`.",
+      "scenario": "Keyboard users cannot jump to first/last items or Tab out cleanly, and screen readers are not told which item is active.",
+      "fix": "Add Home/End/Tab handling and `aria-activedescendant`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-19",
+      "title": "Missing ARIA state on Segmented, NavBar and Toasts",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "src/components/ui/Controls.tsx",
+        "src/components/NavBar.tsx",
+        "src/components/Toasts.tsx"
+      ],
+      "claim": "`Segmented` has no `aria-pressed` or radiogroup semantics; the NavBar has no `aria-current=\"page\"`; Toasts have no live region.",
+      "scenario": "Screen-reader users cannot tell which segment or page is selected, and toast messages are never announced.",
+      "fix": "Add radiogroup/`aria-pressed` semantics to Segmented, `aria-current=\"page\"` to the active NavBar item and an `aria-live` region for Toasts.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-20",
+      "title": "--color-ink-faint fails WCAG AA contrast",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "src/styles/tokens.css"
+      ],
+      "claim": "`--color-ink-faint: #5c5c68` measures 2.84:1 on surface, 2.63:1 on elevated and 3.04:1 on base, failing WCAG AA; it is used 83 times, mostly for small hint text.",
+      "scenario": "Low-vision users cannot read hint text rendered in ink-faint.",
+      "fix": "Use `#80808c`, which gives 4.79:1 and 4.44:1.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-21",
+      "title": "Reduced-motion rule covers only cb-* animations",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "src/styles/motion.css:377",
+        "src/routes/Friends.tsx:164",
+        "src/components/ui/SlidingIndicator.tsx"
+      ],
+      "claim": "The reduced-motion block at motion.css:377 covers only `cb-*` animations; Tailwind `transition-*`, `SlidingIndicator` and `animate-pulse` (Friends.tsx:164) ignore `prefers-reduced-motion`.",
+      "scenario": "A user with reduced motion enabled still sees transitions, the sliding indicator and pulsing placeholders.",
+      "fix": "Add `motion-reduce:transition-none` or a global reduced-motion rule.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-22",
+      "title": "Keyboard reorder in the mixer loses focus after one step",
+      "severity": "medium",
+      "category": "a11y",
+      "locations": [
+        "src/routes/AudioMixer.tsx:201-208"
+      ],
+      "claim": "`nudge` with ArrowDown (AudioMixer.tsx:201-208) makes React move the focused row's DOM node, so focus is lost after one step.",
+      "scenario": "A keyboard user presses ArrowDown on a source's grip to move it; after one move focus is lost and further presses do nothing.",
+      "fix": "Re-focus the grip after the move.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-23",
+      "title": "No ESLint config although eslint-disable comments exist; floating promises go undetected",
+      "severity": "medium",
+      "category": "quality",
+      "locations": [
+        "src/components/ClipPlayer.tsx:210",
+        "src/components/Setup.tsx:128",
+        "src/components/Share.tsx:295",
+        "src/components/ShotViewer.tsx:362",
+        "src/components/ShotViewer.tsx:414",
+        "src/routes/AudioMixer.tsx:242",
+        "src/routes/Clips.tsx:602"
+      ],
+      "claim": "The repo has no ESLint config, yet five `eslint-disable-next-line react-hooks/exhaustive-deps` comments exist (ClipPlayer.tsx:210, Setup.tsx:128, Share.tsx:295, ShotViewer.tsx:362, :414). Without `@typescript-eslint/no-floating-promises`, floating promises such as `upsertSource(s);` (AudioMixer.tsx:242) and `inTauri && api.revealClip()` (Clips.tsx:602) go unflagged.",
+      "scenario": "Hook-dependency mistakes and unhandled promise rejections slip into the frontend with no lint step to catch them.",
+      "fix": "Add a flat ESLint config with `eslint`, `typescript-eslint`, `eslint-plugin-react-hooks` (recommended-latest) and `eslint-plugin-jsx-a11y`, and enable `@typescript-eslint/no-floating-promises`.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-24",
+      "title": "No frontend tests",
+      "severity": "medium",
+      "category": "test-gap",
+      "locations": [
+        "package.json"
+      ],
+      "claim": "There is no frontend test setup or test file; pure functions such as `format.ts`, Hotkeys `accelerator`/`risky`/`supported`, Recording `fit`/`fpsChoices`/`memoryBudgetMb`, `screenChoice`, `slotFor`/`usePresence`, `timeLeft` and `lastSeenText` are untested.",
+      "scenario": "Regressions in store logic or pure helpers are not caught before release.",
+      "fix": "Add `vitest` with `jsdom`, `@testing-library/react`, and `mockIPC`/`clearMocks` from `@tauri-apps/api/mocks` for store tests; test the listed pure functions first (move Recording helpers into `lib/`).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-25",
+      "title": "No pull-request CI: nothing runs tsc on PRs",
+      "severity": "medium",
+      "category": "dx",
+      "locations": [
+        ".github/workflows/release.yml",
+        ".github/workflows/ffmpeg.yml",
+        ".github/workflows/pages.yml"
+      ],
+      "claim": "`.github/workflows` only contains release, ffmpeg and pages workflows; nothing runs `tsc` (or lint/tests) on pull requests.",
+      "scenario": "A PR that breaks type-checking or the Rust tests is merged without any automated check.",
+      "fix": "Add a `ci.yml` on `pull_request` running `npm ci && tsc --noEmit && eslint . && vitest run`, plus `cargo test` on Windows.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-26",
+      "title": "tsconfig lacks noUncheckedIndexedAccess (51 errors when enabled)",
+      "severity": "medium",
+      "category": "quality",
+      "locations": [
+        "tsconfig.json",
+        "src/components/ui/Menu.tsx:166",
+        "src/components/ui/Menu.tsx:175",
+        "src/routes/AudioMixer.tsx:184",
+        "src/routes/AudioMixer.tsx:206",
+        "src/routes/Clips.tsx:519",
+        "src/routes/Friends.tsx:107",
+        "src/routes/Recording.tsx:37"
+      ],
+      "claim": "`tsconfig` lacks `noUncheckedIndexedAccess` (and `noImplicitReturns`). Enabling it yields 51 errors; the ones in this slice are Menu.tsx:166, :175, AudioMixer.tsx:184, :206, Clips.tsx:519, Friends.tsx:107 and Recording.tsx:37.",
+      "scenario": "Indexed accesses that may be undefined are typed as defined, hiding possible runtime `undefined` errors at those sites.",
+      "fix": "Turn on `noUncheckedIndexedAccess` and `noImplicitReturns` and fix the reported errors.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-27",
+      "title": "vite.config.ts is not type-checked",
+      "severity": "medium",
+      "category": "dx",
+      "locations": [
+        "vite.config.ts"
+      ],
+      "claim": "`vite.config.ts` is not covered by the TypeScript type-check (`tsc --noEmit`).",
+      "scenario": "Type errors in the Vite config go unnoticed until build time.",
+      "fix": "Include vite.config.ts in a type-checked tsconfig (e.g. a node tsconfig) and run it in a `typecheck` script.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-28",
+      "title": "Oversized components: Clips.tsx (1187 lines) and AudioMixer.tsx (866 lines)",
+      "severity": "medium",
+      "category": "quality",
+      "locations": [
+        "src/routes/Clips.tsx",
+        "src/routes/AudioMixer.tsx"
+      ],
+      "claim": "`Clips.tsx` has 1187 lines and `AudioMixer.tsx` 866 lines, each mixing many sub-components and hooks.",
+      "scenario": "Large files make memoization, testing and review hard and contribute to the gallery's full re-renders.",
+      "fix": "Split Clips.tsx into `ClipTile` (memo), `FilterBar` (`GameFilters`, `Chip`, `ConfirmChip`), `NameField`, `SearchField`, a `useGalleryFilter` hook (counts and visible list) and `usePlayerSession`. Split AudioMixer.tsx into `SourceRow` (memo), `useSourceDrag`, and move `QuickSetup`/`AddSourcePanel` out.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-29",
+      "title": "Inverted dependencies: components import from routes",
+      "severity": "medium",
+      "category": "quality",
+      "locations": [
+        "src/components/Setup.tsx:11-14",
+        "src/components/Share.tsx:11"
+      ],
+      "claim": "Components import from routes: Setup.tsx:11-14 takes `TargetCard`, `QuickSetup`, `Hotkeys` and `Row` from route files, and Share.tsx:11 takes `Avatar`.",
+      "scenario": "Shared UI pieces live in route modules, coupling global overlays to route code.",
+      "fix": "Move these into `components/`.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-30",
+      "title": "Row component exists twice",
+      "severity": "medium",
+      "category": "quality",
+      "locations": [
+        "src/routes/Recording.tsx:492",
+        "src/routes/settings/shared.tsx:54"
+      ],
+      "claim": "`Row` is defined twice: Recording.tsx:492 and settings/shared.tsx:54.",
+      "scenario": "The two copies can drift (e.g. an a11y fix to one Row is missed in the other).",
+      "fix": "Keep a single shared Row in components/.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-31",
+      "title": "Friends route reports errors through a window CustomEvent",
+      "severity": "medium",
+      "category": "quality",
+      "locations": [
+        "src/routes/Friends.tsx:14-17"
+      ],
+      "claim": "`report()` in routes/Friends.tsx:14-17 sends errors through a window `CustomEvent` instead of the store.",
+      "scenario": "Error reporting bypasses the normal store/toast path, an odd side channel that is hard to trace.",
+      "fix": "Route errors through a store-level notify function.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-32",
+      "title": "init() is not idempotent; listeners register twice and are never removed",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src/App.tsx:31-33",
+        "src/store.ts:272-332",
+        "src/store.ts:228",
+        "src/lib/friends.ts",
+        "src/lib/share.ts",
+        "src/lib/links.ts",
+        "src/lib/hidden.ts"
+      ],
+      "claim": "App.tsx:31-33 calls `void init()` in an effect, which StrictMode runs twice in dev. Every `listen()` in store.ts:272-332 registers twice and is never removed. In browser mode there are two 80 ms intervals (store.ts:228). Vite HMR repeats this for the module-level listeners in friends.ts, share.ts, links.ts and hidden.ts.",
+      "scenario": "In dev, events are handled twice and `clips-changed` triggers two reads; HMR accumulates duplicate listeners. (Dev only.)",
+      "fix": "A module-level `initPromise ??= ...` guard, and keep the unlisten handles.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-33",
+      "title": "Startup snapshots in friends/share stores can overwrite newer pushes",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src/lib/friends.ts:42-43",
+        "src/lib/share.ts:40-41"
+      ],
+      "claim": "friends.ts:42-43 and share.ts:40-41 register `listen` and fire the initial snapshot `invoke` in parallel; the snapshot reply is applied with `setState(view, true)` regardless of whether a push already arrived.",
+      "scenario": "A push event arrives before the snapshot reply; the older snapshot then replaces the newer pushed state.",
+      "fix": "Ignore the snapshot if an event has already arrived, or add a version field.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-34",
+      "title": "useLinks.refresh has no ticket and can race itself",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src/lib/links.ts:63"
+      ],
+      "claim": "`useLinks.refresh` (links.ts:63) applies results without a ticket/version guard.",
+      "scenario": "Two overlapping refreshes resolve out of order and the older result overwrites the newer one.",
+      "fix": "Add a ticket/version guard to refresh.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-35",
+      "title": "Text-field menu Paste into number inputs prepends and throws",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src/lib/dom.ts:48",
+        "src/components/TextMenu.tsx:31-37",
+        "src/components/ui/ColorPicker.tsx:222"
+      ],
+      "claim": "dom.ts:48 includes `\"number\"` in the text input types. In TextMenu.tsx:31-37, `selectionStart` is `null` for number inputs (treated as 0), so pasted text is prepended, and then `setSelectionRange` throws `InvalidStateError` (an unhandled rejection from the async `onSelect`). Paste also bypasses `maxLength`.",
+      "scenario": "Using the context-menu Paste on the RGB number fields in ColorPicker.tsx:222 prepends the pasted text to the current value and raises an unhandled InvalidStateError.",
+      "fix": "Handle number fields separately (replace the whole value) and wrap the call in try/catch.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-36",
+      "title": "Record and buffer buttons have no in-flight guard",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src/store.ts:454-471",
+        "src/store.ts:432-442",
+        "src-tauri/src/state.rs:975"
+      ],
+      "claim": "The record (store.ts:454-471) and buffer (store.ts:432-442) actions have no in-flight guard; the buffer toggle flips optimistically.",
+      "scenario": "Double-clicking \"Record\" either gives a spurious \"A recording is already running.\" (from the core's lifecycle lock in state.rs:975) or stops the just-started recording. The optimistic buffer flip can flicker until the next 1 Hz status.",
+      "fix": "Add `recordingBusy`/`bufferBusy` state and disable the buttons while a call is in flight.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-37",
+      "title": "Page scroll position carries over between routes",
+      "severity": "low",
+      "category": "ux",
+      "locations": [
+        "src/App.tsx:65"
+      ],
+      "claim": "`<main className=\"... overflow-y-auto\">` (App.tsx:65) keeps its `scrollTop` across the keyed route swap; nothing resets or restores it per route.",
+      "scenario": "Leaving a scrolled gallery opens Settings scrolled down, and returning to the gallery loses its own scroll position.",
+      "fix": "Reset or restore the scroll position per route.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-38",
+      "title": "screenshotHasOriginal invokes an unregistered command (dead code)",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "src/lib/ipc.ts:150-151",
+        "src-tauri/src/lib.rs:1283-1365"
+      ],
+      "claim": "`screenshotHasOriginal` in ipc.ts:150-151 invokes `screenshot_has_original`, which is not registered in the invoke handler list in lib.rs:1283-1365. It is unused.",
+      "scenario": "Any future caller would get a command-not-found error at runtime.",
+      "fix": "Remove the wrapper or register the command.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-39",
+      "title": "ipc.ts hotkey doc says \"All four at once\" for five hotkeys",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "src/lib/ipc.ts:53-54"
+      ],
+      "claim": "The doc comment at ipc.ts:53-54 says \"All four at once\" while there are five hotkeys.",
+      "scenario": "Misleading documentation for the hotkey IPC call.",
+      "fix": "Correct the comment.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-40",
+      "title": "Outdated comment in store.ts about saving on every keystroke",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "src/store.ts:490"
+      ],
+      "claim": "The comment at store.ts:490 about saving on every keystroke is outdated; `ClipMeta` now saves on blur.",
+      "scenario": "Misleading comment for maintainers.",
+      "fix": "Update or remove the comment.",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-41",
+      "title": "EngineStatus fields are dropped by the store and never shown",
+      "severity": "low",
+      "category": "quality",
+      "locations": [
+        "src/store.ts:273-285"
+      ],
+      "claim": "The `EngineStatus` fields `droppedFrames`, `fps`, `freeBytes`, `gameSeconds` and `encoder` are dropped by store.ts:273-285 and never shown in the UI.",
+      "scenario": "Health data the core already sends (dropped frames, real encoder, free disk space, game session) is invisible to the user.",
+      "fix": "Keep these fields in the store and surface them (e.g. a health panel).",
+      "reported_confidence": "confirmed"
+    },
+    {
+      "id": "FC-42",
+      "title": "lockdown.ts matches physical event.code, missing zoom shortcuts on QWERTZ",
+      "severity": "low",
+      "category": "security",
+      "locations": [
+        "src/lib/lockdown.ts"
+      ],
+      "claim": "`lockdown.ts` matches shortcuts on physical `event.code`, so on QWERTZ keyboards Ctrl+`+`/Ctrl+`-` (codes `BracketRight` and `Slash`) are not caught; it relies on Tauri's own zoom disable.",
+      "scenario": "A user with a German keyboard presses Ctrl++ / Ctrl+-; the lockdown handler does not block it and only Tauri's zoom disable stands in the way.",
+      "fix": "Match on `event.key` as well; (unverified) WebView2 `AreBrowserAcceleratorKeysEnabled=false` would be the robust lock if the wry/Tauri version exposes it.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-43",
+      "title": "Unused opener and global-shortcut capabilities and npm plugins (least privilege)",
+      "severity": "low",
+      "category": "security",
+      "locations": [
+        "src-tauri/capabilities/default.json:16",
+        "src-tauri/capabilities/default.json:19",
+        "package.json"
+      ],
+      "claim": "capabilities/default.json:16,19 grant the main window `opener:default` (lets page JavaScript open any http(s) URL) and `global-shortcut:default`, but the frontend uses neither; the npm deps `@tauri-apps/plugin-opener` and `plugin-global-shortcut` are unused too.",
+      "scenario": "If script ever runs in the main webview, it can open arbitrary http(s) URLs and register global shortcuts via permissions the app does not need.",
+      "fix": "Remove the two permissions and the unused npm dependencies.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-44",
+      "title": "Menu re-subscribes five window listeners on every render",
+      "severity": "low",
+      "category": "perf",
+      "locations": [
+        "src/components/ui/Menu.tsx:143-192"
+      ],
+      "claim": "The effect in Menu.tsx:143-192 depends on `selectable` and `run`, which are new on every render, so it removes and re-adds five window listeners on every render.",
+      "scenario": "Every re-render of an open menu churns five window listeners.",
+      "fix": "Memoize `selectable`/`run` or read them through refs so the effect subscribes once.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-45",
+      "title": "Meter keeps a 60 ms interval forever and animates width",
+      "severity": "low",
+      "category": "perf",
+      "locations": [
+        "src/components/ui/Controls.tsx:163-197"
+      ],
+      "claim": "`Meter` (Controls.tsx:163-197) keeps a 60 ms `setInterval` per meter for its whole lifetime and animates `width`, which triggers layout.",
+      "scenario": "Each visible meter runs a timer and forces layout continuously, even when levels are idle.",
+      "fix": "Use a ref plus `transform: scaleX` driven by requestAnimationFrame.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-46",
+      "title": "SlidingIndicator transitions width",
+      "severity": "low",
+      "category": "perf",
+      "locations": [
+        "src/components/ui/SlidingIndicator.tsx"
+      ],
+      "claim": "`SlidingIndicator` transitions `width` (a layout property) rather than a transform.",
+      "scenario": "Each indicator move triggers layout on every animation frame.",
+      "fix": "Animate with `transform` (scaleX/translateX) instead of width.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-47",
+      "title": "Tray icon sent as a 64 KB JSON number array",
+      "severity": "low",
+      "category": "perf",
+      "locations": [
+        "src/lib/accent.ts:142"
+      ],
+      "claim": "accent.ts:142 sends the 64 KB tray icon to the core as a JSON number array (`Array.from(pixels)`).",
+      "scenario": "Every accent refresh (every 80 ms in RGB mode) serializes and parses a large JSON array over IPC.",
+      "fix": "Send the pixels as binary.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-48",
+      "title": "Usage-stats notice marks itself as read while stats default to on",
+      "severity": "low",
+      "category": "privacy",
+      "locations": [
+        "src/components/UsageNotice.tsx:40-41",
+        "src-tauri/src/model.rs"
+      ],
+      "claim": "UsageNotice.tsx:40-41 sets `usageStatsNoticed: true` after 10 s of focused display without user action, while usage stats default to on (`model.rs` `usage_stats` default `yes`).",
+      "scenario": "A user who glances away or does not read the notice is recorded as having noticed it, and stats stay on without an explicit choice.",
+      "fix": "Require an explicit \"Got it\" or a choice.",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-49",
+      "title": "Library::delete ignores remove_file errors, leaving orphan files",
+      "severity": "low",
+      "category": "bug",
+      "locations": [
+        "src-tauri/src/clips.rs"
+      ],
+      "claim": "`Library::delete` uses `remove_file` and ignores its errors, so when the file cannot be removed the database entry is gone but the file stays on disk.",
+      "scenario": "The user deletes a clip whose file is locked (e.g. open in a player); the clip disappears from the gallery but its file remains as an orphan on disk.",
+      "fix": "Handle the remove_file error (and delete to the Recycle Bin instead).",
+      "reported_confidence": "likely"
+    },
+    {
+      "id": "FC-50",
+      "title": "Memory-budget slider cannot return to automatic (0) once dragged",
+      "severity": "low",
+      "category": "ux",
+      "locations": [
+        "src/routes/Recording.tsx:468-477"
+      ],
+      "claim": "Once the memory-budget slider on the Recording page has been dragged, it cannot go back to 0 (automatic); there is no \"Auto\" choice.",
+      "scenario": "A user experiments with the memory budget and cannot restore the automatic default.",
+      "fix": "Add an \"Auto\" choice for the memory budget.",
+      "reported_confidence": "likely"
+    }
+  ],
+  "proposals": [
+    {
+      "id": "FC-P-1",
+      "title": "Frontend lint setup",
+      "area": "tooling",
+      "value": "Catches hook-dependency bugs, floating promises and a11y issues automatically.",
+      "effort": "S",
+      "sketch": "Flat ESLint config with `eslint`, `typescript-eslint`, `eslint-plugin-react-hooks` (recommended-latest) and `eslint-plugin-jsx-a11y`; enable `@typescript-eslint/no-floating-promises` (would flag `upsertSource(s);` AudioMixer.tsx:242 and `inTauri && api.revealClip()` Clips.tsx:602)."
+    },
+    {
+      "id": "FC-P-2",
+      "title": "Frontend test setup",
+      "area": "testing",
+      "value": "Regression safety for store logic and pure helpers.",
+      "effort": "M",
+      "sketch": "`vitest` with `jsdom`, `@testing-library/react`, `mockIPC`/`clearMocks` from `@tauri-apps/api/mocks` for store tests. Test first: `format.ts`; Hotkeys `accelerator`/`risky`/`supported`; Recording `fit`/`fpsChoices`/`memoryBudgetMb` (moved into `lib/`); `screenChoice`; `slotFor`/`usePresence`; `timeLeft`; `lastSeenText`."
+    },
+    {
+      "id": "FC-P-3",
+      "title": "Pull-request CI workflow",
+      "area": "CI",
+      "value": "Every PR is type-checked, linted and tested before merge.",
+      "effort": "S",
+      "sketch": "`.github/workflows/ci.yml` on `pull_request` running `npm ci && tsc --noEmit && eslint . && vitest run`, plus `cargo test` on Windows."
+    },
+    {
+      "id": "FC-P-4",
+      "title": "npm scripts and stricter tsconfig",
+      "area": "tooling",
+      "value": "Standard entry points for checks and stronger type safety.",
+      "effort": "S",
+      "sketch": "Add `typecheck`, `lint`, `test` scripts to package.json; turn on `noUncheckedIndexedAccess` and `noImplicitReturns` in tsconfig.json."
+    },
+    {
+      "id": "FC-P-5",
+      "title": "Disable WebView2 browser accelerator keys",
+      "area": "security/lockdown",
+      "value": "A robust lock on browser shortcuts instead of JS key matching (unverified).",
+      "effort": "?",
+      "sketch": "Set WebView2 `AreBrowserAcceleratorKeysEnabled=false`; check whether the wry/Tauri version in use exposes it."
+    },
+    {
+      "id": "FC-P-6",
+      "title": "Gallery sorting and date grouping",
+      "area": "gallery",
+      "value": "Find clips faster in large libraries.",
+      "effort": "M",
+      "sketch": "Sort by date, size, duration or name; group by date."
+    },
+    {
+      "id": "FC-P-7",
+      "title": "Gallery multi-select with bulk actions",
+      "area": "gallery",
+      "value": "Manage many clips at once.",
+      "effort": "M",
+      "sketch": "Multi-select with bulk delete, tag, move or export."
+    },
+    {
+      "id": "FC-P-8",
+      "title": "Keyboard navigation through the gallery grid",
+      "area": "gallery",
+      "value": "Faster, accessible browsing.",
+      "effort": "M",
+      "sketch": "Arrow-key navigation through the grid, Enter to open, Delete to remove."
+    },
+    {
+      "id": "FC-P-9",
+      "title": "Ctrl+F search focus and #tag search syntax",
+      "area": "gallery",
+      "value": "Quicker search; tags become filterable from the search box.",
+      "effort": "S",
+      "sketch": "Ctrl+F focuses search (lockdown currently swallows Ctrl+F); support a `#tag` search syntax."
+    },
+    {
+      "id": "FC-P-10",
+      "title": "Keep gallery filter and scroll position across route switches",
+      "area": "gallery",
+      "value": "Users return to where they left off.",
+      "effort": "S",
+      "sketch": "Persist filter state and scroll position per route."
+    },
+    {
+      "id": "FC-P-11",
+      "title": "Delete clips to the Recycle Bin",
+      "area": "gallery/core",
+      "value": "Recoverable deletes and no orphaned files.",
+      "effort": "M",
+      "sketch": "Replace `Library::delete`'s `remove_file` (whose errors are ignored) with a move to the Recycle Bin, handling errors."
+    },
+    {
+      "id": "FC-P-12",
+      "title": "Drag a clip out into Discord or Explorer",
+      "area": "gallery",
+      "value": "Easy sharing via drag and drop.",
+      "effort": "M",
+      "sketch": "Support dragging clip files out of the gallery."
+    },
+    {
+      "id": "FC-P-13",
+      "title": "Storage auto-cleanup",
+      "area": "storage",
+      "value": "Prevents the clip folder filling the disk.",
+      "effort": "M",
+      "sketch": "Keep N GB; never delete favorites."
+    },
+    {
+      "id": "FC-P-14",
+      "title": "Health panel",
+      "area": "dashboard",
+      "value": "Users see recording health at a glance.",
+      "effort": "S",
+      "sketch": "Show dropped frames, the real encoder, free disk space and the game session (all already in `EngineStatus`)."
+    },
+    {
+      "id": "FC-P-15",
+      "title": "Notification history / error center",
+      "area": "notifications",
+      "value": "Errors remain reviewable after toasts disappear (3-6 s).",
+      "effort": "M",
+      "sketch": "An error center listing past notifications."
+    },
+    {
+      "id": "FC-P-16",
+      "title": "Recording page improvements",
+      "area": "recording",
+      "value": "Fewer misconfigurations.",
+      "effort": "S",
+      "sketch": "An \"Auto\" choice for the memory budget; disable unavailable encoders; show estimated RAM use."
+    },
+    {
+      "id": "FC-P-17",
+      "title": "Mixer gain controls",
+      "area": "mixer",
+      "value": "Precise and quick level adjustments.",
+      "effort": "S",
+      "sketch": "Double-click to reset gain to 0 dB, numeric gain entry, peak/clip indicators."
+    },
+    {
+      "id": "FC-P-18",
+      "title": "Settings search, reset and import/export",
+      "area": "settings",
+      "value": "Easier configuration management.",
+      "effort": "M",
+      "sketch": "Settings search, reset to defaults, import/export."
+    },
+    {
+      "id": "FC-P-19",
+      "title": "Locale-aware dates",
+      "area": "i18n",
+      "value": "Dates in the user's own format.",
+      "effort": "S",
+      "sketch": "Use `navigator.language` instead of hard-coded `en-US` in format.ts."
+    },
+    {
+      "id": "FC-P-20",
+      "title": "Dormant mode",
+      "area": "performance",
+      "value": "No UI cost while gaming.",
+      "effort": "M",
+      "sketch": "Pause animations and level traffic while the window is unfocused or hidden."
+    }
+  ],
+  "positives": [
+    "`npx tsc --noEmit` passes.",
+    "`listen()` cleanup in App.tsx and Toasts.tsx uses the correct cancelled-flag pattern.",
+    "Every object selector uses `useShallow`, so there are no \"getSnapshot should be cached\" problems.",
+    "`SourceMeter` isolates the 20 Hz level updates.",
+    "Clip reloads are ticketed (`clips-changed` at store.ts:301).",
+    "Thumbnails use `loading=\"lazy\"`.",
+    "No XSS sinks: no `dangerouslySetInnerHTML`, `innerHTML`, `href` or `window.open` in `src`.",
+    "Friend names, statuses, game names and transfer names render as text.",
+    "Avatar `<img src>` is limited by CSP `img-src` to `cdn.discordapp.com`.",
+    "Share-link URLs are never rendered.",
+    "Devtools are absent in release builds (no `devtools` cargo feature).",
+    "Context menu and drop handling lockdown is effective (`dragDropEnabled:false` plus `preventDefault`).",
+    "Apart from the listed drift, the IPC wrappers in the slice match model.rs/commands.rs, including camelCase argument names (`startMs`, `targetBytes`, `clipId`) and serde's `accent_color_2` -> `accentColor2`; `mock.ts` is typed so `tsc` keeps it in sync.",
+    "`NameField` (Clips.tsx:697-771) keeps a draft and commits on blur/Enter.",
+    "The gallery player (Clips.tsx:344-376) correctly handles new clips arriving during playback via `shownId`.",
+    "Colors.tsx:29-34 already debounces writes with `SETTLE_MS`."
+  ]
+}
